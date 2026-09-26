@@ -6,14 +6,18 @@
 COMMAND=$(jq -r '.tool_input.command // empty')
 [ -z "$COMMAND" ] && exit 0
 
+# git's global options (-C dir, -c key=val, --no-pager, --git-dir=x ...) may sit before the subcommand.
+GIT='git( -C [^ ]+| -c [^ ]+| --[a-z-]+(=[^ ]+)?)*'
+
 DANGEROUS_PATTERNS=(
-  'git( -C [^ ]+)* push( [^;&|]*)? (--force|--force-with-lease|-f)( |$|=)'
-  'git( -C [^ ]+)* push( [^;&|]*)? \+[^ ]+'
+  "$GIT"' push( [^;&|]*)? (--force|--force-with-lease|-f)( |$|=)'
+  "$GIT"' push( [^;&|]*)? \+[^ ]+'
   'reset --hard'
-  'git( -C [^ ]+)* clean( [^;&|]*)? -[a-zA-Z]*f'
-  'git( -C [^ ]+)* branch( [^;&|]*)? (-D|--delete --force|-d --force)( |$)'
-  'git( -C [^ ]+)* checkout( --)? \.( |$|;|&)'
-  'git( -C [^ ]+)* restore( --worktree| -W| --source[= ][^ ]+| -s [^ ]+)* \.( |$|;|&)'
+  "$GIT"' clean( [^;&|]*)? (-[a-zA-Z]*f|--force)'
+  "$GIT"' branch( [^;&|]*)? (-D|--delete --force|-d --force)( |$)'
+  "$GIT"' checkout( --)? \.( |$|;|&)'
+  "$GIT"' checkout [^;&|]* -- \.( |$|;|&)'
+  "$GIT"' restore( --worktree| -W| --source[= ][^ ]+| -s [^ ]+)* \.( |$|;|&)'
 )
 
 for pattern in "${DANGEROUS_PATTERNS[@]}"; do
