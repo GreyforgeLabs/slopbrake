@@ -54,20 +54,23 @@ def parse_unified_diff(text: str) -> dict[str, FileChange]:
     changes: dict[str, FileChange] = {}
     current: FileChange | None = None
     new_line = 0
+    in_hunk = False  # `+++ b/path` is a header only before the first hunk; inside one it is content
     for line in text.splitlines():
         if line.startswith("diff --git "):
             match = re.match(r'diff --git "?a/(.+?)"? "?b/(.+?)"?$', line)
             old, new = (match.group(1), match.group(2)) if match else (None, None)
             current = FileChange(path=new or "", old_path=old)
             changes[current.path] = current
+            in_hunk = False
         elif current is None:
             continue
-        elif line.startswith("deleted file mode"):
+        elif line.startswith("deleted file mode") and not in_hunk:
             current.deleted = True
         elif line.startswith("@@"):
             match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
             new_line = int(match.group(1)) if match else 0
-        elif line.startswith("+") and not line.startswith("+++"):
+            in_hunk = True
+        elif line.startswith("+") and in_hunk:
             current.added[new_line] = line[1:]
             new_line += 1
     return changes
