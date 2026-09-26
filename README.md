@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/GreyforgeLabs/slopbrake/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/GreyforgeLabs/slopbrake/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-38c8e8?style=flat-square"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-38c8e8?style=flat-square">
   <img alt="Stacks: Python and TypeScript" src="https://img.shields.io/badge/stacks-Python%20%C2%B7%20TypeScript-8b95a0?style=flat-square">
