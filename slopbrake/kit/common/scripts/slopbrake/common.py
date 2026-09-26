@@ -142,7 +142,7 @@ def load_simple_yaml(text: str) -> dict[str, object]:
         if not line.startswith((" ", "\t", "-")):
             name, _, value = line.partition(":")
             key = name.strip()
-            data[key] = _scalar(value.strip()) if value.strip() else []
+            data[key] = [] if value.strip() in ("", "[]") else _scalar(value.strip())
         elif line.strip().startswith("- ") and key is not None:
             items = data.setdefault(key, [])
             if not isinstance(items, list):

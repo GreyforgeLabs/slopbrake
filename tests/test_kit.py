@@ -99,6 +99,17 @@ class DoorClassify(Scratch):
         self.assertEqual(self.classify(source)["door"], "one-way")
         self.assertEqual(self.classify(test)["door"], "two-way")
 
+    def test_a_scalar_rule_is_an_error_not_a_list_of_characters(self):
+        self.write("rules.yml", 'one_way: "migrations/**"\n')
+        self.write("change.diff", "diff --git a/migrations/1.sql b/migrations/1.sql\n--- a/migrations/1.sql\n"
+                                  "+++ b/migrations/1.sql\n@@ -0,0 +1 @@\n+x\n")
+        result = script("door_classify.py", "--rules", "rules.yml", "--diff-file", "change.diff", cwd=self.root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("one_way must be a list", result.stderr)
+
+    def test_an_empty_inline_list_means_no_rules(self):
+        self.assertEqual(load_simple_yaml("content_patterns: []\n"), {"content_patterns": []})
+
     def test_changing_the_classifier_itself_is_one_way(self):
         diff = "diff --git a/.claude/door-rules.yml b/.claude/door-rules.yml\n--- a/.claude/door-rules.yml\n+++ b/.claude/door-rules.yml\n@@ -1 +1 @@\n-a\n+b\n"
         self.assertEqual(self.classify(diff)["door"], "one-way")
