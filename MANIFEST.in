@@ -1,0 +1,3 @@
+graft slopbrake/kit
+graft slopbrake/vendor
+global-exclude __pycache__ *.pyc

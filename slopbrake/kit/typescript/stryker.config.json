@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "Mutation floor on changed lines (rule T4). scripts/check passes --mutate with the changed ranges; raise thresholds.break via /retro.",
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "reporters": ["clear-text", "progress"],
+  "coverageAnalysis": "perTest",
+  "thresholds": { "high": 80, "low": 60, "break": 60 },
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": "always"
+}

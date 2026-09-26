@@ -1,0 +1,25 @@
+# Layer 1 in CI: the same umbrella gate agents run locally (scripts/check).
+# On pull requests the pr stage also checks the PR body's Door and Blast Radius.
+name: check
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [@DEFAULT_BRANCH@]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - run: scripts/check

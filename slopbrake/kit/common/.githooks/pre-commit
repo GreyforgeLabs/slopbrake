@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Layer 1 locally: the fast gate (no mutation) before every commit.
+exec "$(git rev-parse --show-toplevel)/scripts/check" --fast

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# The umbrella gate: agents, git hooks and CI all run this one command.
+#   scripts/check            everything (pre-push, CI, implement-ticket step 3)
+#   scripts/check --fast     everything but mutation (pre-commit, Stop hook)
+#   scripts/check <stage>    one or more named stages
+# Stage commands are this repo's own; edit them here. Raise MUTATION_FLOOR via /retro.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+G=scripts/slopbrake
+source "$G/run-stages.sh"
+
+export MUTATION_FLOOR="${MUTATION_FLOOR:-60}"
+TEST_CMD="${TEST_CMD:-@TEST_CMD@}"
+
+STAGES=(lint types boundaries tests smoke test-quality mutation pr)
+SLOW_STAGES=(mutation)
+
+stage_lint()         { @LINT_CMD@; }
+stage_types()        { @TYPES_CMD@; }
+stage_boundaries()   { python3 "$G/boundaries_py.py" .; }
+stage_tests()        { $TEST_CMD; }
+stage_smoke()        { if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; else echo "smoke: no scripts/smoke.sh (run the real entry point end to end there)"; fi; }
+stage_test_quality() { python3 "$G/tautology_py.py" .; }
+stage_mutation()     { python3 "$G/mutation_py.py" --test-cmd "$TEST_CMD"; }
+stage_pr()           { python3 "$G/pr_body_check.py"; }
+
+run_stages "$@"

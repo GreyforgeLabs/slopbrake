@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The full gate before anything leaves. Maintainers can chain a private check that must
+# never live in this repository (for example a leak scan with an internal denylist):
+#   git config slopbrake.prepush '<command>'
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+"$root/scripts/check"
+extra=$(git config --get slopbrake.prepush || true)
+if [ -n "$extra" ]; then
+  echo "── pre-push: $extra ──"
+  bash -c "$extra"
+fi

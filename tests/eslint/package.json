@@ -1,0 +1,10 @@
+{
+  "name": "slopbrake-eslint-rule-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.38.0",
+    "eslint": "^9.31.0"
+  }
+}

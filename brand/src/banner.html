@@ -1,0 +1,47 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@500;700&display=block" rel="stylesheet">
+<style>
+  :root { --plate:#0a0d11; --steel:#aeb6bf; --cyan:#38c8e8; --sage:#9fb896; --amber:#fda52b; --text:#e9edf1; --muted:#8b95a0; }
+  html,body { margin:0; width:1280px; height:640px; overflow:hidden; background:var(--plate); }
+  body { font-family:'Space Grotesk',sans-serif; color:var(--text); position:relative; }
+  .grid { position:absolute; inset:0;
+    background-image: linear-gradient(rgba(56,200,232,.06) 1px, transparent 1px), linear-gradient(90deg, rgba(56,200,232,.06) 1px, transparent 1px);
+    background-size: 32px 32px; mask-image: radial-gradient(ellipse at 30% 50%, #000 30%, transparent 80%); }
+  .vignette { position:absolute; inset:0; background: radial-gradient(ellipse at 28% 50%, rgba(56,200,232,.10), transparent 55%), radial-gradient(ellipse at 90% 10%, rgba(253,165,43,.08), transparent 40%); }
+  svg.construct { position:absolute; left:0; top:0; }
+  .logo { position:absolute; left:74px; top:128px; width:384px; height:384px; filter: drop-shadow(0 20px 40px rgba(0,0,0,.6)); }
+  .copy { position:absolute; left:500px; top:150px; right:60px; }
+  .kicker { font-family:'JetBrains Mono',monospace; font-size:17px; letter-spacing:.18em; text-transform:uppercase; color:var(--cyan); opacity:.9; }
+  h1 { margin:10px 0 0; font-size:112px; line-height:.95; font-weight:700; letter-spacing:-.035em;
+       background: linear-gradient(180deg,#f4f7fa 0%, #b9c2cb 70%, #8a949e 100%); -webkit-background-clip:text; color:transparent; }
+  .tag { margin-top:18px; font-size:34px; font-weight:500; color:var(--text); letter-spacing:-.01em; }
+  .tag b { color:var(--amber); font-weight:700; }
+  .sub { margin-top:14px; font-size:20px; color:var(--muted); max-width:700px; line-height:1.4; }
+  .flow { position:absolute; left:500px; bottom:74px; display:flex; align-items:center; gap:12px; font-family:'JetBrains Mono',monospace; font-size:17px; }
+  .chip { padding:9px 14px; border-radius:10px; border:1px solid rgba(174,182,191,.25); background:rgba(20,26,33,.85); color:#cfd6dd; }
+  .chip.cyan { border-color:rgba(56,200,232,.45); color:#9fe6f6; }
+  .chip.amber { border-color:rgba(253,165,43,.6); color:#ffd08a; box-shadow:0 0 18px rgba(253,165,43,.18); }
+  .arrow { color:#56606b; }
+</style></head>
+<body>
+  <div class="grid"></div><div class="vignette"></div>
+  <svg class="construct" width="1280" height="640" fill="none" stroke="#38c8e8" stroke-opacity=".10">
+    <circle cx="266" cy="320" r="250"/><circle cx="266" cy="320" r="300" stroke-dasharray="4 8"/>
+    <line x1="266" y1="0" x2="266" y2="640" stroke-dasharray="2 10"/><line x1="0" y1="320" x2="1280" y2="320" stroke-dasharray="2 10"/>
+  </svg>
+  <img class="logo" src="../logo.svg" alt="">
+  <div class="copy">
+    <div class="kicker">OpenForge · coding-agent guardrails</div>
+    <h1>Slopbrake</h1>
+    <div class="tag">Brakes for the <b>software factory</b>.</div>
+    <div class="sub">Deterministic checks, a fresh-context reviewer that commits its fixes, and one-way-door triage. Every rule proven to bite.</div>
+  </div>
+  <div class="flow">
+    <span class="chip">scripts/check</span><span class="arrow">→</span>
+    <span class="chip cyan">reviewer</span><span class="arrow">→</span>
+    <span class="chip amber">one-way door?</span><span class="arrow">→</span>
+    <span class="chip">merge</span>
+  </div>
+</body></html>

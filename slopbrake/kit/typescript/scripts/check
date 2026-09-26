@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The umbrella gate: agents, git hooks and CI all run this one command.
+#   scripts/check            everything (pre-push, CI, implement-ticket step 3)
+#   scripts/check --fast     everything but mutation (pre-commit, Stop hook)
+#   scripts/check <stage>    one or more named stages
+# Stage commands are this repo's own; edit them here. Raise the floor in
+# stryker.config.json ("thresholds.break") via /retro.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+G=scripts/slopbrake
+source "$G/run-stages.sh"
+PM="@PM@"
+
+STAGES=(lint types boundaries tests smoke test-quality mutation pr)
+SLOW_STAGES=(mutation)
+
+stage_lint()         { $PM run -s lint; }
+stage_types()        { $PM run -s typecheck; }
+stage_boundaries()   { $PM exec depcruise @DEPCRUISE_PATHS@ --config .dependency-cruiser.cjs; }
+stage_tests()        { $PM run -s test; }
+stage_smoke()        { if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; else echo "smoke: no scripts/smoke.sh (run the real entry point end to end there)"; fi; }
+stage_test_quality() { $PM exec eslint --max-warnings 0 --no-error-on-unmatched-pattern @TEST_GLOBS@; }
+stage_mutation() {
+  local ranges
+  ranges=$(python3 "$G/changed_ranges.py" @MUTATE_INCLUDE@ --exclude '**/*.test.ts' --exclude '**/*.d.ts') || return 1
+  if [ -z "$ranges" ]; then echo "mutation: no changed source lines since the base; skipped"; return 0; fi
+  $PM exec stryker run stryker.config.json --mutate "$ranges"
+}
+stage_pr()           { python3 "$G/pr_body_check.py"; }
+
+run_stages "$@"

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Slopbrake's own gate: pinned ruff, the behaviour tests of every Python check, and the
+# RuleTester cases for the ESLint rule. The pre-commit hook and CI run this.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+# Git exports these to hooks; the tests run git in temp repos and must not inherit them.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+status=0
+echo "── lint ──";   uvx ruff@0.16.9 check . || status=1
+echo "── tests ──";  python3 -m unittest discover -s tests || status=1
+echo "── eslint rule ──"
+( cd tests/eslint && { [ -d node_modules ] || npm install --silent --no-audit --no-fund; } && npm test --silent ) || status=1
+exit $status
