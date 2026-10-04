@@ -7,17 +7,18 @@ COMMAND=$(jq -r '.tool_input.command // empty')
 [ -z "$COMMAND" ] && exit 0
 
 # git's global options (-C dir, -c key=val, --no-pager, --git-dir=x ...) may sit before the subcommand.
-GIT='git( -C [^ ]+| -c [^ ]+| --[a-z-]+(=[^ ]+)?)*'
+# Shell token separators may contain repeated spaces or tabs.
+GIT='git([[:blank:]]+-C[[:blank:]]+[^[:blank:]]+|[[:blank:]]+-c[[:blank:]]+[^[:blank:]]+|[[:blank:]]+--[a-z-]+(=[^[:blank:]]+)?)*'
 
 DANGEROUS_PATTERNS=(
-  "$GIT"' push( [^;&|]*)? (--force|--force-with-lease|-f)( |$|=)'
-  "$GIT"' push( [^;&|]*)? \+[^ ]+'
-  'reset --hard'
-  "$GIT"' clean( [^;&|]*)? (-[a-zA-Z]*f|--force)'
-  "$GIT"' branch( [^;&|]*)? (-D|--delete --force|-d --force)( |$)'
-  "$GIT"' checkout( --)? \.( |$|;|&)'
-  "$GIT"' checkout [^;&|]* -- \.( |$|;|&)'
-  "$GIT"' restore( --worktree| -W| --source[= ][^ ]+| -s [^ ]+)* \.( |$|;|&)'
+  "$GIT"'[[:blank:]]+push([[:blank:]]+[^;&|]*)?[[:blank:]]+(--force|--force-with-lease|-f)([[:blank:]]|$|=)'
+  "$GIT"'[[:blank:]]+push([[:blank:]]+[^;&|]*)?[[:blank:]]+\+[^[:blank:]]+'
+  'reset[[:blank:]]+--hard'
+  "$GIT"'[[:blank:]]+clean([[:blank:]]+[^;&|]*)?[[:blank:]]+(-[a-zA-Z]*f|--force)'
+  "$GIT"'[[:blank:]]+branch([[:blank:]]+[^;&|]*)?[[:blank:]]+(-D|--delete[[:blank:]]+--force|-d[[:blank:]]+--force)([[:blank:]]|$)'
+  "$GIT"'[[:blank:]]+checkout([[:blank:]]+--)?[[:blank:]]+\.([[:blank:]]|$|;|&)'
+  "$GIT"'[[:blank:]]+checkout[[:blank:]]+[^;&|]*[[:blank:]]+--[[:blank:]]+\.([[:blank:]]|$|;|&)'
+  "$GIT"'[[:blank:]]+restore([[:blank:]]+--worktree|[[:blank:]]+-W|[[:blank:]]+--source(=|[[:blank:]]+)[^[:blank:]]+|[[:blank:]]+-s[[:blank:]]+[^[:blank:]]+)*[[:blank:]]+\.([[:blank:]]|$|;|&)'
 )
 
 for pattern in "${DANGEROUS_PATTERNS[@]}"; do
