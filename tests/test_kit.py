@@ -347,13 +347,25 @@ class GitGuard(unittest.TestCase):
     def test_destructive_commands_are_blocked(self):
         for command in ("git push --force origin main", "git push -f", "git push origin +main",
                         "git reset --hard HEAD~1", "git clean -fd", "git branch -D old", "git checkout .",
-                        "git checkout -- .", "git restore .", "cd x && git -C y reset --hard"):
-            self.assertEqual(self.exit_code(command), 2, command)
+                        "git checkout -- .", "git restore .", "cd x && git -C y reset --hard",
+                        "git -c core.editor=vi push --force", "git --no-pager push -f", "git clean --force -d",
+                        "git checkout HEAD -- .", "git checkout main -- .",
+                        "git restore --source HEAD .", "git restore --source=HEAD .",
+                        "git restore -s HEAD .", "git branch --delete --force old"):
+            for separator in (" ", "  ", "\t", " \t "):
+                spaced = command.replace(" ", separator)
+                with self.subTest(command=spaced):
+                    self.assertEqual(self.exit_code(spaced), 2)
 
     def test_everyday_commands_pass(self):
         for command in ("git push origin feature/x", "git push -u origin HEAD", "git status", "git checkout .github/x",
-                        "git restore --staged .", "git restore src/a.ts", "git clean -n", "git branch -d merged"):
-            self.assertEqual(self.exit_code(command), 0, command)
+                        "git restore --staged .", "git restore src/a.ts", "git clean -n", "git branch -d merged",
+                        "git -c color.ui=never push origin main", "git checkout HEAD -- src/a.ts",
+                        "git restore --source HEAD src/a.ts", "git restore --source=HEAD src/a.ts"):
+            for separator in (" ", "  ", "\t", " \t "):
+                spaced = command.replace(" ", separator)
+                with self.subTest(command=spaced):
+                    self.assertEqual(self.exit_code(spaced), 0)
 
 
 class Installer(Scratch):
