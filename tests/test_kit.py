@@ -110,6 +110,29 @@ class DoorClassify(Scratch):
     def test_an_empty_inline_list_means_no_rules(self):
         self.assertEqual(load_simple_yaml("content_patterns: []\n"), {"content_patterns": []})
 
+    def test_empty_scalars_are_rejected_for_every_rule_list(self):
+        self.write("change.diff", "diff --git a/README.md b/README.md\n--- a/README.md\n"
+                                  "+++ b/README.md\n@@ -0,0 +1 @@\n+Documentation\n")
+        for key in ("one_way", "content_patterns", "ignore", "content_ignore"):
+            for scalar in ('""', "''"):
+                with self.subTest(key=key, scalar=scalar):
+                    self.write("rules.yml", f"{key}: {scalar}\n")
+                    result = script("door_classify.py", "--rules", "rules.yml",
+                                    "--diff-file", "change.diff", cwd=self.root)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{key} must be a list", result.stderr)
+
+    def test_missing_and_explicit_empty_rule_lists_remain_valid(self):
+        self.write("change.diff", "diff --git a/README.md b/README.md\n--- a/README.md\n"
+                                  "+++ b/README.md\n@@ -0,0 +1 @@\n+Documentation\n")
+        for content in ("", "one_way: []\ncontent_patterns: []\nignore: []\ncontent_ignore: []\n"):
+            with self.subTest(content=content):
+                self.write("rules.yml", content)
+                result = script("door_classify.py", "--rules", "rules.yml",
+                                "--diff-file", "change.diff", "--json", cwd=self.root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["door"], "two-way")
+
     def test_changing_the_classifier_itself_is_one_way(self):
         diff = "diff --git a/.claude/door-rules.yml b/.claude/door-rules.yml\n--- a/.claude/door-rules.yml\n+++ b/.claude/door-rules.yml\n@@ -1 +1 @@\n-a\n+b\n"
         self.assertEqual(self.classify(diff)["door"], "one-way")

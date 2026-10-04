@@ -29,7 +29,7 @@ def load_rules(path: Path) -> dict[str, list[str]]:
     data = load_simple_yaml(path.read_text(encoding="utf-8"))
     rules: dict[str, list[str]] = {}
     for key in ("one_way", "content_patterns", "ignore", "content_ignore"):
-        value = data.get(key) or []
+        value = data.get(key, [])
         if not isinstance(value, list):  # list("x/**") would silently become one-character globs
             raise SystemExit(f"{path}: {key} must be a list of '- item' lines, got {value!r}")
         rules[key] = value
