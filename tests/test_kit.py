@@ -76,6 +76,10 @@ class RuleFiles(unittest.TestCase):
         diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -3,0 +4,2 @@\n+a = 1\n+b = 2\n"
         self.assertEqual(parse_unified_diff(diff)["x.py"].added, {4: "a = 1", 5: "b = 2"})
 
+    def test_diff_parser_keeps_added_lines_that_start_with_plus_plus(self):
+        diff = "diff --git a/x.sql b/x.sql\n--- a/x.sql\n+++ b/x.sql\n@@ -0,0 +1,2 @@\n+++ DROP TABLE users;\n+b\n"
+        self.assertEqual(parse_unified_diff(diff)["x.sql"].added, {1: "++ DROP TABLE users;", 2: "b"})
+
 
 class DoorClassify(Scratch):
     def classify(self, diff):
