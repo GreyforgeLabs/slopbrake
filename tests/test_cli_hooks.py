@@ -31,7 +31,7 @@ class Scratch(unittest.TestCase):
         self.settings = self.base / "home/.claude/settings.json"
         self.marker = self.base / "stop-ran"
         # The `slopbrake` Claude Code would run: this checkout, not whatever build is installed.
-        self.good_bin = self.shim("good", f'exec {sys.executable} -m slopbrake "$@"')
+        self.good_bin = self.shim("good", f'PYTHONPATH={HOME} exec {sys.executable} -m slopbrake "$@"')
 
     def shim(self, name, body):
         bindir = self.base / "bin" / name
@@ -119,6 +119,15 @@ class UserHooks(Scratch):
         self.assertFalse(status["runnable"])
         self.assertTrue(json.loads(self.gf("user-hooks", "status", "--settings", str(self.settings), "--json")
                                    .stdout)["runnable"])
+
+    def test_runnable_probe_ignores_the_installers_pythonpath(self):
+        # Claude Code runs the hook without the installer's PYTHONPATH: an old build that only
+        # works with a dev checkout on PYTHONPATH must not pass the probe.
+        dev_only = self.shim("dev-only", f'[ -n "$PYTHONPATH" ] && exec {sys.executable} -m slopbrake "$@"; exit 2')
+        path = f"{dev_only}{os.pathsep}{os.environ['PATH']}"
+        result = self.gf("user-hooks", "install", "--settings", str(self.settings), PATH=path)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(self.settings.exists())
 
     def test_install_creates_a_missing_settings_file(self):
         self.assertEqual(self.gf("user-hooks", "install", "--settings", str(self.settings)).returncode, 0)

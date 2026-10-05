@@ -271,9 +271,11 @@ def runnable() -> tuple[str | None, bool]:
     binary = shutil.which("slopbrake")
     if not binary:
         return None, False
+    # Claude Code runs it without the installer's PYTHONPATH: a dev checkout must not prop up an old build.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
     try:
         result = subprocess.run([binary, "hook", "pre-tool-use"], input="{}", capture_output=True, text=True,
-                                timeout=30, check=False)
+                                timeout=30, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return binary, False
     return binary, result.returncode == 0
