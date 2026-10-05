@@ -394,7 +394,6 @@ def substitutions(repo: Path, stack: str) -> dict[str, str]:
         test_args = python_test_args(repo)
         subs |= {
             "TEST_ARGS": test_args,
-            "TEST_CMD": f"python3 {test_args}",  # a scripts/check template from before B6
             "LINT_CMD": "uvx ruff@0.16.9 check .",
             "TYPES_CMD": f'echo "types: skipped: {TYPES_PLACEHOLDER} (edit scripts/check)"; return 78',
             "CI_INSTALL": python_ci_install(repo, test_args),

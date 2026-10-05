@@ -7,7 +7,7 @@ An audit of 0.1.0 in real use found that Slopbrake was installed but never fired
 ### Hooks that actually run (H5, H6, H7)
 
 - **Broken:** Claude Code loads project hooks only from the directory a session starts in. Sessions started in `~` never ran the git guard or the Stop gate, and nothing said so.
-- **New:** `slopbrake user-hooks install|uninstall|status` wires `slopbrake hook pre-tool-use|post-tool-use|stop` into `~/.claude/settings.json`. The hooks act only in repos with `.claude/slopbrake.json`, run each touched repo's Stop gate, and do nothing anywhere else. `install` refuses while the `slopbrake` on `PATH` is too old to run them.
+- **New:** `slopbrake user-hooks install|uninstall|status|trust|untrust` wires `slopbrake-hook pre-tool-use|post-tool-use|stop` into `~/.claude/settings.json`. The guard acts in every repo with `.claude/slopbrake.json`; the Stop gate runs only for repos the session actually changed and that you trust (`init` trusts its repo; a cloned repo's scripts never run until you `user-hooks trust` it). Outside managed repos the hooks do nothing. `install` refuses while the `slopbrake` on `PATH` is too old, and an older install without `slopbrake-hook` fails harmlessly instead of blocking every command.
 - **Broken:** the git guard was a regex with many bypasses (`push -f;`, `+main`, `--force-with-lease`, `restore`/`checkout` forms, `--no-verify`, `-c core.hooksPath=`) and false positives on commit messages and `grep` patterns. It failed open without `jq`.
 - **Changed:** the guard is now `git_guard.py`, which parses the command like a shell (`bash -c`, `eval`, wrappers, substitutions, heredocs) and judges git's own argv. It blocks the forms above plus branch, stash, reflog, ref and object deletion, and aliases or `rebase --exec` that run them. The shell wrapper fails closed without python3.
 - **Broken:** the Stop gate looked only at uncommitted code, so committing (or working in another worktree) let an agent stop with an unchecked change.
@@ -20,8 +20,10 @@ An audit of 0.1.0 in real use found that Slopbrake was installed but never fired
 - **Broken:** `MUTATION_FLOOR=0 git push` and `TEST_CMD=true` lowered the gate from the environment.
 - **Changed:** `scripts/check` fixes the floor and the test command; pre-push drops inherited overrides and runs the full gate once per pushed ref, against the commit the remote already has.
 - **Broken:** committing straight on the default branch with no remote (both pilots' workflow) measured mutation and the door against HEAD itself: nothing changed, so the floor and the door never ran on committed work.
-- **New:** the last-green ratchet. A full, all-green run on a clean tree records `refs/slopbrake/last-green/<branch>`; on the default branch, checks measure from it. `init` starts it at HEAD.
-- **Changed:** Python repos get pytest when it's configured or declared anywhere (pytest-style tests were silently skipped under `unittest discover`), the project's interpreter (`uv run`, `.venv`), and a CI install that matches. The TypeScript CI is set up for the repo's package manager instead of always pnpm.
+- **New:** the last-green ratchet. A full, all-green run on a clean tree records `refs/slopbrake/last-green/<branch>` (`/` in the branch name written as `%2F`); on the default branch, checks measure from it, or from the merge-base with it after an amend or rebase, or from the empty tree when there is none yet. `init` starts it at HEAD.
+- **Changed:** pre-commit refuses when a staged file also has unstaged edits, and pre-push refuses a dirty tree or a ref that isn't checked out: the gate checks the working tree, so it must be the tree being committed or pushed. A new branch is measured against what the remote already has.
+- **Changed:** a change that touches only tests is mutation-checked against the modules those tests import (Python), so weakening an assertion no longer slips through. Marking every changed line `# slopbrake: no-mutate` fails the stage.
+- **Changed:** Python repos get pytest when it's configured or declared anywhere (pytest-style tests were silently skipped under `unittest discover`), the project's interpreter (`.venv`, found at run time, also from a linked worktree), and a CI install that matches. The TypeScript CI is set up for the repo's package manager instead of always pnpm.
 
 ### Test quality (T1, T4)
 

@@ -58,9 +58,9 @@ slopbrake status .                  # anything still unwired is listed as a gap
 
 Merge `add-slopbrake` the way you'll merge every one-way door from now on: a human reads it first.
 
-**Why user-level hooks?** Claude Code loads a project's `.claude/settings.json` hooks only from the directory the session *started* in. Start a session in `~` or a parent folder, and the repo's git guard and Stop gate never fire. `user-hooks install` adds three entries to `~/.claude/settings.json` that act only inside repos Slopbrake manages and do nothing anywhere else. It refuses to install until the `slopbrake` on your `PATH` can run them.
+**Why user-level hooks?** Claude Code loads a project's `.claude/settings.json` hooks only from the directory the session *started* in. Start a session in `~` or a parent folder, and the repo's git guard and Stop gate never fire. `user-hooks install` adds three entries to `~/.claude/settings.json` that act only inside repos Slopbrake manages and do nothing anywhere else. The Stop gate runs a repo's own scripts, so it only does that for repos you trust: `init` trusts the repo it installs into, and `slopbrake user-hooks trust <repo>` adds others. It refuses to install until the `slopbrake` on your `PATH` can run them.
 
-Python and TypeScript repos are supported. `init`, `status`, `verify` and `user-hooks` take `--json`. Exit codes: 0 ok, 1 a gap or a failed proof, 2 usage error. A fresh Python repo shows one gap until you choose a type checker for the `types` stage in `scripts/check`; it skips until then.
+Python and TypeScript repos are supported, installed at the repository root (monorepo subdirectories are not supported yet). `init`, `status`, `verify` and `user-hooks` take `--json`. Exit codes: 0 ok, 1 a gap or a failed proof, 2 usage error. A fresh Python repo shows one gap until you choose a type checker for the `types` stage in `scripts/check`; it skips until then.
 
 ### The checks are proven, not configured
 
