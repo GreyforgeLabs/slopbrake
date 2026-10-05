@@ -2,9 +2,9 @@
 """Check a PR body has the required shape (rules G1, G2, G3, G4, C3).
 
 Body source, first found: --body-file, $PR_BODY_FILE, the GitHub Actions pull_request
-event. Outside a PR context there is no body: on the default branch an uncommitted
-one-way change fails (it belongs on a feature branch); otherwise the check is skipped
-(exit 78), or fails with --require.
+event. On the default branch a staged (else uncommitted) one-way change fails, body or
+not (C8: it belongs on a feature branch). Outside a PR context there is no body: the
+check is otherwise skipped (exit 78), or fails with --require.
 """
 from __future__ import annotations
 
@@ -18,13 +18,15 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import base_ref, empty_tree, git, merge_base, repo_root
+from common import base_ref, default_branch, empty_tree, git, merge_base, repo_root
 from door_classify import (
     DEFAULT_RULES,
     RulesError,
     classify,
     effective_rules,
     measure,
+    staged_changes,
+    tracked_changes,
     working_changes,
 )
 
@@ -39,9 +41,12 @@ LABELS = re.compile(r"\*\*(?:Door|Blast Radius):\*\*[ \t]*[\w-]*", re.IGNORECASE
 # "none", "no way to restore", "restore is not possible" do not.
 PLAN_STEP = re.compile(r"\b(?:revert|restor|back ?up|backed up|down[ -]?migration|downgrade|migrate down|snapshot|"
                        r"dump|flags?\b|disabl|toggl|undo|redeploy|re-?run|re-?apply|re-?enabl|re-?creat|replay|recover|"
-                       r"reinstat|revers|rebuild|roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write)",
+                       r"reinstat|revers|rebuild|roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write|"
+                       r"roll[ -]back|undeploy|make\s+rollback)",
                        re.IGNORECASE)
-NEGATOR = re.compile(r"\b(?:no|not|none|nothing|never|without|cannot|impossible|irreversible|unable|"
+# "roll back" / "make rollback" / "undeploy" used as a step, not as a "Roll back:" label.
+STEP_VERB = re.compile(r"\b(?:make\s+rollback|roll[ -]back|undeploy)\b(?!\s*(?:plan|strategy)?\s*(?::|\*\*))", re.IGNORECASE)
+NEGATOR = re.compile(r"\b(?:no|not|none|nothing|nobody|never|without|cannot|impossible|irreversible|unable|"
                      r"(?:can|won|don|doesn|isn|aren|wasn|didn)['\u2019]t)\b|\bn/a\b", re.IGNORECASE)
 CLAUSE = re.compile(r"[;,!?()]|\.(?=\s|$)")
 
@@ -99,7 +104,10 @@ def has_rollback_plan(merge_danger: str) -> bool:
     """A rollback/mitigation label whose text (or the lines under a bare label) names a concrete step."""
     lines = [LABELS.sub(" ", line) for line in merge_danger.splitlines()]
     for i, line in enumerate(lines):
-        labels = list(ROLLBACK.finditer(line))
+        verbs = [verb.span() for verb in STEP_VERB.finditer(line)]
+        if verbs and names_a_step(line):
+            return True
+        labels = [label for label in ROLLBACK.finditer(line) if not any(a <= label.start() < b for a, b in verbs)]
         for n, label in enumerate(labels):
             if re.search(r"\b(?:no|not|without)\W*$", line[:label.start()], re.IGNORECASE):  # "no rollback"
                 continue
@@ -176,45 +184,45 @@ def branch_name() -> str | None:
     return git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip() or None
 
 
-def default_branch() -> str | None:
-    origin = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False).strip()
-    if origin:
-        return origin.split("/", 1)[1]
-    for name in ("main", "master"):
-        if git("rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False).strip():
-            return name
-    configured = git("config", "init.defaultBranch", check=False).strip()
-    if configured and git("rev-parse", "--verify", "-q", f"refs/heads/{configured}", check=False).strip():
-        return configured
-    branches = git("for-each-ref", "--format=%(refname:short)", "refs/heads", check=False).split()
-    return branches[0] if len(branches) == 1 else None  # a local-only repo with one branch
+def no_pr_context(quiet: bool = False) -> int:
+    """C8: block a one-way change about to be committed on the default branch.
 
-
-def no_pr_context() -> int:
-    """C8: block a one-way change about to be committed on the default branch."""
+    A hook's GIT_INDEX_FILE is exactly what the commit adds. scripts/check unsets it, so a non-empty index is
+    judged together with tracked edits on disk (`commit -a` and `commit -- <path>` add them); an empty index
+    means the whole uncommitted working tree. quiet: print only a block or an error.
+    """
+    say = (lambda _message: None) if quiet else print
     branch = branch_name()
     if branch is None or not git("rev-parse", "--verify", "-q", "HEAD", check=False).strip():
-        print("pr: skipped: no PR context (not on a branch with commits)")
+        say("pr: skipped: no PR context (not on a branch with commits)")
         return SKIP
     if branch != default_branch():
-        print(f"pr: skipped: no PR context on {branch}")
+        say(f"pr: skipped: no PR context on {branch}")
         return SKIP
-    changes = working_changes("HEAD")
-    if not changes:
-        print(f"pr: skipped: no PR context and nothing uncommitted on {branch}")
+    views, what, empty = [staged_changes()], "staged change", "nothing staged"
+    if not os.environ.get("GIT_INDEX_FILE"):  # a hook's own index is exactly the commit
+        if views[0]:
+            views.append(tracked_changes())
+            what = "staged change (with tracked edits on disk)"
+        else:
+            views, what, empty = [working_changes("HEAD")], "uncommitted change", "nothing uncommitted"
+    if not any(views):
+        say(f"pr: skipped: no PR context and {empty} on {branch}")
         return SKIP
     try:
-        result = classify(changes, effective_rules("HEAD", repo_root() / DEFAULT_RULES))
+        rules = effective_rules("HEAD", repo_root() / DEFAULT_RULES)
+        results = [classify(view, rules) for view in views]
     except RulesError as exc:
         print(f"pr: door rules: {exc}")
         return 1
-    if result["door"] == "one-way":
+    reasons = list(dict.fromkeys(r for result in results if result["door"] == "one-way" for r in result["reasons"]))
+    if reasons:
         print(f"pr: one-way door on {branch}: commit it on a feature branch for operator review "
               "(a human may override with git commit --no-verify)")
-        for reason in result["reasons"]:
+        for reason in reasons:
             print(f"  - {reason}")
         return 1
-    print(f"pr: skipped: no PR context; the uncommitted change on {branch} is two-way")
+    say(f"pr: skipped: no PR context; the {what} on {branch} is two-way")
     return SKIP
 
 
@@ -236,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
             print("pr: skipped: no PR context (not a git repository)")
             return SKIP
         return no_pr_context()
+    if no_pr_context(quiet=True) == 1:  # B10: a body does not lift C8 on the default branch
+        return 1
     problems, computed, floor = [], None, "not computed (--no-door-floor)"
     if not args.no_door_floor:
         base = base_ref(args.base)

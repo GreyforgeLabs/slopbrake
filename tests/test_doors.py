@@ -168,10 +168,10 @@ class PreCommitOneWay(Scratch):
         self.assertEqual(result.returncode, 1)
         self.assertIn("one-way door on master", result.stdout)
 
-    def test_the_only_local_branch_is_the_default_branch(self):
+    def test_the_configured_init_default_branch_is_the_default_branch(self):  # B16: no single-branch guess
         self.git_repo(branch="trunk")
         self.write("x.sql", "DROP TABLE users;\n")
-        config = self.write("../gitconfig", "[init]\n\tdefaultBranch = master\n")  # a branch that does not exist
+        config = self.write("../gitconfig", "[init]\n\tdefaultBranch = trunk\n")
         result = script("pr_body_check.py", cwd=self.root, env=clean_env(GIT_CONFIG_GLOBAL=str(config)))
         self.assertEqual(result.returncode, 1, result.stdout)
 
@@ -310,7 +310,7 @@ class KitRules(Scratch):
 
     def test_one_way_paths(self):
         for path in ("alembic/versions/0003_drop.py", "db/migrate/20261005_drop.rb", "app/migrate/0001.py",
-                     "src/x/auth.py", "src/oauth_client/token.py", "src/authz/policies/admin.ts", "src/middleware/session.py", "payments/charge.py",
+                     "src/x/auth.py", "src/oauth/token.py", "src/auth_service/policies/admin.ts", "src/middleware/session.py", "payments/charge.py",
                      "src/stripe_api/client.py", ".env", ".env.production", ".github/actions/setup/action.yml",
                      ".github/CODEOWNERS", "CODEOWNERS", ".gitlab-ci.yml", "deploy/main.tf", "docker-compose.yml",
                      "docker-compose.prod.yaml", "Dockerfile.prod", "svc/Dockerfile", "k8s/deploy.yaml",
@@ -325,7 +325,7 @@ class KitRules(Scratch):
         for line in ("drop table users;", "ALTER TABLE t DROP COLUMN c;", "alter table t drop constraint k;",
                      "Delete From users", "metadata.drop_all(engine)", "subprocess.run('rm -fr /data')",
                      "from shutil import rmtree; rmtree(p)", "op.drop_column('t', 'c')",
-                     "subprocess.run([\"rm\", \"-rf\", path])", "rm -r -f build", "rm --recursive --force /srv",
+                     "subprocess.run([\"rm\", \"-rf\", path])", "rm -r -f data", "rm --recursive --force /srv",
                      "rm -R -f x", "truncate users;", "db.execute('truncate table users')",
                      "cur.execute('DELETE FROM \"users\"')", "sql = \"DELETE FROM `users`\"",
                      "knex.raw(`DELETE FROM \"User\" WHERE 1=1`)", "q = 'DELETE FROM [dbo].[users]'",

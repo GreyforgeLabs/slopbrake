@@ -335,3 +335,16 @@ def _scalar(value: str) -> str:
     if value.startswith("'") and value.endswith("'"):
         return value[1:-1].replace("''", "'")
     return value
+
+
+def default_branch() -> str | None:
+    """The repository's default branch, one rule for every check: the target of origin/HEAD, else
+    init.defaultBranch when that branch exists, else main, else master, else None (no guessing)."""
+    origin = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False).strip()
+    if origin:
+        return origin.split("/", 1)[1]
+    configured = git("config", "init.defaultBranch", check=False).strip()
+    for name in ([configured] if configured else []) + ["main", "master"]:
+        if git("rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False).strip():
+            return name
+    return None

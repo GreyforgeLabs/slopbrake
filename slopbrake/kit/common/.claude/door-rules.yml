@@ -34,8 +34,10 @@ one_way:
   - "**/.env.*"
   # auth, money, outbound communication, public contracts
   - "**/auth/**"
+  - "**/*auth/**"  # oauth/, user-auth/; authors/ and authoring/ stay two-way
+  - "**/auth_*/**"
+  - "**/auth-*/**"
   - "**/auth.*"
-  - "**/*auth*/**/*"  # files under an auth-named directory; "**/*auth*/**" would match author.py too
   - "**/middleware/**/session*.*"
   - "**/billing/**"
   - "**/payments/**"
@@ -45,6 +47,7 @@ one_way:
   - "**/openapi.*"
   # the auto-merge decider and the gate itself: the operator reviews these (G3)
   - ".claude/door-rules.yml"
+  - ".claude/slopbrake.json"
   - ".claude/settings.json"
   - ".claude/hooks/**"
   - ".claude/agents/**"
@@ -59,6 +62,18 @@ one_way:
   - "eslint-rules/**"
   - "eslint.config.*"
   - ".dependency-cruiser.cjs"
+  # configs that drive the gate's stages (package.json scripts and pyproject [tool.*] are content rules below)
+  - "**/ruff.toml"
+  - "**/.ruff.toml"
+  - "**/pytest.ini"
+  - "**/tox.ini"
+  - "**/setup.cfg"
+  - "**/mypy.ini"
+  - "**/.mypy.ini"
+  - "**/pyrightconfig.json"
+  - "**/vitest.config.*"
+  - "**/jest.config.*"
+  - "**/tsconfig*.json"
 
 content_patterns:
   - "(?i)\\bdrop\\s+(table|column|schema|database)\\b"
@@ -72,16 +87,21 @@ content_patterns:
   - "\\bdrop_all\\("
   - "\\bop\\.drop_\\w+\\("
   - "sendEmail\\("
-  # deleting files or directories at runtime (user data paths)
-  - "\\brm(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
+  # the gate's own scripts and tool tables. Patterns cannot be scoped to a path, so any source line starting
+  # with a "test"/"lint"/"check"... key (a dict, an i18n file) is one-way too; deleting such a line adds none.
+  - "^\\s*\"(lint|test|typecheck|smoke|check)\"\\s*:"
+  - "^\\[tool\\.(ruff|pytest|mypy|pyright|coverage)"
+  # deleting files or directories at runtime (user data paths); removing only build outputs is not
+  - "\\brm(?!(?:\\s+-[\\w-]*)*(?:\\s+(?:\\./)?(?:dist|build|node_modules|coverage|\\.cache|tmp|out|\\.next)/?)+(?:\\s*(?:[;|&)]|$)|[\"'`]|\\s+#))(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
   - "[\"']rm[\"']\\s*,\\s*[\"']-[a-zA-Z]*[rRf]"
   - "\\brmtree\\("
   - "os\\.(remove|unlink|rmdir)\\("
   - "\\.(unlink|rmdir)\\("
   - "fs\\.(rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\\("
 
-# Paths that are not classified at all: templates without real values.
+# Paths that are not classified at all: templates without real values, and docs.
 ignore:
+  - "docs/**"
   - "**/.env.example"
   - "**/.env.sample"
   - "**/.env.template"

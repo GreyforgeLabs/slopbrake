@@ -100,6 +100,22 @@ def working_changes(base: str) -> dict:
     return changes
 
 
+def _diff_head(*args: str) -> dict:
+    return parse_unified_diff(git("diff", *args, "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+                                  "--unified=0", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "HEAD",
+                                  cwd=repo_root()))
+
+
+def staged_changes() -> dict:
+    """What the next commit adds: the index against HEAD (honours GIT_INDEX_FILE, e.g. `commit -a`)."""
+    return _diff_head("--cached")
+
+
+def tracked_changes() -> dict:
+    """Tracked files on disk against HEAD: what `commit -a` or `commit -- <path>` may add beyond the index."""
+    return _diff_head()
+
+
 def measure(base: str, working_tree: bool, rules_path: Path | None = None):
     """Classify the change since `base`. Returns (result, warning or None)."""
     fork = merge_base(base)  # may be the empty tree, which holds no rules file
@@ -119,7 +135,7 @@ def classify(changes, rules) -> dict[str, object]:
     reasons: list[str] = []
     for change in changes.values():
         paths = {p for p in (change.path, change.old_path) if p}
-        if any(rx.match(p) for p in paths for rx in ignore):
+        if all(any(rx.match(p) for rx in ignore) for p in paths):  # a file leaving docs/ is classified
             continue
         for glob, rx in path_rules:
             hit = next((p for p in sorted(paths) if rx.match(p)), None)
