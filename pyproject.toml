@@ -26,6 +26,7 @@ Rules = "https://github.com/GreyforgeLabs/slopbrake/blob/main/docs/RULES.md"
 
 [project.scripts]
 slopbrake = "slopbrake.cli:main"
+slopbrake-hook = "slopbrake.hooks:main"
 
 [tool.setuptools]
 packages = ["slopbrake"]
