@@ -90,12 +90,16 @@ def last_line(result: subprocess.CompletedProcess) -> str:
 
 
 def cause_line(result: subprocess.CompletedProcess) -> str:
-    """The first line that says why a tool failed (npm leads with codes and ends with a log path)."""
+    """The first message that says why a tool failed, rejoined when it wraps over several lines
+    (npm leads with codes, ends with a log path and separates messages with a bare prefix line)."""
+    message: list[str] = []
     for line in (result.stderr.strip() or result.stdout.strip()).splitlines():
         text = re.sub(r"^(npm (error|ERR!)|error)\s*", "", line.strip())
         if text and not re.match(r"code \S+$|A complete log", text):
-            return line.strip()
-    return last_line(result)
+            message.append(line.strip() if not message else text)
+        elif message:
+            break
+    return " ".join(message) or last_line(result)
 
 
 def git(repo: Path, *args: str, check=True) -> str:
@@ -626,7 +630,10 @@ class Verifier:
         self.scratch = Path(tempfile.mkdtemp(prefix="slopbrake-verify-"))
         git(self.top, "worktree", "add", "--detach", str(self.scratch / "wt"), self.head)
         self.wt = self.scratch / "wt" / self.repo.relative_to(self.top)
-        self.stack = recorded_stack(self.wt) or detect_stack(self.wt)  # as committed
+        try:
+            self.stack = recorded_stack(self.wt) or detect_stack(self.wt)  # as committed
+        except UsageError:
+            return  # no kit at HEAD: verify reports it as a failed L1 proof
         if self.stack == "typescript" and (self.wt / "package.json").is_file():
             # A real install from the package manager's store; package managers reject a
             # symlinked node_modules and try to reinstall mid-check.
@@ -778,7 +785,12 @@ class Verifier:
                    subprocess.CompletedProcess([], 0 if short else 1, f"{len(lines)} lines", ""), "H1")
 
 
+NO_KIT_AT_HEAD = ("HEAD has no slopbrake kit (scripts/check, .claude/slopbrake.json): run `slopbrake init` "
+                  "if needed, commit the files `slopbrake init` wrote, then verify")
+
+
 def verify(repo: Path, keep: bool) -> dict:
+    git_toplevel(repo)  # a missing or non-git dir is a usage error before anything runs in it
     if run(["git", "status", "--porcelain", "."], repo).stdout.strip():
         note = "working tree has uncommitted changes; verify proves the committed HEAD only"
     else:
@@ -786,9 +798,9 @@ def verify(repo: Path, keep: bool) -> dict:
     verifier = Verifier(repo, keep)
     try:
         verifier.setup()
-        if not (verifier.wt / "scripts/check").is_file():
+        if not verifier.stack or not (verifier.wt / "scripts/check").is_file():
             verifier.proofs.append({"proof": "Slopbrake is committed at HEAD", "rule": "L1", "ok": False,
-                                    "output": ["HEAD has no scripts/check: commit the files `slopbrake init` wrote, then verify"]})
+                                    "output": [NO_KIT_AT_HEAD]})
         else:
             try:
                 verifier.run_all()

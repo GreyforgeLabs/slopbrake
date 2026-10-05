@@ -450,6 +450,22 @@ class Verify(Scratch):
         self.assert_one_line_error(self.gf("verify", str(self.root)))
         self.assert_nothing_leaked()
 
+    def test_missing_dir_is_an_environment_error(self):
+        missing = str(self.root / "nope")
+        self.assert_one_line_error(self.gf("verify", missing))
+        result = self.gf("verify", missing, "--json")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("no such directory", json.loads(result.stdout)["error"])
+
+    def test_head_without_a_kit_points_to_init_not_to_a_missing_option(self):
+        self.git_repo()  # committed, but no stack and no kit
+        result = self.gf("verify", str(self.root))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("HEAD has no slopbrake kit", result.stdout)
+        self.assertNotIn("--stack", result.stdout + result.stderr)
+        self.assertNotIn("slopbrake-verify-", result.stdout + result.stderr)
+        self.assert_nothing_leaked()
+
     def test_failed_dependency_install_exits_2_with_json_and_leaks_nothing(self):
         self.git_repo()
         self.write("package.json", '{"name": "t"}')
@@ -472,6 +488,23 @@ class Verify(Scratch):
                "echo 'npm error A complete log of this run can be found in: /x/debug.log' >&2; exit 1")
         result = self.gf("verify", str(self.root), "--json", path_prefix=str(self.fake_bin("npm", npm)))
         self.assertIn("existing package-lock.json", json.loads(result.stdout)["error"])
+
+    def test_failed_install_error_keeps_a_wrapped_message_whole(self):
+        self.git_repo()
+        self.write("package.json", '{"name": "t"}')
+        self.write("tsconfig.json", "{}")
+        self.gf("init", str(self.root))
+        self.commit("install slopbrake")
+        npm = ("echo 'npm error code EUSAGE' >&2; echo 'npm error' >&2; "
+               "echo 'npm error The npm ci command can only install with an existing package-lock.json or' >&2; "
+               "echo 'npm error npm-shrinkwrap.json with lockfileVersion >= 1. Run an install with npm@5 or' >&2; "
+               "echo 'npm error later to generate a package-lock.json file, then try again.' >&2; "
+               "echo 'npm error' >&2; echo 'npm error Clean install a project' >&2; exit 1")
+        error = json.loads(self.gf("verify", str(self.root), "--json",
+                                   path_prefix=str(self.fake_bin("npm", npm))).stdout)["error"]
+        self.assertIn("existing package-lock.json or npm-shrinkwrap.json", error)
+        self.assertIn("then try again.", error)
+        self.assertNotIn("Clean install", error)
 
     def test_failure_output_shows_the_failing_stage_summary(self):
         self.noop_repo()
