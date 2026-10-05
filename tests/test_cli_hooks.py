@@ -93,9 +93,9 @@ class UserHooks(Scratch):
         self.assertTrue(status["installed"])
         self.assertEqual(self.gf("user-hooks", "uninstall", "--settings", str(self.settings)).returncode, 0)
         self.assertEqual(json.loads(self.settings.read_text()), {"model": "x", "hooks": {"Stop": [{"hooks": [mine]}]}})
-        # B18: nothing installed is informational, not a failure.
+        # status is a health check: nothing installed exits 1 (B18 changed only the wording).
         result = self.gf("user-hooks", "status", "--settings", str(self.settings), "--json")
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(result.stdout)["installed"])
 
     def test_unparsable_settings_are_left_alone(self):

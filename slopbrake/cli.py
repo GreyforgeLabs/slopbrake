@@ -866,13 +866,13 @@ def main(argv: list[str] | None = None) -> int:
     p_user.add_argument("repo", type=Path, nargs="?", help="the repo to trust or untrust")
     p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
     p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
-    p_hook.add_argument("event", choices=["pre-tool-use", "post-tool-use", "stop"])
+    p_hook.add_argument("event", nargs="?", help="pre-tool-use|post-tool-use|stop (hooks.main validates it: never exit 2)")
     for p in (p_init, p_status, p_verify, p_user):
         p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "hook":
-        return hooks.main([args.event])
+        return hooks.main([args.event] if args.event else [])
     try:
         if args.command == "init":
             repo = args.repo.resolve()

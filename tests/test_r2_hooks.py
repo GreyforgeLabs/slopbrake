@@ -317,7 +317,7 @@ class SettingsFile(R2):
         old = self.shim("old", "exit 2", "slopbrake-hook")
         path = f"{old}{os.pathsep}{os.environ['PATH']}"
         result = self.gf("user-hooks", "status", "--settings", str(self.settings), PATH=path)
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout)  # a health check; B18 fixed only the wording
         self.assertNotIn("block every session", result.stdout)
         self.assertIn("none", result.stdout)
         self.assertIn("install refuses until", result.stdout)

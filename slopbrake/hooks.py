@@ -119,15 +119,29 @@ def trusted() -> list[str]:
     return string_list(data.get("repos")) if isinstance(data, dict) else []
 
 
+def main_checkout(path) -> Path | None:
+    """The main worktree of the repository holding path: a linked worktree (.claude/worktrees/<x>) and its
+    main checkout are one repository, which can check out the same branches, so they share one trust entry."""
+    path = Path(path).expanduser()
+    if not path.is_dir():
+        return None
+    result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path,
+                            capture_output=True, text=True, check=False)
+    common = Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+    return common.parent if common and common.name == ".git" else toplevel(path)
+
+
 def is_trusted(repo: Path) -> bool:
-    """Whether the Stop gate may run repo's own scripts: the operator listed its toplevel."""
-    return str(Path(repo).expanduser().resolve()) in trusted()
+    """Whether the Stop gate may run repo's own scripts: the operator trusted its repository (the main
+    checkout, so its linked worktrees count too)."""
+    path, known = Path(repo).expanduser().resolve(), trusted()
+    return str(path) in known or ((path / ".git").is_file() and str(main_checkout(path)) in known)
 
 
 def trust(repo: Path) -> Path:
-    """Trust the git repo holding repo; returns its toplevel."""
+    """Trust the git repository holding repo; returns its main checkout."""
     path = Path(repo).expanduser()
-    top = toplevel(path) if path.exists() else None
+    top = main_checkout(path) if path.exists() else None
     if top is None:
         raise SettingsError(f"{repo} is not inside a git repository")
     update_json(trust_path(), lambda data: data.update(repos=sorted({*string_list(data.get("repos")), str(top)})))
@@ -135,11 +149,11 @@ def trust(repo: Path) -> Path:
 
 
 def untrust(repo: Path) -> bool:
-    """Forget repo (or the toplevel holding it); False when it was not trusted."""
+    """Forget repo (or the repository holding it); False when it was not trusted."""
     path = Path(repo).expanduser().resolve()
     names = {str(path)}
     if path.is_dir():
-        names.add(str(toplevel(path) or path))
+        names |= {str(toplevel(path) or path), str(main_checkout(path) or path)}
 
     def change(data):
         known = string_list(data.get("repos"))
@@ -289,8 +303,9 @@ def snapshot(repo: Path) -> str | None:
     try:
         head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=repo, capture_output=True,
                               timeout=30, check=False).stdout
-        status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=repo,
-                                capture_output=True, timeout=30, check=False)
+        # --no-optional-locks: never take index.lock or rewrite .git/index in a repo the hook only observes
+        status = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                                 "--untracked-files=all"], cwd=repo, capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if status.returncode:
@@ -493,8 +508,7 @@ def untrusted() -> list[str]:
             seen.update(string_list(json.loads(path.read_text(encoding="utf-8")).get("repos")))
         except (OSError, ValueError, AttributeError):
             continue
-    known = set(trusted())
-    return sorted(r for r in seen if r not in known and (Path(r) / ".claude/slopbrake.json").is_file())
+    return sorted(r for r in seen if (Path(r) / ".claude/slopbrake.json").is_file() and not is_trusted(Path(r)))
 
 
 def user_status(path: Path) -> dict:
@@ -505,8 +519,7 @@ def user_status(path: Path) -> dict:
                  for e in hook_entries(data, event) for c in commands(e))
     binary, ready = runnable()
     installed, disabled = all(events.values()), bool(data.get("disableAllHooks"))
-    # Not installed is informational (the hooks are opt-in); installed but unable to fire is not.
-    ok = not (any(events.values()) or legacy) or (installed and not legacy and ready and not disabled)
+    ok = installed and not legacy and ready and not disabled  # a health check: 0 only when the hooks can fire
     return {"settings": str(path), "events": events, "installed": installed, "legacy": legacy,
             "on_path": binary is not None, "binary": binary, "runnable": ready, "disabled": disabled,
             "trusted": trusted(), "untrusted": untrusted(), "ok": ok}
