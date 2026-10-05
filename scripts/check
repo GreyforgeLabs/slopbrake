@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
-# Slopbrake's own gate: pinned ruff, the behaviour tests of every Python check, and the
-# RuleTester cases for the ESLint rule. The pre-commit hook and CI run this.
+# Slopbrake's own gate: pinned ruff, the behaviour tests of every Python check, its own T1
+# check over those tests, the RuleTester cases for the ESLint rules, and its own T4 mutation
+# floor on the kit's changed lines. The pre-commit hook runs it with --fast (no mutation);
+# pre-push and CI run it in full.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # Git exports these to hooks; the tests run git in temp repos and must not inherit them.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+fast=0
+[ "${1:-}" = --fast ] && fast=1
 status=0
 echo "── lint ──";   uvx ruff@0.16.9 check . || status=1
 echo "── tests ──";  python3 -m unittest discover -s tests || status=1
+echo "── test quality ──"; python3 slopbrake/kit/common/scripts/slopbrake/tautology_py.py tests || status=1
 echo "── eslint rule ──"
 ( cd tests/eslint && { [ -d node_modules ] || npm install --silent --no-audit --no-fund; } && npm test --silent ) || status=1
+if [ "$fast" -eq 0 ]; then
+  # T4 on the kit (what repos install); cli.py and hooks.py are not measured yet. The full suite
+  # takes ~80 s, so mutants are sampled (MUTATION_MAX) and the suite stops at the first failure.
+  # 2026-10-05, the audit fixes vs main 431e458, 60 mutants: 38 killed = 63%.
+  echo "── mutation ──"
+  # CI checks out one commit: fetch the PR's base and history so changed lines can be measured.
+  if [ -n "${GITHUB_BASE_REF:-}" ] && ! git rev-parse -q --verify "origin/$GITHUB_BASE_REF^{commit}" >/dev/null; then
+    if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --no-tags --unshallow origin; fi
+    git fetch -q --no-tags origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+  fi
+  MUTATION_MAX=40 python3 slopbrake/kit/common/scripts/slopbrake/mutation_py.py --floor 60 \
+    --test-cmd "python3 -m unittest discover -s tests -f" \
+    --exclude slopbrake/cli.py --exclude slopbrake/hooks.py --exclude slopbrake/__init__.py
+  case $? in 0|78) ;; *) status=1 ;; esac
+fi
 exit $status
