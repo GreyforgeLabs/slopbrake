@@ -30,20 +30,22 @@ class Scratch(unittest.TestCase):
         self.state = self.base / "state"
         self.settings = self.base / "home/.claude/settings.json"
         self.marker = self.base / "stop-ran"
-        # The `slopbrake` Claude Code would run: this checkout, not whatever build is installed.
+        # The `slopbrake` and `slopbrake-hook` Claude Code would run: this checkout, not whatever build is installed.
         self.good_bin = self.shim("good", f'PYTHONPATH={HOME} exec {sys.executable} -m slopbrake "$@"')
+        self.shim("good", f'PYTHONPATH={HOME} exec {sys.executable} -m slopbrake.hooks "$@"', "slopbrake-hook")
 
-    def shim(self, name, body):
+    def shim(self, name, body, program="slopbrake"):
         bindir = self.base / "bin" / name
-        bindir.mkdir(parents=True)
-        (bindir / "slopbrake").write_text(f"#!/bin/sh\n{body}\n")
-        (bindir / "slopbrake").chmod(0o755)
+        bindir.mkdir(parents=True, exist_ok=True)
+        (bindir / program).write_text(f"#!/bin/sh\n{body}\n")
+        (bindir / program).chmod(0o755)
         return bindir
 
     def env(self, **extra):
         return {**os.environ, "PYTHONPATH": str(HOME), "HOME": str(self.base / "home"),
                 "PATH": f"{self.good_bin}{os.pathsep}{os.environ['PATH']}",
-                "XDG_STATE_HOME": str(self.state), "CLAUDE_PROJECT_DIR": str(self.base), **extra}
+                "XDG_STATE_HOME": str(self.state), "XDG_CONFIG_HOME": str(self.base / "config"),
+                "CLAUDE_PROJECT_DIR": str(self.base), **extra}
 
     def gf(self, *args, stdin=None, **env):
         return sh([sys.executable, "-m", "slopbrake", *args], self.base, env=self.env(**env), stdin=stdin)
@@ -67,7 +69,7 @@ class Scratch(unittest.TestCase):
 
     def touched(self, session="s1"):
         path = self.state / "slopbrake/sessions" / f"{session}.json"
-        return json.loads(path.read_text())["repos"] if path.is_file() else []
+        return json.loads(path.read_text()).get("repos", []) if path.is_file() else []
 
     def hook(self, event, payload, **env):
         return self.gf("hook", event, stdin=json.dumps({"session_id": "s1", **payload}), **env)
@@ -83,15 +85,18 @@ class UserHooks(Scratch):
         data = json.loads(self.settings.read_text())
         self.assertEqual(data["model"], "x")
         commands = [h["command"] for e in data["hooks"]["Stop"] for h in e["hooks"]]
-        self.assertEqual(commands, ["my-linter", "slopbrake hook stop"])
+        self.assertEqual(commands, ["my-linter", "slopbrake-hook stop"])  # B11 (a): its own console script
         for event in ("PreToolUse", "PostToolUse"):
-            self.assertEqual(sum(h["command"].startswith("slopbrake hook") for e in data["hooks"][event]
+            self.assertEqual(sum(h["command"].startswith("slopbrake-hook") for e in data["hooks"][event]
                                  for h in e["hooks"]), 1)
         status = json.loads(self.gf("user-hooks", "status", "--settings", str(self.settings), "--json").stdout)
         self.assertTrue(status["installed"])
         self.assertEqual(self.gf("user-hooks", "uninstall", "--settings", str(self.settings)).returncode, 0)
         self.assertEqual(json.loads(self.settings.read_text()), {"model": "x", "hooks": {"Stop": [{"hooks": [mine]}]}})
-        self.assertEqual(self.gf("user-hooks", "status", "--settings", str(self.settings)).returncode, 1)
+        # status is a health check: nothing installed exits 1 (B18 changed only the wording).
+        result = self.gf("user-hooks", "status", "--settings", str(self.settings), "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(json.loads(result.stdout)["installed"])
 
     def test_unparsable_settings_are_left_alone(self):
         self.settings.parent.mkdir(parents=True)
@@ -102,14 +107,14 @@ class UserHooks(Scratch):
         self.assertEqual(self.settings.read_text(), "{ // nope\n")
 
     def test_install_refuses_a_slopbrake_on_path_that_cannot_run_hook(self):
-        # An older build answers `slopbrake hook` with an argparse error (exit 2), which
-        # Claude Code reads as "block": every Bash call and every Stop would be refused.
-        old = self.shim("old", "echo \"slopbrake: error: argument command: invalid choice: 'hook'\" >&2; exit 2")
+        # A broken build that answers with exit 2, which Claude Code reads as "block": every
+        # Bash call and every Stop would be refused.
+        old = self.shim("old", "echo \"slopbrake-hook: error\" >&2; exit 2", "slopbrake-hook")
         path = f"{old}{os.pathsep}{os.environ['PATH']}"
         result = self.gf("user-hooks", "install", "--settings", str(self.settings), PATH=path)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertNotIn("Traceback", result.stderr)
-        self.assertIn("slopbrake hook", result.stderr)
+        self.assertIn("slopbrake-hook", result.stderr)
         self.assertFalse(self.settings.exists())
         self.assertEqual(self.gf("user-hooks", "install", "--settings", str(self.settings)).returncode, 0)
         result = self.gf("user-hooks", "status", "--settings", str(self.settings), "--json", PATH=path)
@@ -123,7 +128,8 @@ class UserHooks(Scratch):
     def test_runnable_probe_ignores_the_installers_pythonpath(self):
         # Claude Code runs the hook without the installer's PYTHONPATH: an old build that only
         # works with a dev checkout on PYTHONPATH must not pass the probe.
-        dev_only = self.shim("dev-only", f'[ -n "$PYTHONPATH" ] && exec {sys.executable} -m slopbrake "$@"; exit 2')
+        dev_only = self.shim("dev-only", f'[ -n "$PYTHONPATH" ] && exec {sys.executable} -m slopbrake.hooks "$@"; exit 2',
+                             "slopbrake-hook")
         path = f"{dev_only}{os.pathsep}{os.environ['PATH']}"
         result = self.gf("user-hooks", "install", "--settings", str(self.settings), PATH=path)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -141,21 +147,28 @@ class PostToolUse(Scratch):
                                                      "tool_input": {"file_path": str(shop / "src/a.py")}}).returncode, 0)
         self.hook("post-tool-use", {"tool_name": "Write", "cwd": str(self.base),
                                     "tool_input": {"file_path": str(other / "src/new.py")}})
-        self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(other),
-                                    "tool_input": {"command": f"cd {web}/src && ls; git -C {other} status"}})
+        # B11 (c): PreToolUse snapshots the Bash targets; PostToolUse records the ones that changed.
+        bash = {"tool_name": "Bash", "cwd": str(other), "tool_use_id": "b1",
+                "tool_input": {"command": f"cd {web}/src && touch new.py; git -C {other} status"}}
+        self.assertEqual(self.hook("pre-tool-use", bash).returncode, 0)
+        (web / "src/new.py").touch()
+        self.hook("post-tool-use", bash)
         self.assertEqual(self.touched(), sorted([str(shop), str(web)]))
 
-    def test_bash_cwd_and_git_dash_c_count(self):
+    def test_bash_targets_without_a_snapshot_are_not_recorded(self):
+        # B11 (c), round 2 review: with no PreToolUse snapshot there is no evidence of a change, and the
+        # payload's cwd may already be a repo a `cd` moved into; recording it would gate the operator's WIP.
         shop, web = self.repo("shop"), self.repo("web")
         self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(shop / "src"), "tool_input": {"command": "true"}})
         self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(self.base),
                                     "tool_input": {"command": f'git -C "{web}" commit -m x'}})
-        self.assertEqual(self.touched(), sorted([str(shop), str(web)]))
+        self.assertEqual(self.touched(), [])
 
 
 class Stop(Scratch):
     def test_runs_require_green_in_each_touched_repo(self):
         shop = self.repo("shop")
+        self.gf("user-hooks", "trust", str(shop))  # B11 (b): only trusted repos' scripts run
         self.hook("post-tool-use", {"tool_name": "Edit", "tool_input": {"file_path": str(shop / "src/a.py")},
                                     "cwd": str(self.base)})
         result = self.hook("stop", {"stop_hook_active": False})
@@ -165,6 +178,7 @@ class Stop(Scratch):
 
     def test_skips_the_project_repo_when_its_own_hooks_are_wired(self):
         shop = self.repo("shop")
+        self.gf("user-hooks", "trust", str(shop))  # B11 (b): only trusted repos' scripts run
         self.hook("post-tool-use", {"tool_name": "Edit", "tool_input": {"file_path": str(shop / "src/a.py")},
                                     "cwd": str(shop)})
         (shop / ".claude/settings.json").write_text(KIT_SETTINGS)

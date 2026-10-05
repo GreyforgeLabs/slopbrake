@@ -323,7 +323,7 @@ def resolve(base, path):
 def managed(path):
     """True when path is inside a git repo whose toplevel has .claude/slopbrake.json."""
     if path is None:
-        return True  # unknown directory: judge it rather than let it through
+        return True  # unknown directory: judge it rather than let it through (callers pass the session cwd)
     path = os.path.abspath(path)
     while not os.path.exists(path) and os.path.dirname(path) != path:
         path = os.path.dirname(path)
@@ -391,22 +391,29 @@ def whole_tree(spec):
 
 
 class Judge:
-    def __init__(self, cwd, scope, depth=0, env=None):
+    def __init__(self, cwd, scope, depth=0, env=None, session=None):
         self.dir, self.scope, self.depth, self.env = cwd, scope, depth, env or {}
+        self.session = session or cwd  # the hook's cwd: stands in for directories that can't be known
         self.procsubs, self.cmdsubs = {}, {}
 
     def string(self, text, cwd=False):
         if cwd is not False:
-            return Judge(cwd, self.scope, self.depth + 1, dict(self.env)).string(text)
+            return Judge(cwd, self.scope, self.depth + 1, dict(self.env), self.session).string(text)
         if self.depth > MAX_DEPTH:
-            return "the command nests shells too deeply to check"
+            return self.unscoped("the command nests shells too deeply to check")
         try:
             toks = Lexer(text).tokens()
         except Unparseable:
             match = FALLBACK.search(text)
-            return f"the command does not parse and looks like a destructive git command ({match.group(0)!r})" \
-                if match else None
+            return self.unscoped(f"the command does not parse and looks like a destructive git command "
+                                 f"({match.group(0)!r})") if match else None
         return self.tokens(toks)
+
+    def unscoped(self, reason):
+        """A reason tied to no git invocation: in managed scope it counts only in a known managed directory or
+        from a managed session cwd (an unknown directory falls back to the session cwd)."""
+        known = self.dir is not None and managed(self.dir)
+        return reason if self.scope != "managed" or known or managed(self.session) else None
 
     def nested(self, text):
         return self.string(text, cwd=self.dir)
@@ -648,7 +655,9 @@ class Git:
         if i >= len(args):
             return None
         reason = self.config_reason() or self.subcommand(args[i], args[i + 1:])
-        if reason and not self.nested and self.judge.scope == "managed" and not managed(self.effective_dir()):
+        target = self.effective_dir()
+        if reason and not self.nested and self.judge.scope == "managed" and \
+                not managed(self.judge.session if target is None else target):
             return None
         return reason
 

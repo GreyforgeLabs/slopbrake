@@ -5,7 +5,9 @@
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
   slopbrake user-hooks install|uninstall|status [--settings PATH] [--json]
-  slopbrake hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin)
+  slopbrake user-hooks trust|untrust REPO           (the Stop gate runs only trusted repos' scripts)
+  slopbrake-hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin;
+                                                      `slopbrake hook` is an alias)
 
 init writes two kinds of files. Managed files (scripts/slopbrake, hooks, the reviewer
 agent, vendored skills) belong to the kit: --update refreshes them. Seeded files
@@ -833,13 +835,7 @@ def print_human(command: str, result) -> None:
             for gap in r["gaps"]:
                 print(f"      - {gap}")
     elif command == "user-hooks":
-        on = " ".join(event for event, present in result["events"].items() if present) or "none"
-        print(f"slopbrake user hooks in {result['settings']}: {on}")
-        if not result["on_path"]:
-            print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
-        elif not result["runnable"]:
-            print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
-                  "install this slopbrake version or run slopbrake user-hooks uninstall")
+        print("\n".join(hooks.user_lines(result)))
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -866,16 +862,17 @@ def main(argv: list[str] | None = None) -> int:
     p_verify.add_argument("repo", type=Path)
     p_verify.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
     p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into ~/.claude/settings.json")
-    p_user.add_argument("action", choices=["install", "uninstall", "status"])
+    p_user.add_argument("action", choices=["install", "uninstall", "status", "trust", "untrust"])
+    p_user.add_argument("repo", type=Path, nargs="?", help="the repo to trust or untrust")
     p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
     p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
-    p_hook.add_argument("event", choices=["pre-tool-use", "post-tool-use", "stop"])
+    p_hook.add_argument("event", nargs="?", help="pre-tool-use|post-tool-use|stop (hooks.main validates it: never exit 2)")
     for p in (p_init, p_status, p_verify, p_user):
         p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "hook":
-        return hooks.run(args.event, sys.stdin.read())
+        return hooks.main([args.event] if args.event else [])
     try:
         if args.command == "init":
             repo = args.repo.resolve()
@@ -892,10 +889,8 @@ def main(argv: list[str] | None = None) -> int:
             result = verify(args.repo.resolve(), args.keep)
             ok = result["ok"]
         else:
-            action = {"install": hooks.install, "uninstall": hooks.uninstall, "status": hooks.user_status}[args.action]
-            result = action(args.settings or hooks.default_settings())
-            ok = result["installed"] != (args.action == "uninstall")
-            ok = ok and (args.action != "status" or result["runnable"])
+            result = hooks.user_command(args.action, args.settings, args.repo)
+            ok = result["ok"]
     except (UsageError, hooks.SettingsError, RuntimeError) as exc:
         message = " ".join(str(exc).split())
         if args.json:
