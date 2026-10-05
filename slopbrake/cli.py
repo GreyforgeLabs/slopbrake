@@ -4,12 +4,15 @@
   slopbrake init REPO [--stack auto|python|typescript] [--update] [--dry-run] [--json]
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
+  slopbrake user-hooks install|uninstall|status [--settings PATH] [--json]
+  slopbrake hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin)
 
 init writes two kinds of files. Managed files (scripts/slopbrake, hooks, the reviewer
 agent, vendored skills) belong to the kit: --update refreshes them. Seeded files
 (CLAUDE.md, CODING_STANDARDS.md, door rules, scripts/check, retro log, CI) belong to the
 repo once written: init never overwrites them. verify runs a proof for each rule
-in a throwaway git worktree, so the repo's working tree is never touched.
+in a throwaway git worktree, so the repo's working tree is never touched. user-hooks wires
+the git guard and Stop gate into ~/.claude/settings.json for sessions started elsewhere.
 Exit codes: 0 ok, 1 a check or proof failed, 2 usage or environment error.
 """
 from __future__ import annotations
@@ -17,12 +20,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from slopbrake import hooks
 
 HOME = Path(__file__).resolve().parent  # the package: kit/ and vendor/ ship inside it
 KIT = HOME / "kit"
@@ -50,6 +57,16 @@ SPEC_FILES = ["CLAUDE.md", "CODING_STANDARDS.md", ".claude/agents/reviewer.md",
               "docs/agents/retro-log.md", "docs/agents/issue-tracker.md"]
 CLAUDE_MD_MAX_LINES = 40
 GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/"]}
+LAST_GREEN = "refs/slopbrake/last-green"
+META = ".claude/slopbrake.json"
+TYPES_PLACEHOLDER = "no type checker configured"
+ESLINT_CONFIGS = [f"eslint.config.{ext}" for ext in ("js", "mjs", "cjs", "ts", "mts", "cts")] + [
+    f".eslintrc{ext}" for ext in ("", ".js", ".cjs", ".json", ".yml", ".yaml")]
+SKIP_DIRS = {"node_modules", "__pycache__", "venv", "env", "build", "dist", "site-packages"}
+
+
+class UsageError(Exception):
+    """A usage or environment problem: exit 2 with one line, never a traceback."""
 
 
 @dataclass
@@ -62,8 +79,13 @@ class Action:
 def run(cmd, cwd: Path, env=None, check=False) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, shell=isinstance(cmd, str), check=False)
     if check and result.returncode != 0:
-        raise RuntimeError(f"{cmd} failed in {cwd}:\n{result.stdout}{result.stderr}")
+        raise RuntimeError(f"{cmd if isinstance(cmd, str) else ' '.join(cmd)} failed in {cwd}: {last_line(result)}")
     return result
+
+
+def last_line(result: subprocess.CompletedProcess) -> str:
+    lines = (result.stderr.strip() or result.stdout.strip()).splitlines()
+    return lines[-1] if lines else f"exit {result.returncode}"
 
 
 def git(repo: Path, *args: str, check=True) -> str:
@@ -79,12 +101,30 @@ def kit_version() -> str:
 
 # ── detection ────────────────────────────────────────────────────────────────
 
+def git_toplevel(path: Path) -> Path:
+    if not path.is_dir():
+        raise UsageError(f"{path}: no such directory")
+    result = run(["git", "rev-parse", "--show-toplevel"], path)
+    if result.returncode != 0:
+        raise UsageError(f"{path} is not inside a git repository (git init first)")
+    return Path(result.stdout.strip()).resolve()
+
+
 def detect_stack(repo: Path) -> str:
     if (repo / "package.json").is_file() and (repo / "tsconfig.json").is_file():
         return "typescript"
     if (repo / "pyproject.toml").is_file() or (repo / "setup.py").is_file():
         return "python"
-    raise SystemExit(f"slopbrake: cannot detect a supported stack in {repo} (python, typescript); pass --stack")
+    raise UsageError(f"cannot detect a supported stack in {repo} (python, typescript); pass --stack")
+
+
+def recorded_stack(repo: Path) -> str | None:
+    """The stack init recorded, which wins over detection (a python repo may also have a package.json)."""
+    try:
+        stack = json.loads((repo / META).read_text(encoding="utf-8")).get("stack")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return stack if stack in ("python", "typescript") else None
 
 
 def github_remote(repo: Path) -> bool:
@@ -95,21 +135,93 @@ def default_branch(repo: Path) -> str:
     for name in ("main", "master"):
         if run(["git", "rev-parse", "--verify", "-q", name], repo).returncode == 0:
             return name
-    return git(repo, "branch", "--show-current") or "main"
+    return git(repo, "branch", "--show-current", check=False) or "main"
 
 
 def package_manager(repo: Path) -> str:
-    for lock, pm in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lockb", "bun")):
+    for lock, pm in (("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lockb", "bun"), ("bun.lock", "bun")):
         if (repo / lock).is_file():
             return pm
     return "npm"
 
 
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+
+
+def pyproject(repo: Path) -> dict:
+    try:
+        return tomllib.loads(read_text(repo / "pyproject.toml"))
+    except ValueError:
+        return {}
+
+
+def declared_requirements(data: dict) -> list[str]:
+    """Requirement strings and names from every dependency list a pyproject can declare."""
+    project, tool = data.get("project", {}), data.get("tool", {})
+    lists = [project.get("dependencies", []), *project.get("optional-dependencies", {}).values(),
+             *data.get("dependency-groups", {}).values(), tool.get("uv", {}).get("dev-dependencies", [])]
+    poetry = tool.get("poetry", {})
+    names = [*poetry.get("dependencies", {}), *poetry.get("dev-dependencies", {}),
+             *(name for group in poetry.get("group", {}).values() for name in group.get("dependencies", {}))]
+    return [req for reqs in lists for req in reqs if isinstance(req, str)] + names
+
+
+def uses_pytest(repo: Path) -> bool:
+    if "[tool.pytest" in read_text(repo / "pyproject.toml") or (repo / "pytest.ini").is_file():
+        return True
+    if "[pytest]" in read_text(repo / "tox.ini") or "[tool:pytest]" in read_text(repo / "setup.cfg"):
+        return True
+    for _, dirs, files in os.walk(repo):
+        if "conftest.py" in files:
+            return True
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+    return any(re.split(r"[\s\[<>=!~;@(]", req.strip(), maxsplit=1)[0].lower() == "pytest"
+               for req in declared_requirements(pyproject(repo)))
+
+
+def python_interpreter(repo: Path) -> str:
+    # $PWD expands when scripts/check assigns TEST_CMD (at the repo root), so the mutation
+    # stage's scratch copy, which has no .venv, still runs the project's interpreter.
+    if (repo / "uv.lock").is_file():
+        return "uv run --frozen python"
+    return "$PWD/.venv/bin/python" if (repo / ".venv").is_dir() else "python3"
+
+
 def python_test_cmd(repo: Path) -> str:
-    pyproject = (repo / "pyproject.toml").read_text(encoding="utf-8") if (repo / "pyproject.toml").is_file() else ""
-    if "[tool.pytest" in pyproject or (repo / "pytest.ini").is_file() or (repo / "conftest.py").is_file():
-        return "python3 -m pytest -q"
-    return "python3 -m unittest discover -s tests"
+    """pytest when the repo configures or declares it anywhere (it runs unittest tests too)."""
+    py = python_interpreter(repo)
+    return f"{py} -m pytest -q" if uses_pytest(repo) else f"{py} -m unittest discover -s tests"
+
+
+def python_ci_install(repo: Path, test_cmd: str) -> str:
+    if (repo / "uv.lock").is_file():
+        return "uv sync --frozen --all-extras --all-groups"
+    extras = [e for e in ("dev", "test") if e in pyproject(repo).get("project", {}).get("optional-dependencies", {})]
+    target = "'.[" + ",".join(extras) + "]'" if extras else "."
+    pip = f"-m pip install -e {target}" + (" pytest" if "-m pytest" in test_cmd else "")
+    return f"python3 -m venv .venv && .venv/bin/python {pip}" if (repo / ".venv").is_dir() else f"python3 {pip}"
+
+
+def node_ci(repo: Path, pm: str) -> tuple[str, str]:
+    """(CI_SETUP, CI_INSTALL) for the TypeScript workflow: step items indented 6 spaces, one command."""
+    try:
+        package = json.loads(read_text(repo / "package.json") or "{}")
+    except ValueError:
+        package = {}
+    package = package if isinstance(package, dict) else {}
+    engines = package.get("engines")
+    version = next((f"node-version-file: {name}" for name, ok in (
+        ("package.json", isinstance(engines, dict) and bool(engines.get("node"))),
+        (".nvmrc", (repo / ".nvmrc").is_file()), (".node-version", (repo / ".node-version").is_file())) if ok),
+        "node-version: 22")
+    node = ["- uses: actions/setup-node@v4", "  with:", f"    {version}", f"    cache: {pm}"]
+    pnpm = ["- uses: pnpm/action-setup@v4"] + ([] if package.get("packageManager") else ["  with:", "    version: 10"])
+    steps = {"pnpm": pnpm + node, "npm": node, "yarn": ["- run: corepack enable", *node],
+             "bun": ["- uses: oven-sh/setup-bun@v2"]}[pm]
+    install = {"pnpm": "pnpm install --frozen-lockfile", "npm": "npm ci", "yarn": "yarn install --frozen-lockfile",
+               "bun": "bun install --frozen-lockfile"}[pm]
+    return "\n".join("      " + step for step in steps), install
 
 
 # ── init ─────────────────────────────────────────────────────────────────────
@@ -159,19 +271,25 @@ def planned_files(repo: Path, stack: str) -> dict[str, str]:
 def substitutions(repo: Path, stack: str) -> dict[str, str]:
     subs = {"DEFAULT_BRANCH": default_branch(repo), "PACKAGES_ROOT": "src"}
     if stack == "python":
+        test_cmd = python_test_cmd(repo)
         subs |= {
-            "TEST_CMD": python_test_cmd(repo),
+            "TEST_CMD": test_cmd,
             "LINT_CMD": "uvx ruff@0.16.9 check .",
-            "TYPES_CMD": 'echo "types: no type checker configured for this repo yet; edit scripts/check"',
-            "CI_INSTALL": "python3 -m pip install -e .",
+            "TYPES_CMD": f'echo "types: skipped: {TYPES_PLACEHOLDER} (edit scripts/check)"; return 78',
+            "CI_INSTALL": python_ci_install(repo, test_cmd),
         }
     else:
-        tests = [g for g in ("'tests/**/*.ts'", "'src/**/*.test.ts'") if (repo / g.strip("'").split("/")[0]).is_dir()]
+        pm = package_manager(repo)
+        roots = ["src"] + ([] if (repo / "src").is_dir() else ["lib"])
+        ci_setup, ci_install = node_ci(repo, pm)
         subs |= {
-            "PM": package_manager(repo),
+            "PM": pm,
             "DEPCRUISE_PATHS": " ".join(d for d in ("src", "tests") if (repo / d).is_dir()) or ".",
-            "TEST_GLOBS": " ".join(tests) or "'**/*.test.ts'",
-            "MUTATE_INCLUDE": "--include 'src/**/*.ts'",
+            "TEST_GLOBS": " ".join(f"'{d}/**/*.{kind}.{ext}'" for d in ("tests", "src") for kind in ("test", "spec")
+                                   for ext in ("ts", "tsx")),
+            "MUTATE_INCLUDE": " ".join(f"--include '{root}/**/*.{ext}'" for root in roots for ext in ("ts", "tsx")),
+            "CI_SETUP": ci_setup,
+            "CI_INSTALL": ci_install,
         }
     return subs
 
@@ -181,25 +299,29 @@ def is_managed(rel: str) -> bool:
 
 
 def merge_settings(existing: dict, kit: dict) -> dict:
+    """Add each kit hook entry unless an entry with the same matcher already runs its commands."""
     merged = json.loads(json.dumps(existing))
+    merged["hooks"] = merged.get("hooks") or {}
     for event, entries in kit.get("hooks", {}).items():
-        target = merged.setdefault("hooks", {}).setdefault(event, [])
-        present = {h.get("command") for entry in target for h in entry.get("hooks", [])}
+        target = merged["hooks"][event] = merged["hooks"].get(event) or []
         for entry in entries:
-            if not all(h.get("command") in present for h in entry["hooks"]):
+            present = {c for e in target if e.get("matcher") == entry.get("matcher") for c in hooks.commands(e)}
+            if not set(hooks.commands(entry)) <= present:
                 target.append(entry)
     return merged
 
 
 def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
+    top = git_toplevel(repo)
+    existing_settings = hooks.load_settings(repo / ".claude/settings.json")  # refuse before writing anything
     files = planned_files(repo, stack)
     actions: list[Action] = []
     for rel, content in sorted(files.items()):
         target = repo / rel
         if rel == ".claude/settings.json" and target.is_file():
-            merged = merge_settings(json.loads(target.read_text(encoding="utf-8")), json.loads(content))
+            merged = merge_settings(existing_settings, json.loads(content))
             new = json.dumps(merged, indent=2) + "\n"
-            if json.loads(target.read_text(encoding="utf-8")) == merged:
+            if existing_settings == merged:
                 actions.append(Action(rel, "unchanged"))
             else:
                 actions.append(Action(rel, "merge", "added the kit's hooks to existing settings"))
@@ -233,11 +355,21 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
             prefix = "" if not ignored or ignore_file.read_text(encoding="utf-8").endswith("\n") else "\n"
             with ignore_file.open("a", encoding="utf-8") as handle:
                 handle.write(prefix + "".join(entry + "\n" for entry in missing))
+    if git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False) and \
+            not git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False):
+        actions.append(Action(LAST_GREEN, "create", "the last-green ratchet starts at HEAD"))
+        if not dry_run:
+            git(repo, "update-ref", LAST_GREEN, "HEAD")
     hooks_path = git(repo, "config", "--get", "core.hooksPath", check=False)
-    live_hooks = [p.name for p in (repo / ".git" / "hooks").glob("*") if not p.name.endswith(".sample")] \
-        if (repo / ".git" / "hooks").is_dir() else []
+    hooks_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
+    live_hooks = sorted(p.name for p in hooks_dir.glob("*") if not p.name.endswith(".sample")) \
+        if not hooks_path and hooks_dir.is_dir() else []
     hooks_note = "core.hooksPath already .githooks"
-    if hooks_path != ".githooks":
+    if repo != top:
+        rel = repo.relative_to(top)
+        hooks_note = (f"left alone: {rel} is a subdirectory of the git repo {top}; chain by hand: run "
+                      f"{rel}/scripts/check --fast from pre-commit and {rel}/scripts/check from pre-push in {hooks_dir}")
+    elif hooks_path != ".githooks":
         if hooks_path or live_hooks:
             hooks_note = f"left alone: existing hooks ({hooks_path or ', '.join(live_hooks)}); chain .githooks by hand"
         else:
@@ -256,14 +388,39 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
             ("wire the tautology rule into eslint.config.js: import slopbrake from './eslint-rules/slopbrake.mjs' and "
             "add { files: [<test globs>], plugins: { slopbrake }, rules: { 'slopbrake/no-tautological-test': 'error' } }"),
         ]
-    if stack == "python" and "no type checker configured" in (repo / "scripts/check").read_text(encoding="utf-8"):
-        next_steps.append("choose a type checker for the types stage in scripts/check (it prints 'not configured' until then)")
+    check_text = read_text(repo / "scripts/check") or files.get("scripts/check", "")  # a dry run wrote nothing
+    if stack == "python" and TYPES_PLACEHOLDER in check_text:
+        next_steps.append("choose a type checker for the types stage in scripts/check (it skips until then)")
+    next_steps.append(f"commit the kit (verify proves the committed HEAD): cd {repo} && git add -A . && "
+                      "git commit -m 'Add slopbrake guardrails'")
     next_steps.append(f"prove it: slopbrake verify {repo}")
     return {"repo": str(repo), "stack": stack, "dry_run": dry_run, "hooks": hooks_note,
             "actions": [asdict(a) for a in actions], "next_steps": next_steps}
 
 
 # ── status ───────────────────────────────────────────────────────────────────
+
+def git_hook_gaps(repo: Path) -> list[str]:
+    """Why git would not run the gate's pre-commit and pre-push hooks (core.hooksPath or the hooks dir)."""
+    configured = git(repo, "config", "--get", "core.hooksPath", check=False)
+    hooks_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
+    if configured and not hooks_dir.is_dir():
+        return [f"core.hooksPath={configured} does not exist, so no git hook runs"]
+    missing = [name for name in ("pre-commit", "pre-push") if not os.access(hooks_dir / name, os.X_OK)]
+    return [f"git hooks: no executable {' or '.join(missing)} in {hooks_dir}"] if missing else []
+
+
+def wiring_gaps(repo: Path, local: Path | None = None) -> list[str]:
+    """Claude Code hooks (H5/H6), git hooks and python3: everything the kit's hooks need to fire."""
+    gaps = hooks.settings_gaps(repo, local) + git_hook_gaps(repo)
+    return gaps if shutil.which("python3") else gaps + ["python3 is not on PATH (the hooks and the gate need it)"]
+
+
+def stale_files(repo: Path, stack: str) -> list[str]:
+    """Kit-managed files that are missing or differ from what init would write now."""
+    return [rel for rel, content in planned_files(repo, stack).items()
+            if is_managed(rel) and rel != META and read_text(repo / rel) != content]
+
 
 def status(repo: Path) -> dict:
     present = {rel: (repo / rel).exists() for rel in SPEC_FILES}
@@ -274,10 +431,25 @@ def status(repo: Path) -> dict:
     gaps = [f"missing {rel}" for rel, ok in present.items() if not ok]
     if claude_lines is not None and claude_lines > CLAUDE_MD_MAX_LINES:
         gaps.append(f"CLAUDE.md has {claude_lines} lines (max {CLAUDE_MD_MAX_LINES})")
-    if hooks_path != ".githooks" and not ci_runs_check:
+    if git_hook_gaps(repo) and not ci_runs_check:
         gaps.append("no guardrail: neither git hooks nor CI run scripts/check")
+    gaps += wiring_gaps(repo)
+    stack, stale = recorded_stack(repo), []
+    if stack:
+        from slopbrake import __version__
+        installed = str(json.loads((repo / META).read_text(encoding="utf-8")).get("kit_version", "unknown"))
+        if installed.split("+")[0] != __version__:
+            gaps.append(f"kit is stale: installed {installed}, running slopbrake {__version__}; run slopbrake init --update")
+        stale = stale_files(repo, stack)
+        if stale:
+            gaps.append(f"kit is stale: {len(stale)} managed file(s) differ; run slopbrake init --update")
+    if TYPES_PLACEHOLDER in read_text(repo / "scripts/check"):
+        gaps.append("types stage is not configured: choose a type checker in scripts/check")
+    if stack == "typescript" and not any("eslint-rules/slopbrake" in read_text(repo / name) for name in ESLINT_CONFIGS):
+        gaps.append("eslint config does not load eslint-rules/slopbrake.mjs (T1 is not enforced)")
+    gaps = list(dict.fromkeys(gaps))
     return {"repo": str(repo), "files": present, "claude_md_lines": claude_lines, "hooks_path": hooks_path or None,
-            "ci_runs_check": ci_runs_check, "gaps": gaps, "ok": not gaps}
+            "ci_runs_check": ci_runs_check, "stale_files": stale, "gaps": gaps, "ok": not gaps}
 
 
 # ── verify ───────────────────────────────────────────────────────────────────
@@ -368,55 +540,83 @@ discount(total, member)
 
 - none
 """
-GIT_GUARD_CASES = [("git push --force origin main", 2), ("git reset --hard HEAD~1", 2), ("git clean -fd", 2),
-                   ("git branch -D old", 2), ("git checkout .", 2), ("git restore .", 2),
-                   ("git push origin feature/x", 0), ("git status", 0), ("git restore --staged .", 0)]
+GIT_GUARD_BLOCK = ["git push --force origin main", "git push -f;echo done", 'bash -c "git reset --hard"', "git clean -fd",
+                   "git branch -D old", "git checkout .", "git restore .", "git commit --no-verify -m x",
+                   "git -c core.hooksPath=/dev/null commit -m x", "git push origin +main"]
+GIT_GUARD_ALLOW = ["git push origin feature/x", "git status", "git restore --staged .",
+                   'git commit -m "never run git reset --hard"', 'grep -rn "reset --hard" docs', "git push -u origin feature/x"]
+GIT_GUARD_CASES = [(c, 2) for c in GIT_GUARD_BLOCK] + [(c, 0) for c in GIT_GUARD_ALLOW]
+
+
+def kit_stages(stack: str) -> list[str]:
+    """The STAGES the kit's scripts/check template runs: a full run must report every one."""
+    match = re.search(r"^STAGES=\(([^)]*)\)", (KIT / stack / "scripts/check").read_text(encoding="utf-8"), re.MULTILINE)
+    return match.group(1).split() if match else []
+
+
+def missing_stages(output: str, required: list[str]) -> list[str]:
+    """Required stages the run's summary does not report as pass or skip."""
+    summary = output.rsplit("── summary ──", 1)[1] if "── summary ──" in output else ""
+    seen = {m.group(2) for m in re.finditer(r"^(pass|skip)\s+(\S+)", summary, re.MULTILINE)}
+    return [stage for stage in required if stage not in seen]
 
 
 class Verifier:
+    """Proofs run in a detached worktree of HEAD; self.wt is the repo's directory inside it
+    (a subdirectory when the kit lives in a monorepo package)."""
+
     def __init__(self, repo: Path, keep: bool):
         self.repo, self.keep = repo, keep
-        self.stack = json.loads((repo / ".claude/slopbrake.json").read_text())["stack"] \
-            if (repo / ".claude/slopbrake.json").is_file() else detect_stack(repo)
+        self.top = git_toplevel(repo)
+        self.head = git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False)
+        if not self.head:
+            raise UsageError(f"{repo} has no commits yet: commit the files `slopbrake init` wrote, then verify")
         self.proofs: list[dict] = []
-        self.scratch = Path(tempfile.mkdtemp(prefix="slopbrake-verify-"))
-        self.wt = self.scratch / "wt"
-        self.head = git(repo, "rev-parse", "HEAD")
+        self.scratch: Path | None = None
+        self.wt = self.top
+        self.stack = ""
 
-    def __enter__(self):
-        git(self.repo, "worktree", "add", "--detach", str(self.wt), self.head)
-        if (self.repo / "package.json").is_file():
+    def setup(self) -> None:
+        self.scratch = Path(tempfile.mkdtemp(prefix="slopbrake-verify-"))
+        git(self.top, "worktree", "add", "--detach", str(self.scratch / "wt"), self.head)
+        self.wt = self.scratch / "wt" / self.repo.relative_to(self.top)
+        self.stack = recorded_stack(self.wt) or detect_stack(self.repo)  # the committed record first
+        if self.stack == "typescript" and (self.wt / "package.json").is_file():
             # A real install from the package manager's store; package managers reject a
             # symlinked node_modules and try to reinstall mid-check.
-            pm = package_manager(self.repo)
             install = {"pnpm": "pnpm install --frozen-lockfile --prefer-offline",
                        "yarn": "yarn install --frozen-lockfile --prefer-offline",
-                       "bun": "bun install --frozen-lockfile", "npm": "npm ci --prefer-offline"}[pm]
+                       "bun": "bun install --frozen-lockfile", "npm": "npm ci --prefer-offline"}[package_manager(self.wt)]
             result = run(install, self.wt)
             if result.returncode != 0:
-                raise RuntimeError(f"{install} failed in the verify worktree:\n{result.stdout}{result.stderr}")
-        return self
+                raise UsageError(f"{install} failed in the verify worktree: {last_line(result)}")
 
-    def __exit__(self, *exc):
-        if not self.keep:
-            git(self.repo, "worktree", "remove", "--force", str(self.wt), check=False)
-            git(self.repo, "worktree", "prune", check=False)
-            shutil.rmtree(self.scratch, ignore_errors=True)
+    def cleanup(self) -> None:
+        if self.keep or self.scratch is None:
+            return
+        git(self.top, "worktree", "remove", "--force", str(self.scratch / "wt"), check=False)
+        git(self.top, "worktree", "prune", check=False)
+        shutil.rmtree(self.scratch, ignore_errors=True)
 
     def env(self, **extra: str) -> dict[str, str]:
-        return dict(os.environ, SLOPBRAKE_BASE=self.head, CLAUDE_PROJECT_DIR=str(self.wt), **extra)
+        # Worktrees share refs: proofs must never move the last-green ratchet.
+        return dict(os.environ, SLOPBRAKE_BASE=self.head, SLOPBRAKE_NO_RECORD="1", CLAUDE_PROJECT_DIR=str(self.wt),
+                    **extra)
 
     def check(self, *stages: str, **env: str) -> subprocess.CompletedProcess:
         return run(["scripts/check", *stages], self.wt, env=self.env(**env))
 
     def prove(self, name: str, expect_ok: bool, result: subprocess.CompletedProcess, rule: str,
-              says: str | None = None) -> bool:
-        """A failure only counts when the check says why (`says`), so a crash can't pass a proof."""
-        ok = (result.returncode == 0) == expect_ok and (says is None or says in result.stdout + result.stderr)
-        tail = (result.stdout + result.stderr).strip().splitlines()[-6:]
+              says: str | None = None, problems: list[str] | None = None) -> bool:
+        """A result only counts when the check says so (`says`): a crash can't pass an expect-fail
+        proof and a gate that runs nothing can't pass an expect-pass one."""
+        text = result.stdout + result.stderr
+        ok = (result.returncode == 0) == expect_ok and (says is None or says in text) and not problems
+        lines = text.strip().splitlines()
+        failed = [line for line in lines if line.startswith("FAIL  ")]  # the stage summary names what broke
         self.proofs.append({"proof": name, "rule": rule, "expected": ("pass" if expect_ok else "fail")
-                            + (f" saying {says!r}" if says else ""),
-                            "exit": result.returncode, "ok": ok, "output": tail})
+                            + (f" saying {says!r}" if says else ""), "exit": result.returncode, "ok": ok,
+                            "output": [*(problems or []), *failed, *(line for line in lines[-6:] if line not in failed)]})
         return ok
 
     def write(self, rel: str, text: str) -> Path:
@@ -439,8 +639,12 @@ class Verifier:
 
     def run_all(self) -> None:
         seeds = self.seeds()
-        # Clean tree: the full gate passes (mutation skips: nothing changed since HEAD).
-        self.prove("clean tree passes scripts/check", True, self.check(), "L1")
+        # Clean tree: the full gate passes and runs every kit stage (mutation skips: nothing changed since HEAD).
+        result, required = self.check(), kit_stages(self.stack)
+        missing = missing_stages(result.stdout, required)
+        problem = (f"stages missing from the summary as pass or skip: {' '.join(missing)} "
+                   f"(the kit's STAGES: {' '.join(required)})")
+        self.prove("clean tree passes scripts/check", True, result, "L1", problems=[problem] if missing else None)
 
         # D1: pass -> fail on a seeded deep import -> pass after reverting.
         added = [self.write(*seeds["boundary"])]
@@ -450,7 +654,7 @@ class Verifier:
                    "tests-through-entrypoints" if self.stack == "python" else "entrypoint-boundary")
         for path in added:
             path.unlink()
-        self.prove("boundaries pass again after revert", True, self.check("boundaries"), "D1")
+        self.prove("boundaries pass again after revert", True, self.check("boundaries"), "D1", "pass  boundaries")
 
         # T1: a seeded tautological test fails the gate.
         seeded = self.write(*seeds["tautology"])
@@ -464,7 +668,8 @@ class Verifier:
         self.prove("assertion-free test fails the mutation floor", False, self.check("mutation"), "T4",
                    "below floor" if self.stack == "python" else "Final mutation score")
         self.write(*seeds["mutation_strong"])
-        self.prove("real assertions clear the mutation floor", True, self.check("mutation"), "T4")
+        self.prove("real assertions clear the mutation floor", True, self.check("mutation"), "T4",
+                   "mutants killed" if self.stack == "python" else "Final mutation score")
 
         # Stop hook: red code blocks the stop (exit 2); a green tree lets it through.
         red = self.write(*seeds["red"])
@@ -496,7 +701,7 @@ class Verifier:
         body = self.scratch / "pr.md"
         checker = ["python3", "scripts/slopbrake/pr_body_check.py", "--body-file", str(body)]
         body.write_text(PR_BODY.format(door="one-way", rollback="Rollback: restore the accounts backup."), encoding="utf-8")
-        self.prove("complete one-way PR body passes", True, run(checker, self.wt, env=self.env()), "G1/G4")
+        self.prove("complete one-way PR body passes", True, run(checker, self.wt, env=self.env()), "G1/G4", "one-way")
         body.write_text(PR_BODY.format(door="two-way", rollback=""), encoding="utf-8")
         self.prove("under-declared door fails (two-way on a migration)", False, run(checker, self.wt, env=self.env()), "G2",
                    "never lowered")
@@ -508,35 +713,43 @@ class Verifier:
         guard = self.wt / ".claude/hooks/block-dangerous-git.sh"
         wrong = []
         for command, expected in GIT_GUARD_CASES:
-            result = subprocess.run([str(guard)], input=json.dumps({"tool_input": {"command": command}}),
-                                    capture_output=True, text=True, check=False)
+            result = subprocess.run([str(guard)], input=json.dumps({"tool_input": {"command": command}, "cwd": str(self.wt)}),
+                                    cwd=self.wt, capture_output=True, text=True, check=False)
             if result.returncode != expected:
                 wrong.append(f"{command}: exit {result.returncode}, expected {expected}")
         self.prove("git guard blocks destructive commands only", True,
                    subprocess.CompletedProcess([], 1 if wrong else 0, "\n".join(wrong) or "all cases ok", ""), "H5")
 
-        # H1: CLAUDE.md stays a short pointer file.
-        lines = (self.repo / "CLAUDE.md").read_text(encoding="utf-8").splitlines() if (self.repo / "CLAUDE.md").is_file() else []
+        # H5/H6 only bite when Claude Code and git actually run the hooks.
+        gaps = wiring_gaps(self.wt, local=self.repo)
+        self.prove("hooks are wired in .claude/settings.json", True,
+                   subprocess.CompletedProcess([], 1 if gaps else 0, "\n".join(gaps) or "wired", ""), "H5/H6")
+
+        # H1: CLAUDE.md stays a short pointer file (as committed).
+        lines = read_text(self.wt / "CLAUDE.md").splitlines()
         short = 0 < len(lines) <= CLAUDE_MD_MAX_LINES
         self.prove(f"CLAUDE.md is at most {CLAUDE_MD_MAX_LINES} lines", True,
                    subprocess.CompletedProcess([], 0 if short else 1, f"{len(lines)} lines", ""), "H1")
 
 
 def verify(repo: Path, keep: bool) -> dict:
-    if run(["git", "status", "--porcelain"], repo).stdout.strip():
+    if run(["git", "status", "--porcelain", "."], repo).stdout.strip():
         note = "working tree has uncommitted changes; verify proves the committed HEAD only"
     else:
         note = ""
-    with Verifier(repo, keep) as verifier:
+    verifier = Verifier(repo, keep)
+    try:
+        verifier.setup()
         if not (verifier.wt / "scripts/check").is_file():
             verifier.proofs.append({"proof": "Slopbrake is committed at HEAD", "rule": "L1", "ok": False,
                                     "output": ["HEAD has no scripts/check: commit the files `slopbrake init` wrote, then verify"]})
-            return {"repo": str(repo), "stack": verifier.stack, "head": verifier.head, "note": note,
-                    "worktree": None, "proofs": verifier.proofs, "ok": False}
-        try:
-            verifier.run_all()
-        except Exception as exc:  # noqa: BLE001 - any harness error becomes a failed proof, not a traceback
-            verifier.proofs.append({"proof": "verify harness", "ok": False, "output": [repr(exc)]})
+        else:
+            try:
+                verifier.run_all()
+            except Exception as exc:  # noqa: BLE001 - any harness error becomes a failed proof, not a traceback
+                verifier.proofs.append({"proof": "verify harness", "ok": False, "output": [repr(exc)]})
+    finally:
+        verifier.cleanup()  # also when setup fails: no leaked worktree or scratch dir
     return {"repo": str(repo), "stack": verifier.stack, "head": verifier.head, "note": note,
             "worktree": str(verifier.wt) if keep else None, "proofs": verifier.proofs,
             "ok": all(p["ok"] for p in verifier.proofs)}
@@ -557,6 +770,11 @@ def print_human(command: str, result) -> None:
             print(f"{'ok' if r['ok'] else 'GAPS'}  {r['repo']}")
             for gap in r["gaps"]:
                 print(f"      - {gap}")
+    elif command == "user-hooks":
+        on = " ".join(event for event, present in result["events"].items() if present) or "none"
+        print(f"slopbrake user hooks in {result['settings']}: {on}")
+        if not result["on_path"]:
+            print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -582,20 +800,42 @@ def main(argv: list[str] | None = None) -> int:
     p_verify = sub.add_parser("verify", help="prove the checks bite, in a throwaway worktree")
     p_verify.add_argument("repo", type=Path)
     p_verify.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
-    for p in (p_init, p_status, p_verify):
+    p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into ~/.claude/settings.json")
+    p_user.add_argument("action", choices=["install", "uninstall", "status"])
+    p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
+    p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
+    p_hook.add_argument("event", choices=["pre-tool-use", "post-tool-use", "stop"])
+    for p in (p_init, p_status, p_verify, p_user):
         p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    if args.command == "init":
-        repo = args.repo.resolve()
-        result = init(repo, detect_stack(repo) if args.stack == "auto" else args.stack, args.update, args.dry_run)
-        ok = True
-    elif args.command == "status":
-        result = [status(r.resolve()) for r in args.repos]
-        ok = all(r["ok"] for r in result)
-    else:
-        result = verify(args.repo.resolve(), args.keep)
-        ok = result["ok"]
+    if args.command == "hook":
+        return hooks.run(args.event, sys.stdin.read())
+    try:
+        if args.command == "init":
+            repo = args.repo.resolve()
+            git_toplevel(repo)
+            stack = args.stack if args.stack != "auto" else recorded_stack(repo) or detect_stack(repo)
+            result, ok = init(repo, stack, args.update, args.dry_run), True
+        elif args.command == "status":
+            repos = [r.resolve() for r in args.repos]
+            for repo in repos:
+                git_toplevel(repo)
+            result = [status(r) for r in repos]
+            ok = all(r["ok"] for r in result)
+        elif args.command == "verify":
+            result = verify(args.repo.resolve(), args.keep)
+            ok = result["ok"]
+        else:
+            action = {"install": hooks.install, "uninstall": hooks.uninstall, "status": hooks.user_status}[args.action]
+            result = action(args.settings or hooks.default_settings())
+            ok = result["installed"] != (args.action == "uninstall")
+    except (UsageError, hooks.SettingsError, RuntimeError) as exc:
+        message = " ".join(str(exc).split())
+        if args.json:
+            print(json.dumps({"error": message}))
+        print(f"slopbrake: {message}", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps(result, indent=2))
     else:
