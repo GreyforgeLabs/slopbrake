@@ -147,18 +147,22 @@ class PostToolUse(Scratch):
                                                      "tool_input": {"file_path": str(shop / "src/a.py")}}).returncode, 0)
         self.hook("post-tool-use", {"tool_name": "Write", "cwd": str(self.base),
                                     "tool_input": {"file_path": str(other / "src/new.py")}})
-        # No PreToolUse snapshot here, so web counts as changed (B11 c; test_r2_hooks covers the snapshots).
-        self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(other),
-                                    "tool_input": {"command": f"cd {web}/src && ls; git -C {other} status"}})
+        # B11 (c): PreToolUse snapshots the Bash targets; PostToolUse records the ones that changed.
+        bash = {"tool_name": "Bash", "cwd": str(other), "tool_use_id": "b1",
+                "tool_input": {"command": f"cd {web}/src && touch new.py; git -C {other} status"}}
+        self.assertEqual(self.hook("pre-tool-use", bash).returncode, 0)
+        (web / "src/new.py").touch()
+        self.hook("post-tool-use", bash)
         self.assertEqual(self.touched(), sorted([str(shop), str(web)]))
 
-    def test_bash_targets_without_a_snapshot_count_as_changed(self):
-        # B11 (c): with no PreToolUse snapshot to compare against, the repo may have changed.
+    def test_bash_targets_without_a_snapshot_are_not_recorded(self):
+        # B11 (c), round 2 review: with no PreToolUse snapshot there is no evidence of a change, and the
+        # payload's cwd may already be a repo a `cd` moved into; recording it would gate the operator's WIP.
         shop, web = self.repo("shop"), self.repo("web")
         self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(shop / "src"), "tool_input": {"command": "true"}})
         self.hook("post-tool-use", {"tool_name": "Bash", "cwd": str(self.base),
                                     "tool_input": {"command": f'git -C "{web}" commit -m x'}})
-        self.assertEqual(self.touched(), sorted([str(shop), str(web)]))
+        self.assertEqual(self.touched(), [])
 
 
 class Stop(Scratch):

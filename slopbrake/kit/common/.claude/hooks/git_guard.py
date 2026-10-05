@@ -410,8 +410,10 @@ class Judge:
         return self.tokens(toks)
 
     def unscoped(self, reason):
-        """A reason tied to no git invocation: in managed scope it counts only from a managed session cwd."""
-        return reason if self.scope != "managed" or managed(self.session) else None
+        """A reason tied to no git invocation: in managed scope it counts only in a known managed directory or
+        from a managed session cwd (an unknown directory falls back to the session cwd)."""
+        known = self.dir is not None and managed(self.dir)
+        return reason if self.scope != "managed" or known or managed(self.session) else None
 
     def nested(self, text):
         return self.string(text, cwd=self.dir)

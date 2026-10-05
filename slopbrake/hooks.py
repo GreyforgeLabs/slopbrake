@@ -257,7 +257,8 @@ def expand(base: Path, word: str) -> Path | None:
 
 def bash_dirs(command: str, cwd: Path) -> list[Path]:
     """Directories a shell command may change: its cwd, `cd`/`pushd` targets (followed through a chain of
-    cds), `git -C` targets, and absolute or ~ paths among its words (also after an `=`)."""
+    cds), `git -C` targets, and paths among its words (absolute, ~, $VAR/... or relative with a "/"; also
+    after an `=`). Extra candidates are cheap: only a changed snapshot records a repo."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
@@ -277,7 +278,7 @@ def bash_dirs(command: str, cwd: Path) -> list[Path]:
             dirs.append(target)
             here = here if word == "-C" else target
         for part in {word, word.partition("=")[2]}:
-            if part.startswith(("/", "~")) and (path := expand(here, part)):
+            if ("/" in part or part.startswith("~")) and (path := expand(here, part)):
                 dirs.append(path)
     return list(dict.fromkeys(dirs))
 
@@ -316,10 +317,10 @@ def pending_key(payload: dict, command: str) -> str:
 
 
 def remember(payload: dict, command: str) -> None:
-    """PreToolUse: snapshot the managed repos a Bash command may change, for post_tool_use to compare."""
-    taken = snapshots(command, Path(payload.get("cwd") or os.getcwd()))
-    if not taken:
-        return
+    """PreToolUse: snapshot the managed repos a Bash command may change, with the cwd it starts in, for
+    post_tool_use to compare. Stored even when none is managed yet: the command may create one (a clone)."""
+    cwd = str(Path(payload.get("cwd") or os.getcwd()))
+    taken = {"cwd": cwd, "repos": snapshots(command, Path(cwd))}
 
     def change(data):
         pending = data.get("pending") if isinstance(data.get("pending"), dict) else {}
@@ -328,19 +329,23 @@ def remember(payload: dict, command: str) -> None:
     update_json(state_path(payload.get("session_id")), change)
 
 
-def recall(payload: dict, command: str) -> dict:
+def recall(payload: dict, command: str) -> dict | None:
+    """The PreToolUse snapshot {"cwd", "repos"} of this Bash call (removed from the state), or None."""
     def change(data):
         pending = data.get("pending") if isinstance(data.get("pending"), dict) else {}
         taken = pending.pop(pending_key(payload, command), None)
         if "pending" in data:
             data["pending"] = pending
-        return taken if isinstance(taken, dict) else {}
+        ok = isinstance(taken, dict) and isinstance(taken.get("cwd"), str) and isinstance(taken.get("repos"), dict)
+        return taken if ok else None
     return update_json(state_path(payload.get("session_id")), change)
 
 
 def post_tool_use(payload: dict) -> int:
     """Record the managed repos this tool call changed: edit targets directly, and for Bash every repo
-    whose snapshot differs from PreToolUse's (or that had none, such as a fresh clone)."""
+    whose snapshot differs from PreToolUse's (or that had none, such as a fresh clone). A Bash call is judged
+    from the cwd PreToolUse saw: after a `cd` the payload's cwd is already inside the repo it moved to, which
+    PreToolUse may never have snapshotted. Without a PreToolUse snapshot nothing is recorded."""
     cwd = Path(payload.get("cwd") or os.getcwd())
     args = payload.get("tool_input") or {}
     repos = set()
@@ -350,10 +355,10 @@ def post_tool_use(payload: dict) -> int:
         repos = {str(root)} if root else set()
     elif payload.get("tool_name") == "Bash":
         command = str(args.get("command", ""))
-        before = recall(payload, command) if state_path(payload.get("session_id")).is_file() else {}
-        missing = object()
-        repos = {repo for repo, digest in snapshots(command, cwd).items()
-                 if digest is None or before.get(repo, missing) != digest}
+        taken = recall(payload, command) if state_path(payload.get("session_id")).is_file() else None
+        before, missing = (taken or {}).get("repos", {}), object()
+        repos = {repo for repo, digest in snapshots(command, Path(taken["cwd"])).items()
+                 if digest is None or before.get(repo, missing) != digest} if taken else set()
     if repos:
         record(payload.get("session_id"), repos)
     return 0
