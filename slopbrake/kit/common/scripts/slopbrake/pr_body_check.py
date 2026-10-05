@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import base_ref, git, repo_root
+from common import base_ref, empty_tree, git, merge_base, repo_root
 from door_classify import (
     DEFAULT_RULES,
     RulesError,
@@ -148,7 +148,8 @@ def unlogged_reviews(body: str, merge_base: str) -> list[str]:
     flat = " ".join(log.lower().split())
     shas = re.findall(r"\b[0-9a-f]{7,40}\b", log.lower())
     missing = []
-    for line in git("log", "--format=%H %s", f"{merge_base}..HEAD").splitlines():
+    since = "HEAD" if merge_base == empty_tree() else f"{merge_base}..HEAD"  # the empty tree: every commit
+    for line in git("log", "--format=%H %s", since).splitlines():
         sha, _, subject = line.partition(" ")
         if not subject.lower().startswith("review:"):
             continue
@@ -252,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
             except RulesError as exc:
                 problems.append(f"door rules: {exc} (G2)")
             problems += [f"Review log is missing review: commit '{subject}' (C3)"
-                         for subject in unlogged_reviews(body, git("merge-base", base, "HEAD").strip())]
+                         for subject in unlogged_reviews(body, merge_base(base))]
             body_path = str(Path(args.body_file).resolve()) if args.body_file else ""
             pending = [line[3:] for line in git("status", "--porcelain").splitlines()
                        if str((repo_root() / line[3:]).resolve()) != body_path]

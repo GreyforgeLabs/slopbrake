@@ -505,5 +505,90 @@ class NoMutate(Scratch):
         self.assertIn("0 changed lines excluded", self.floor("--base", "main").stdout)
 
 
+# ── Round 2 review: callers of an empty-tree base, deleted tests, wording ────
+
+class EmptyTreeBaseCallers(Scratch):
+    """B2 lets base_ref return the empty tree on main with no ratchet; every caller must take it."""
+
+    def setUp(self):
+        super().setUp()
+        self.git_repo()
+        self.write(".claude/door-rules.yml", (KIT / "common/.claude/door-rules.yml").read_text())
+        self.write("f", "x\n")
+        self.commit("review: tighten the parser")
+
+    def test_door_classify_measures_from_the_empty_tree(self):
+        result = script("door_classify.py", "--json", cwd=self.root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("measuring nothing", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["base"], self.empty_tree())
+        self.assertEqual(json.loads(result.stdout)["files"], 3)
+
+    def test_pr_body_check_logs_reviews_since_the_empty_tree(self):
+        self.write("body.md", "## Summary\n\nx\n\n## Review log\n\nnothing yet\n")
+        result = script("pr_body_check.py", "--body-file", "body.md", cwd=self.root)
+        self.assertNotIn("failed", result.stdout + result.stderr)
+        self.assertIn("Review log is missing review: commit 'review: tighten the parser' (C3)", result.stdout)
+
+
+class DeletedTestFile(Scratch):
+    def test_deleting_a_modules_only_test_file_is_mutation_checked(self):
+        self.git_repo()
+        self.write("shop/__init__.py", "def one():\n    return 1\n")
+        self.write("tests/test_one.py", "import unittest\nfrom shop import one\n\n\n"
+                                        "class T(unittest.TestCase):\n    def test_one(self):\n"
+                                        "        self.assertEqual(one(), 1)\n")
+        self.commit("tested")
+        self.git("checkout", "-q", "-b", "feat")
+        self.git("rm", "-q", "tests/test_one.py")
+        self.write("tests/test_x.py", "import unittest\n\n\nclass X(unittest.TestCase):\n"
+                                      "    def test_m(self):\n        pass\n")
+        self.commit("drop the test")
+        result = self.floor()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("only tests changed", result.stdout)
+        self.assertIn("shop/__init__.py", result.stdout)
+        self.assertIn("below floor", result.stdout)
+
+
+class ReviewWording(Scratch):
+    def test_a_merge_base_that_is_the_empty_tree_is_named(self):
+        self.git_repo()
+        self.git("update-ref", GREEN + "main", "HEAD")
+        self.seed("def tax(x):\n    return x * 2\n", "tax(1)\n", "tax")
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "--amend", "--no-edit")
+        base, described = self.base()
+        self.assertEqual(base, self.empty_tree())
+        self.assertNotIn("?", described)
+        self.assertIn("the empty tree", described)
+        self.assertIn("not an ancestor", described)
+
+    def test_the_test_command_is_printed_as_it_runs(self):
+        self.git_repo()
+        self.seed("def tax(x):\n    return x * 2\n", "self.assertEqual(tax(2), 4)\n", "tax")
+        result = self.floor("--base", "main")
+        self.assertIn("test command: python3 -m unittest discover -s tests\n", result.stdout)
+
+    def test_the_no_mutate_count_is_printed_when_only_tests_changed(self):
+        self.git_repo()
+        self.seed("def tax(x):\n    return x * 2\n", "self.assertEqual(tax(2), 4)\n", "tax")
+        self.commit("tested")
+        self.git("checkout", "-q", "-b", "feat")
+        self.write("tests/test_shop.py", (self.root / "tests/test_shop.py").read_text() + "\n")
+        result = self.floor()
+        self.assertIn("only tests changed", result.stdout)
+        self.assertIn("0 changed lines excluded by no-mutate", result.stdout)
+
+    def test_the_no_mutate_count_is_printed_when_skipping(self):
+        self.git_repo()
+        self.git("checkout", "-q", "-b", "feat")
+        self.write("notes.txt", "x\n")
+        result = self.floor()
+        self.assertEqual(result.returncode, SKIP, result.stdout)
+        self.assertIn("no changed Python source lines", result.stdout)
+        self.assertIn("0 changed lines excluded by no-mutate", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

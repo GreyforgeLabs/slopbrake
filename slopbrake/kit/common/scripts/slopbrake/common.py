@@ -126,6 +126,7 @@ def describe_base(explicit: str | None = None) -> str:
         return f"the empty tree (no last-green ratchet for {branch or 'this detached HEAD'} yet, so every line is new)"
     sha = git("rev-parse", "--short", base + "^{commit}", check=False).strip() or "?"
     if how == "ratchet not an ancestor":
+        sha = "the empty tree" if base == empty_tree() else sha  # no shared history left (an amended root)
         return (f"{sha}, the merge-base with last-green ({last_green_ref(branch)} is not an ancestor of HEAD: "
                 "amended, rebased or reset)")
     if base.startswith("refs/slopbrake/last-green/"):
