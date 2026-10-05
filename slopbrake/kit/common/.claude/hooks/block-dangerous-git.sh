@@ -1,30 +1,12 @@
 #!/bin/bash
-# PreToolUse guard (rule H5), adapted from Matt Pocock's git-guardrails-claude-code.
-# Blocks destructive git commands in agent sessions. Plain `git push` of a branch stays
-# allowed; force pushes do not. Exit 2 = block, with the reason on stderr.
-
-COMMAND=$(jq -r '.tool_input.command // empty')
-[ -z "$COMMAND" ] && exit 0
-
-# git's global options (-C dir, -c key=val, --no-pager, --git-dir=x ...) may sit before the subcommand.
-# Shell token separators may contain repeated spaces or tabs.
-GIT='git([[:blank:]]+-C[[:blank:]]+[^[:blank:]]+|[[:blank:]]+-c[[:blank:]]+[^[:blank:]]+|[[:blank:]]+--[a-z-]+(=[^[:blank:]]+)?)*'
-
-DANGEROUS_PATTERNS=(
-  "$GIT"'[[:blank:]]+push([[:blank:]]+[^;&|]*)?[[:blank:]]+(--force|--force-with-lease|-f)([[:blank:]]|$|=)'
-  "$GIT"'[[:blank:]]+push([[:blank:]]+[^;&|]*)?[[:blank:]]+\+[^[:blank:]]+'
-  'reset[[:blank:]]+--hard'
-  "$GIT"'[[:blank:]]+clean([[:blank:]]+[^;&|]*)?[[:blank:]]+(-[a-zA-Z]*f|--force)'
-  "$GIT"'[[:blank:]]+branch([[:blank:]]+[^;&|]*)?[[:blank:]]+(-D|--delete[[:blank:]]+--force|-d[[:blank:]]+--force)([[:blank:]]|$)'
-  "$GIT"'[[:blank:]]+checkout([[:blank:]]+--)?[[:blank:]]+\.([[:blank:]]|$|;|&)'
-  "$GIT"'[[:blank:]]+checkout[[:blank:]]+[^;&|]*[[:blank:]]+--[[:blank:]]+\.([[:blank:]]|$|;|&)'
-  "$GIT"'[[:blank:]]+restore([[:blank:]]+--worktree|[[:blank:]]+-W|[[:blank:]]+--source(=|[[:blank:]]+)[^[:blank:]]+|[[:blank:]]+-s[[:blank:]]+[^[:blank:]]+)*[[:blank:]]+\.([[:blank:]]|$|;|&)'
-)
-
-for pattern in "${DANGEROUS_PATTERNS[@]}"; do
-  if printf '%s' "$COMMAND" | grep -qE -- "$pattern"; then
-    echo "BLOCKED: '$COMMAND' matches the destructive-git guard ('$pattern'). The operator has not granted this in agent sessions; ask them to run it." >&2
-    exit 2
-  fi
-done
-exit 0
+# PreToolUse guard (rule H5), descended from Matt Pocock's git-guardrails-claude-code.
+# Blocks destructive git commands in agent sessions: force pushes and remote deletes, reset --hard,
+# clean -f, branch -D, whole-tree checkout/restore, stash drop/clear, --no-verify and core.hooksPath
+# overrides. Plain branch pushes stay allowed. The parsing lives in git_guard.py (stdlib Python, no jq),
+# which reads the hook JSON on stdin. Exit 2 = block, with the reason on stderr.
+# Without python3 the guard can't judge anything, so it fails closed.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "BLOCKED: the destructive-git guard (H5) needs python3, which is not on PATH; install python3 or ask the operator to run this command." >&2
+  exit 2
+fi
+exec python3 "$(dirname "$0")/git_guard.py" --scope always
