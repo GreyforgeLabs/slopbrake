@@ -493,6 +493,10 @@ def status(repo: Path) -> dict:
         stale = stale_files(repo, stack)
         if stale:
             gaps.append(f"kit is stale: {len(stale)} managed file(s) differ; run slopbrake init --update")
+    stages = re.search(r"^STAGES=\(([^)]*)\)", read_text(repo / "scripts/check"), re.MULTILINE)
+    if stack and stages:
+        gaps += [f"scripts/check does not run the kit's {name} stage" for name in kit_stages(stack)
+                 if name not in stages.group(1).split()]
     if TYPES_PLACEHOLDER in read_text(repo / "scripts/check"):
         gaps.append("types stage is not configured: choose a type checker in scripts/check")
     if stack == "typescript" and not any("eslint-rules/slopbrake" in read_text(repo / name) for name in ESLINT_CONFIGS):

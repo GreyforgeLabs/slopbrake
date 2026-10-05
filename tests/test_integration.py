@@ -1,4 +1,5 @@
 """Behaviour that spans kit areas: the installed kit is never treated as the repo's own code."""
+import json
 import os
 import subprocess
 import sys
@@ -86,6 +87,31 @@ class StopHookOnNewBranches(Scratch):
 
     def test_the_default_branch_with_nothing_new_lets_the_agent_stop(self):
         self.assertEqual(self.stop().returncode, 0)
+
+
+class StatusSeesTheGate(Scratch):
+    def test_a_scripts_check_without_every_kit_stage_is_a_gap(self):
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        self.write("pyproject.toml", "[project]\nname = 'shop'\n")
+        self.commit("init")
+        self.assertEqual(self.slopbrake("init", ".").returncode, 0)
+        check = self.root / "scripts/check"
+        check.write_text(check.read_text().replace("STAGES=(lint types boundaries tests smoke", "STAGES=(lint types boundaries tests"))
+        result = self.slopbrake("status", ".")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("scripts/check does not run the kit's smoke stage", result.stdout)
+
+
+class UserLevelGuard(Scratch):
+    def test_block_message_names_the_guard_and_the_way_forward(self):
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        self.write(".claude/slopbrake.json", '{"stack": "python"}\n')
+        payload = json.dumps({"cwd": str(self.root), "tool_input": {"command": "git reset --hard"}})
+        result = subprocess.run([sys.executable, "-m", "slopbrake", "hook", "pre-tool-use"], input=payload, cwd=self.root,
+                                capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(HOME)), check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("BLOCKED by the destructive-git guard (H5)", result.stderr)
+        self.assertIn("ask them to run it", result.stderr)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 KIT_GUARD = Path(__file__).resolve().parent / "kit/common/.claude/hooks/git_guard.py"
@@ -30,6 +31,7 @@ USER_ENTRIES = {
     "Stop": {"hooks": [{"type": "command", "command": f"{PREFIX} stop", "timeout": 600}]},
 }
 OPERATORS = set("();<>|&")
+STOP_BUDGET = 540  # seconds for every touched repo together, inside the 600 s hook timeout
 
 
 class SettingsError(ValueError):
@@ -203,15 +205,19 @@ def post_tool_use(payload: dict) -> int:
 def stop(payload: dict, text: str) -> int:
     project = os.environ.get("CLAUDE_PROJECT_DIR")
     project_top = toplevel(project) if project else None
-    failures = []
+    failures, deadline = [], time.monotonic() + STOP_BUDGET  # one budget: Claude Code kills the hook at 600 s
     for repo in map(Path, touched(payload.get("session_id"))):
         hook = repo / ".claude/hooks/require-green.sh"
         if not (repo / ".claude/slopbrake.json").is_file() or not hook.is_file():
             continue
         if repo == project_top and not settings_gaps(repo):
             continue  # the project's own Stop hook already gates it
-        result = subprocess.run([str(hook)], input=text, cwd=repo, env=dict(os.environ, CLAUDE_PROJECT_DIR=str(repo)),
-                                capture_output=True, text=True, check=False)
+        left = int(deadline - time.monotonic())
+        if left <= 0:
+            failures.append(f"{repo}:\nrequire-green: the {STOP_BUDGET}s Stop budget was used up before this repo's gate ran")
+            continue
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo), SLOPBRAKE_STOP_TIMEOUT=str(left))
+        result = subprocess.run([str(hook)], input=text, cwd=repo, env=env, capture_output=True, text=True, check=False)
         if result.returncode == 2:
             failures.append(f"{repo}:\n{result.stderr.strip()}")
     if failures:
@@ -229,7 +235,8 @@ def pre_tool_use(payload: dict, guard: Path = KIT_GUARD) -> int:
     spec.loader.exec_module(module)
     reason = module.check_command(command, str(payload.get("cwd") or os.getcwd()), "managed")
     if reason:
-        print(reason, file=sys.stderr)
+        print(f"BLOCKED by the destructive-git guard (H5): {reason}. The operator has not granted this in agent "
+              "sessions; ask them to run it.", file=sys.stderr)
         return 2
     return 0
 
