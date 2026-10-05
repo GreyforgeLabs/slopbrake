@@ -58,6 +58,17 @@ module.exports = {
       },
     },
     {
+      name: "colocated-tests-through-entrypoints",
+      comment:
+        "Test files inside a package (foo.test.ts, foo.spec.ts) also go through its entry points: never its internals.",
+      severity: "error",
+      from: { path: `^${R}/([^/]+)/.*\\.(?:test|spec)\\.[^/]+$` }, // a co-located test, in package $1
+      to: {
+        path: `^${R}/$1/[^/]+/`,
+        pathNot: `^${R}/$1/tests/`,
+      },
+    },
+    {
       name: "tests-folder-is-private",
       comment:
         "A package's tests/ folder is reachable only from tests: nothing else may import fixtures.",
@@ -86,6 +97,7 @@ module.exports = {
     // },
   ],
   options: {
+    tsPreCompilationDeps: true, // `import type` deep imports count too
     doNotFollow: { path: "node_modules" },
     tsConfig: { fileName: "tsconfig.json" },
     enhancedResolveOptions: {

@@ -5,6 +5,7 @@
   "plugins": ["@stryker-mutator/vitest-runner"],
   "reporters": ["clear-text", "progress"],
   "coverageAnalysis": "perTest",
+  "concurrency": 2,
   "thresholds": { "high": 80, "low": 60, "break": 60 },
   "tempDirName": ".stryker-tmp",
   "cleanTempDir": "always"
