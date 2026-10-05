@@ -234,3 +234,12 @@ class Stop(Scratch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HookAliasNeverBlocksByAccident(unittest.TestCase):
+    def test_the_alias_passes_harness_flags_through(self):
+        # Exit 2 means "block" to every harness: a usage error in the alias must never produce it.
+        for args in (["hook", "--harness", "codex", "stop"], ["hook", "--harness=codex", "pre-tool-use"], ["hook", "--bogus"]):
+            result = subprocess.run([sys.executable, "-m", "slopbrake", *args], input="{}", capture_output=True, text=True,
+                                    env=dict(os.environ, PYTHONPATH=str(HOME)), check=False)
+            self.assertNotEqual(result.returncode, 2, (args, result.stderr))

@@ -6,8 +6,8 @@
   slopbrake verify REPO [--json] [--keep]
   slopbrake user-hooks install|uninstall|status [--harness claude|codex|opencode] [--settings PATH] [--json]
   slopbrake user-hooks trust|untrust REPO           (the Stop gate runs only trusted repos' scripts)
-  slopbrake-hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin;
-                                                      `slopbrake hook` is an alias)
+  slopbrake-hook [--harness claude|codex|opencode|grok] pre-tool-use|post-tool-use|stop
+                                                     (harnesses run this; hook JSON on stdin; `slopbrake hook` is an alias)
 
 init writes two kinds of files. Managed files (scripts/slopbrake, hooks, the reviewer
 agent, vendored skills) belong to the kit: --update refreshes them. Seeded files
@@ -1094,6 +1094,9 @@ def print_human(command: str, result) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["hook"]:  # the slopbrake-hook alias: hooks.main owns its arguments and never exits 2 on misuse
+        return hooks.main(argv[1:])
     parser = argparse.ArgumentParser(prog="slopbrake", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1120,8 +1123,6 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    if args.command == "hook":
-        return hooks.main([args.event] if args.event else [])
     try:
         if args.command == "init":
             repo = repo_root(args.repo)
