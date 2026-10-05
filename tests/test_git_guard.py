@@ -135,6 +135,12 @@ BLOCK = {
         "coproc git push -f", "source <(echo git push -f)", ". <(echo 'git push -f')", "bash <(echo 'git push -f')",
         "bash < <(echo 'git push -f')", "git checkout --pathspec-from-file=- <<< .", "git restore --pathspec-from-file=list.txt",
     ],
+    "command substitutions run as the command or its arguments": [
+        "$(echo git push -f)", "`echo git push -f`", 'eval "$(echo git push -f)"', "eval $(echo git push -f)",
+        "eval \"$(cat <<'EOF'\ngit push -f\nEOF\n)\"", "bash -c \"$(cat <<'EOF'\ngit push -f\nEOF\n)\"",
+        "bash -c \"$(cat <<'EOF'\ncd /tmp\ngit reset --hard\nEOF\n)\"", "$(echo git) push -f", "sudo $(echo git push -f)",
+        "command `echo git reset --hard`", "git $(echo push -f)", "git $(echo push) -f", 'eval "$(printf \'git clean -fd\')"',
+    ],
 }
 
 ALLOW = {
@@ -173,6 +179,12 @@ ALLOW = {
         "git config --get alias.nuke", "stdbuf -oL git log", "setsid git status", "source <(echo export X=1)",
         "source ./env.sh", ". ./env.sh", "bash <(echo 'git status')", "git restore --staged --pathspec-from-file=list.txt",
         "diff <(git show HEAD:a) a",
+    ],
+    "near misses of command substitutions": [
+        'eval "$(ssh-agent -s)"', "$(git rev-parse --show-toplevel)/scripts/check", 'eval "$(echo export X=1)"',
+        "$(echo git status)", "`which python3` -V", 'git commit -m "$(echo fix -n handling)"',
+        "git commit -m \"$(cat <<'EOF'\nfix: stop --force pushes, -n and --no-verify\n\ngit reset --hard is blocked\nEOF\n)\"",
+        "git push origin $(git branch --show-current)", 'cd "$(git rev-parse --show-toplevel)" && git status',
     ],
 }
 
@@ -288,6 +300,11 @@ class Managed(unittest.TestCase):
         self.assertIsNotNone(self.check(f"git -c alias.x='!cd {self.managed} && git push -f' x", self.plain))
         self.assertIsNotNone(self.check(f"git rebase -x 'git -C {self.managed} reset --hard' main", self.plain))
         self.assertIsNone(self.check(f"git -C {self.managed} -c alias.x='!git -C {self.plain} push -f' x", self.plain))
+
+    def test_substituted_command_is_judged_against_its_own_directory(self):
+        self.assertIsNotNone(self.check(f"$(echo git -C {self.managed} push -f)", self.plain))
+        self.assertIsNone(self.check(f"$(echo git -C {self.plain} push -f)", self.managed))
+        self.assertIsNotNone(self.check(f"cd {self.managed} && `echo git reset --hard`", self.plain))
 
     def test_unbalanced_quotes_in_a_nested_string_do_not_raise(self):
         self.assertIsNotNone(self.check("git -c alias.x='!git push -f \"' x", self.managed))

@@ -3,8 +3,9 @@
 
 The Bash command is parsed like a shell would (quotes, control operators, substitutions,
 heredocs, env prefixes and exports, wrappers such as env/sudo/xargs, nested `bash -c` and
-`eval` payloads, scripts fed to a shell from echo/printf/cat or a process substitution), then
-every git invocation is judged on its argv after git's global options and `-c` config.
+`eval` payloads, scripts fed to a shell from echo/printf/cat or a process substitution, and
+$( )/backtick substitutions whose echo/printf/cat output becomes the command or a git argument),
+then every git invocation is judged on its argv after git's global options and `-c` config.
 Text inside the arguments of other commands (commit messages, grep patterns, heredocs
 written to files) is never matched. A command that does not parse falls back to a
 conservative check of the raw string.
@@ -14,6 +15,11 @@ stderr blocks, exit 0 allows. `--scope always` judges every command (the project
 `--scope managed` acts only when the git invocation's effective directory is inside a repo
 whose toplevel has .claude/slopbrake.json (the user-level hook). Importable API:
 check_command(command, cwd, scope) -> reason or None. Stdlib only.
+
+Known limits (data flow and runners the parser does not model; the guard is a seatbelt, not a
+sandbox): values that come from variables (`X=push; git $X -f`, `git ${X:-push} -f`) or from
+substitutions other than echo/printf/cat; multi-stage pipelines and scripts written to a file then
+run; wrappers it does not know, such as watch, ionice, chrt, taskset, flock, unbuffer, parallel.
 """
 from __future__ import annotations
 
@@ -286,6 +292,12 @@ def emitted(command):
     return found
 
 
+def whole_substitution(word):
+    """True when word is nothing but one $( ) or backtick substitution."""
+    return len(word.subs) == 1 and (word.text == f"$({word.subs[0]})" or (
+        len(word.text) > 1 and word.text[0] == word.text[-1] == "`"))
+
+
 def split_words(text):
     """shlex word splitting for env -S strings and alias values; whitespace when quotes don't balance."""
     try:
@@ -380,7 +392,8 @@ def whole_tree(spec):
 
 class Judge:
     def __init__(self, cwd, scope, depth=0, env=None):
-        self.dir, self.scope, self.depth, self.env, self.procsubs = cwd, scope, depth, env or {}, {}
+        self.dir, self.scope, self.depth, self.env = cwd, scope, depth, env or {}
+        self.procsubs, self.cmdsubs = {}, {}
 
     def string(self, text, cwd=False):
         if cwd is not False:
@@ -440,6 +453,7 @@ class Judge:
                 return reason
         env = {}
         self.procsubs = {w.text: w.subs for w in words if w.text.startswith("<(")}
+        self.cmdsubs = {w.text: (w.subs[0], w.quote_at == 0) for w in words if whole_substitution(w)}
         while words and words[0].text in RESERVED - {"time"}:
             if words.pop(0).text == "coproc" and len(words) > 1 and words[1].text == "{":
                 words.pop(0)  # coproc NAME { ...; }
@@ -487,6 +501,9 @@ class Judge:
                 break
         if not argv:
             return None
+        if argv[0] in self.cmdsubs:  # the shell runs what the substitution prints, e.g. $(echo git push -f)
+            rest = " ".join(map(shlex.quote, self.expand(argv[1:])))
+            return self.scripts([f"{out} {rest}" for out in emitted(self.cmdsubs[argv[0]][0])], cwd)
         name = basename(argv[0])
         if name in ("cd", "pushd"):
             target = next((a for a in argv[1:] if not a.startswith("-") or a == "-"), "~")
@@ -503,8 +520,17 @@ class Judge:
         elif name in SHELLS:
             return self.shell(argv[1:], stdin, piped_from, cwd)
         elif name == "git":
-            return Git(self, cwd, {**self.env, **env}).run(argv[1:])
+            return Git(self, cwd, {**self.env, **env}).run(self.expand(argv[1:]))
         return None
+
+    def expand(self, args):
+        """args with each knowable command substitution replaced by its output (word-split unless quoted)."""
+        expanded = []
+        for a in args:
+            sub, quoted = self.cmdsubs.get(a, (None, False))
+            texts = emitted(sub) if sub else []
+            expanded += ([texts[0]] if quoted else texts[0].split()) if texts else [a]
+        return expanded
 
     def substituted(self, args):
         """The scripts printed by process-substitution arguments such as <(echo ...)."""
