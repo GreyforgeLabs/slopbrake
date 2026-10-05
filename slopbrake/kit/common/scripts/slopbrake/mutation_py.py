@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-cmd", default=os.environ.get("MUTATION_TEST_CMD",
                                                                "python3 -m unittest discover -s tests"))
     parser.add_argument("--max-mutants", type=int, default=int(os.environ.get("MUTATION_MAX", "150")))
-    parser.add_argument("--exclude", action="append", default=["scripts/slopbrake/"],
+    parser.add_argument("--exclude", action="append", default=["scripts/slopbrake/", ".claude/", "eslint-rules/"],
                         help="path prefix never mutated (repeatable)")
     parser.add_argument("--json", help="also write the result as JSON to this path")
     args = parser.parse_args(argv)

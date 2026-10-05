@@ -57,7 +57,7 @@ SPEC_FILES = ["CLAUDE.md", "CODING_STANDARDS.md", ".claude/agents/reviewer.md",
               ".claude/skills/retro/SKILL.md", ".claude/settings.json", ".claude/door-rules.yml", "scripts/check",
               "docs/agents/retro-log.md", "docs/agents/issue-tracker.md"]
 CLAUDE_MD_MAX_LINES = 40
-GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/"]}
+GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/", "__pycache__/"]}
 LAST_GREEN = "refs/slopbrake/last-green"  # + /<branch>; detached HEAD has none
 META = ".claude/slopbrake.json"
 TYPES_PLACEHOLDER = "no type checker configured"
@@ -427,7 +427,7 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
         next_steps += [
             f"{pm} add -D dependency-cruiser @stryker-mutator/core @stryker-mutator/vitest-runner",
             ("wire the tautology rule into eslint.config.js: import slopbrake from './eslint-rules/slopbrake.mjs' and "
-            "add { files: [<test globs>], plugins: { slopbrake }, rules: { 'slopbrake/no-tautological-test': 'error' } }"),
+            "add { files: [<test globs>], plugins: { slopbrake }, rules: { 'slopbrake/no-tautological-test': 'error', 'slopbrake/expect-in-test': 'error' } }"),
         ]
     check_text = read_text(repo / "scripts/check") or files.get("scripts/check", "")  # a dry run wrote nothing
     if stack == "python" and TYPES_PLACEHOLDER in check_text:

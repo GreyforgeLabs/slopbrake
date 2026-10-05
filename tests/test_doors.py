@@ -330,7 +330,9 @@ class KitRules(Scratch):
                      "cur.execute('DELETE FROM \"users\"')", "sql = \"DELETE FROM `users`\"",
                      "knex.raw(`DELETE FROM \"User\" WHERE 1=1`)", "q = 'DELETE FROM [dbo].[users]'",
                      "db.run('DELETE FROM cache WHERE 1')", "db.run('delete from disk_usage')",
-                     "q = 'TRUNCATE `users`'", "db.execute('truncate users')", "q = 'truncate \"Users\";'"):
+                     "q = 'TRUNCATE `users`'", "db.execute('truncate users')", "q = 'truncate \"Users\";'",
+                     "await db.query(`TRUNCATE ${table}`)", 'cur.execute(f"TRUNCATE {table}")',
+                     'cur.execute("TRUNCATE %s" % table)', "sql = 'TRUNCATE :tbl'"):
             with self.subTest(line=line):
                 self.assertEqual(self.door(new_file_diff("src/x.py", line)), "one-way")
 
@@ -422,7 +424,10 @@ class BodyShape(Scratch):
                       "Rollback: N/A, we won't have a backup.", "Mitigation: none, flagged for human review.",
                       "Rollback: none (this takes down the old API).",
                       "Rollback plan: there is no plan to restore anything.",
-                      "**Rollback plan:**\n- none\n- the data cannot be restored"):
+                      "**Rollback plan:**\n- none\n- the data cannot be restored",
+                      "Rollback: restore is not possible.", "Rollback: restore is impossible.",
+                      "Rollback: revert is not an option.", "Rollback: reverting is impossible once the rows are deleted.",
+                      "Rollback: backups don't exist.", "Rollback: revert won't help."):
             with self.subTest(extra=extra):
                 self.assert_fails(body(door="one-way", extra=extra), "rollback")
 

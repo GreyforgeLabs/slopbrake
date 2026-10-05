@@ -1,8 +1,8 @@
 #!/bin/bash
 # Stop hook (rule H6): the gate must be green before the agent stops. Uncommitted code
-# changes need the fast gate; a clean tree with commits since this branch's last green run
-# (refs/slopbrake/last-green/<branch>) needs the full gate, which records the new green on
-# success. The full gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and all runs
+# changes need the fast gate; a clean tree with commits no full green run has covered (since
+# refs/slopbrake/last-green/<branch>, or since the branch left the default branch) needs the
+# full gate, which records the new green on success. The full gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and all runs
 # together share one SLOPBRAKE_STOP_TIMEOUT (540) second budget, inside the 600 s hook
 # timeout; running out of it is a red attempt, never a hang.
 # Gated: the project, plus the same directory in the worktree the agent is working in
@@ -38,17 +38,32 @@ STATE_DIR="$(git rev-parse --absolute-git-dir)/slopbrake"
 mkdir -p "$STATE_DIR"
 COUNT_FILE="$STATE_DIR/stop-red-$SESSION"
 
+# unverified BRANCH: HEAD has commits that no full green run has covered: since the branch's
+# last green run, or, before its first one, since it left the default branch.
+unverified() {
+  local last base
+  if last=$(git rev-parse -q --verify "refs/slopbrake/last-green/$1"); then
+    [ "$last" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$last" HEAD
+    return
+  fi
+  for base in origin/HEAD main master origin/main origin/master; do
+    git rev-parse -q --verify "$base^{commit}" >/dev/null || continue
+    [ "$(git merge-base "$base" HEAD 2>/dev/null)" != "$(git rev-parse HEAD)" ]
+    return
+  done
+  return 1
+}
+
 # gate DIR: runs what DIR needs; on red prints why and the log tail, returns 1.
 gate() {
   cd "$1" 2>/dev/null && [ -x scripts/check ] || return 0
-  local log args=() why last branch status
+  local log args=() why branch status
   log="$(git rev-parse --absolute-git-dir)/slopbrake/stop-check.log"
   # Docs-only changes don't need the gate.
   if git -c core.quotePath=false status --porcelain --untracked-files=all | awk '{print $NF}' | grep -qvE '\.(md|txt)$'; then
     args=(--fast) why="uncommitted code changes and scripts/check --fast is red"
-  elif branch=$(git symbolic-ref -q --short HEAD) && last=$(git rev-parse -q --verify "refs/slopbrake/last-green/$branch") \
-       && [ "$last" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$last" HEAD; then
-    why="commits since the last green run on $branch (${last:0:12}) and the full scripts/check is red"
+  elif branch=$(git symbolic-ref -q --short HEAD) && unverified "$branch"; then
+    why="commits on $branch that no full green run has covered, and the full scripts/check is red"
     export MUTATION_MAX="${SLOPBRAKE_STOP_MUTANTS:-40}"
   else
     return 0

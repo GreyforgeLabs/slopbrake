@@ -35,8 +35,8 @@ PLACEHOLDERS = ("<one-way or two-way>", "<one-word description>", "<diagram, dif
                 "<finding>", "<only things a human must decide>")
 ROLLBACK = re.compile(r"\b(?:roll[ -]?backs?|mitigations?)\b", re.IGNORECASE)
 LABELS = re.compile(r"\*\*(?:Door|Blast Radius):\*\*[ \t]*[\w-]*", re.IGNORECASE)
-# A plan names a concrete step, with no negator before it in its clause: "restore the backup"
-# counts; "none", "no way to restore", "cannot be undone" do not.
+# A plan names a concrete step in a clause with no negator: "restore the backup" counts;
+# "none", "no way to restore", "restore is not possible" do not.
 PLAN_STEP = re.compile(r"\b(?:revert|restor|back ?up|backed up|down[ -]?migration|downgrade|migrate down|snapshot|"
                        r"dump|flags?\b|disabl|toggl|undo|redeploy|re-?run|re-?apply|re-?enabl|re-?creat|replay|recover|"
                        r"reinstat|revers|rebuild|roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write)",
@@ -90,7 +90,7 @@ def section(body: str, name: str) -> str:
 def names_a_step(text: str) -> bool:
     for clause in CLAUSE.split(text):
         step = PLAN_STEP.search(clause)
-        if step and not NEGATOR.search(clause[:step.start()]):
+        if step and not NEGATOR.search(clause):
             return True
     return False
 

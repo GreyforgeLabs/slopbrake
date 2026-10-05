@@ -67,7 +67,7 @@ content_patterns:
   - "\\bDELETE\\s+FROM\\b"
   - "(?i)\\bdelete\\s+from\\s+(?!(the|a|an|this|that|it|its|our|your|their)\\b)[\\w\"`\\[]"
   - "(?i)\\btruncate\\s+table\\b"
-  - "\\bTRUNCATE\\s+[\\w\"`\\[]"
+  - "\\bTRUNCATE\\s+(?![=(])\\S"
   - "(?i)\\btruncate\\s+([\\w.]+|\"[^\"]+\"|`[^`]+`|\\[[^\\]]+\\])\\s*(;|['\"`]\\s*([,)]|$))"
   - "\\bdrop_all\\("
   - "\\bop\\.drop_\\w+\\("
