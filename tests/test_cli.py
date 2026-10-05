@@ -29,6 +29,7 @@ class Scratch(unittest.TestCase):
         self.root.mkdir()
         self.tmpdir = Path(self.tmp.name) / "tmp"  # TMPDIR for the cli, to catch leaked scratch dirs
         self.tmpdir.mkdir()
+        (Path(self.tmp.name) / "home").mkdir()  # HOME for the cli: never the user's real settings
 
     def write(self, rel, text, base=None):
         path = (base or self.root) / rel
@@ -48,9 +49,11 @@ class Scratch(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def gf(self, *args, cwd=None, path_prefix=None, **env):
-        # init records the repo in the user-level trust list (B11 b): keep it out of the real ~/.config.
+        # init records the repo in the user-level trust list (B11 b) and status reads ~/.claude/settings.json:
+        # keep both away from the real ~/.config and HOME (the uv cache stays real: no ruff re-download).
         full = dict(os.environ, PYTHONPATH=str(HOME), TMPDIR=str(self.tmpdir),
-                    XDG_CONFIG_HOME=str(Path(self.tmp.name) / "config"), **env)
+                    XDG_CONFIG_HOME=str(Path(self.tmp.name) / "config"), HOME=str(Path(self.tmp.name) / "home"),
+                    UV_CACHE_DIR=os.environ.get("UV_CACHE_DIR", str(Path.home() / ".cache/uv")), **env)
         if path_prefix:
             full["PATH"] = f"{path_prefix}{os.pathsep}{full['PATH']}"
         return sh([sys.executable, "-m", "slopbrake", *args], cwd or self.root, env=full)

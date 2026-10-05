@@ -5,7 +5,6 @@
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
   slopbrake user-hooks install|uninstall|status [--settings PATH] [--json]
-  slopbrake user-hooks trust|untrust REPO     (repos whose gate the user-level Stop hook may run)
   slopbrake hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin)
 
 init writes two kinds of files. Managed files (scripts/slopbrake, hooks, the reviewer
@@ -28,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -78,15 +78,42 @@ class UsageError(Exception):
 @dataclass
 class Action:
     path: str
-    action: str  # create | update | unchanged | kept | merge
+    action: str  # create | update | unchanged | kept | merge | delete
     note: str = ""
 
 
-def run(cmd, cwd: Path, env=None, check=False) -> subprocess.CompletedProcess:
-    result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, shell=isinstance(cmd, str), check=False)
+def run(cmd, cwd: Path, env=None, check=False, stdin: str | None = None) -> subprocess.CompletedProcess:
+    """cmd in its own process group: an interrupted verify (B12) also stops the gate's test runners and mutants."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=isinstance(cmd, str),
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(stdin)
+    except BaseException:
+        stop_group(proc)
+        raise
+    result = subprocess.CompletedProcess(cmd, proc.returncode, out, err)
     if check and result.returncode != 0:
         raise RuntimeError(f"{cmd if isinstance(cmd, str) else ' '.join(cmd)} failed in {cwd}: {last_line(result)}")
     return result
+
+
+def stop_group(proc: subprocess.Popen) -> None:
+    """TERM the process group, give it 10 s to clean up (mutants restore files, runners remove temp dirs), then KILL."""
+    deadline, sig = time.monotonic() + 10, signal.SIGTERM
+    while True:
+        try:
+            os.killpg(proc.pid, sig)  # signal 0 only asks whether any member is left
+        except ProcessLookupError:
+            break
+        if sig == signal.SIGKILL:
+            break
+        try:
+            proc.wait(timeout=0.1)  # reap the leader, or the group never empties
+        except subprocess.TimeoutExpired:
+            pass
+        sig = 0 if time.monotonic() < deadline else signal.SIGKILL
+    proc.wait()
 
 
 def last_line(result: subprocess.CompletedProcess) -> str:
@@ -164,7 +191,7 @@ def default_branch(repo: Path) -> str | None:
     if origin:
         return origin.split("/", 1)[1]
     configured = git(repo, "config", "init.defaultBranch", check=False)
-    for name in [configured] * bool(configured) + ["main", "master"]:
+    for name in ([configured] if configured else []) + ["main", "master"]:
         if run(["git", "rev-parse", "--verify", "-q", f"refs/heads/{name}"], repo).returncode == 0:
             return name
     return None
@@ -253,7 +280,7 @@ def python_test_args(repo: Path) -> str:
 
 
 def has_tests(repo: Path, stack: str) -> bool:
-    name = re.compile(r"(test_.*|.*_test)\.py" if stack == "python" else r".*\.(test|spec)\.[cm]?[jt]sx?")
+    name = re.compile(r"(test.*|.*_test)\.py" if stack == "python" else r".*\.(test|spec)\.[cm]?[jt]sx?")
     for _, dirs, files in os.walk(repo):
         if any(name.fullmatch(f) for f in files):
             return True
@@ -453,12 +480,13 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     ratchet = last_green_ref(repo)
     if ratchet and git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False) and \
             not git(repo, "rev-parse", "-q", "--verify", ratchet, check=False):
+        # Older layouts block this ref: a pre-A1 flat ref, or pre-B1 refs nested under the name.
+        nested = git(repo, "for-each-ref", "--format=%(refname)", f"{ratchet}/", check=False).split()
+        blocking = ([LAST_GREEN] if git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False) else []) + nested
+        actions += [Action(old, "delete", "an older ratchet layout that blocks the new ref") for old in blocking]
         actions.append(Action(ratchet, "create", "the last-green ratchet starts at HEAD"))
         if not dry_run:
-            # Older layouts block this ref: a pre-A1 flat ref, or pre-B1 refs nested under the name.
-            nested = git(repo, "for-each-ref", "--format=%(refname)", f"{ratchet}/", check=False).split()
-            flat = [LAST_GREEN] if git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False) else []
-            for old in flat + nested:
+            for old in blocking:
                 git(repo, "update-ref", "-d", old)
             git(repo, "update-ref", ratchet, "HEAD")
     hooks_path = git(repo, "config", "--get", "core.hooksPath", check=False)
@@ -609,14 +637,13 @@ def types_unconfigured(repo: Path, stack: str, check_text: str) -> bool:
 
 
 def ts_layout_gaps(repo: Path, check_text: str) -> list[str]:
-    """Top-level dirs holding TypeScript sources that no TEST_GLOBS or --include glob in scripts/check reaches."""
+    """Dirs holding TypeScript sources below no TEST_GLOBS or --include glob's base dir in scripts/check (B7)."""
     globs = re.findall(r"(?<!--exclude )'([^'\s]*\*\*[^'\s]*)'", check_text)
-    heads = {glob.split("/", 1)[0] for glob in globs}
-    if any("*" in head for head in heads):
-        return []  # a glob that starts anywhere covers every dir
+    bases = re.compile("|".join(re.escape(glob.split("**", 1)[0]).replace(r"\*", "[^/]*") for glob in globs) or "(?!)")
     files = run(["git", "ls-files", "-co", "--exclude-standard", "--", "*.ts", "*.tsx", "*.mts", "*.cts"], repo).stdout
-    outside = sorted({f.split("/", 1)[0] + "/" for f in files.splitlines() if "/" in f and not f.endswith(".d.ts")
-                      and f.split("/", 1)[0] not in heads | SKIP_DIRS and not f.startswith(".")})
+    dirs = sorted({f.rsplit("/", 1)[0] + "/" for f in files.splitlines() if "/" in f and not f.endswith(".d.ts")
+                   and not bases.match(f) and not any(d.startswith(".") or d in SKIP_DIRS for d in f.split("/")[:-1])})
+    outside = [d for i, d in enumerate(dirs) if not any(d.startswith(parent) for parent in dirs[:i])]
     return [(f"TypeScript sources outside every scripts/check glob (no T1 or T4 there): {', '.join(outside)}; "
              "add them to TEST_GLOBS and the mutation --include list")] if outside else []
 
@@ -792,24 +819,22 @@ def missing_stages(output: str, required: list[str]) -> list[str]:
 
 
 class Verifier:
-    """Proofs run in a detached worktree of HEAD; self.wt is the repo's directory inside it
-    (a subdirectory when the kit lives in a monorepo package)."""
+    """Proofs run in self.wt, a detached worktree of HEAD (repo is a repository root, B8)."""
 
     def __init__(self, repo: Path, keep: bool):
         self.repo, self.keep = repo, keep
-        self.top = git_toplevel(repo)
         self.head = git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False)
         if not self.head:
             raise UsageError(f"{repo} has no commits yet: commit the files `slopbrake init` wrote, then verify")
         self.proofs: list[dict] = []
         self.scratch: Path | None = None
-        self.wt = self.top
+        self.wt = repo
         self.stack = ""
 
     def setup(self) -> None:
         self.scratch = Path(tempfile.mkdtemp(prefix="slopbrake-verify-"))
-        git(self.top, "worktree", "add", "--detach", str(self.scratch / "wt"), self.head)
-        self.wt = self.scratch / "wt" / self.repo.relative_to(self.top)
+        self.wt = self.scratch / "wt"
+        git(self.repo, "worktree", "add", "--detach", str(self.wt), self.head)
         try:
             self.stack = recorded_stack(self.wt) or detect_stack(self.wt)  # as committed
         except UsageError:
@@ -827,8 +852,8 @@ class Verifier:
     def cleanup(self) -> None:
         if self.keep or self.scratch is None:
             return
-        git(self.top, "worktree", "remove", "--force", str(self.scratch / "wt"), check=False)
-        git(self.top, "worktree", "prune", check=False)
+        git(self.repo, "worktree", "remove", "--force", str(self.scratch / "wt"), check=False)
+        git(self.repo, "worktree", "prune", check=False)
         shutil.rmtree(self.scratch, ignore_errors=True)
 
     def env(self, **extra: str) -> dict[str, str]:
@@ -917,10 +942,10 @@ class Verifier:
         red = self.write(*seeds["red"])
         hook = self.wt / ".claude/hooks/require-green.sh"
         stop_input = json.dumps({"session_id": "verify", "stop_hook_active": False})
-        result = subprocess.run([str(hook)], input=stop_input, cwd=self.wt, env=self.env(), capture_output=True, text=True, check=False)
+        result = run([str(hook)], self.wt, env=self.env(), stdin=stop_input)
         self.prove("Stop hook blocks on a red gate", False, result, "H6", "FAIL  tests")
         red.unlink()
-        result = subprocess.run([str(hook)], input=stop_input, cwd=self.wt, env=self.env(), capture_output=True, text=True, check=False)
+        result = run([str(hook)], self.wt, env=self.env(), stdin=stop_input)
         self.prove("Stop hook allows a green gate", True, result, "H6")
         for key in ("mutation_src", "mutation_weak"):
             (self.wt / seeds[key][0]).unlink(missing_ok=True)
@@ -939,7 +964,7 @@ class Verifier:
         # detached, so this runs in a clone with its own refs (the user's are untouched) whose only branch,
         # main, is the default by the kit's rule (no origin; init.defaultBranch=main).
         clone = self.scratch / "clone"
-        run(["git", "clone", "-q", "--shared", "--no-checkout", str(self.top), str(clone)], self.scratch, check=True)
+        run(["git", "clone", "-q", "--shared", "--no-checkout", str(self.repo), str(clone)], self.scratch, check=True)
         for args in (("remote", "remove", "origin"), ("config", "init.defaultBranch", "main"),
                      ("checkout", "-q", "-B", "main", self.head)):
             run(["git", *args], clone, check=True)
@@ -970,8 +995,7 @@ class Verifier:
         guard = self.wt / ".claude/hooks/block-dangerous-git.sh"
         wrong = []
         for command, expected in GIT_GUARD_CASES:
-            result = subprocess.run([str(guard)], input=json.dumps({"tool_input": {"command": command}, "cwd": str(self.wt)}),
-                                    cwd=self.wt, capture_output=True, text=True, check=False)
+            result = run([str(guard)], self.wt, stdin=json.dumps({"tool_input": {"command": command}, "cwd": str(self.wt)}))
             if result.returncode != expected:
                 wrong.append(f"{command}: exit {result.returncode}, expected {expected}")
         self.prove("git guard blocks destructive commands only", True,
@@ -1043,22 +1067,14 @@ def print_human(command: str, result) -> None:
                 print(f"      - {gap}")
             for note in r.get("notes", []):
                 print(f"   note  {note}")
-    elif command == "user-hooks" and "trusted" in result:
-        print(f"{'trusted' if result['trusted'] else 'untrusted'}  {result['repo']}")
     elif command == "user-hooks":
         on = " ".join(event for event, present in result["events"].items() if present) or "none"
         print(f"slopbrake user hooks in {result['settings']}: {on}")
-        if any(result["events"].values()):
-            if not result["on_path"]:
-                print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
-            elif not result["runnable"]:
-                print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
-                      "install this slopbrake version or run slopbrake user-hooks uninstall")
+        if not result["on_path"]:
+            print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
         elif not result["runnable"]:
-            print(f"note: {result['binary'] or '`slopbrake` (not on PATH)'} cannot run `slopbrake hook`; "
-                  "user-hooks install will refuse until a current slopbrake is on PATH")
-        for note in result.get("notes", []):
-            print(f"note: {note}")
+            print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
+                  "install this slopbrake version or run slopbrake user-hooks uninstall")
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -1068,18 +1084,6 @@ def print_human(command: str, result) -> None:
         if result["note"]:
             print(f"note: {result['note']}")
         print("verify: all proofs hold" if result["ok"] else "verify: some proofs FAILED")
-
-
-def trust_command(action: str, repo: Path | None) -> dict:
-    """slopbrake user-hooks trust|untrust REPO: which repos the user-level Stop gate may run (B11 b)."""
-    if repo is None:
-        raise UsageError(f"user-hooks {action} needs a repo")
-    change = getattr(hooks, action, None)
-    if change is None:
-        raise UsageError(f"this slopbrake build has no hooks.{action}(); reinstall slopbrake")
-    top = git_toplevel(repo.resolve())
-    change(top)
-    return {"repo": str(top), "trusted": action == "trust"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1097,8 +1101,7 @@ def main(argv: list[str] | None = None) -> int:
     p_verify.add_argument("repo", type=Path)
     p_verify.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
     p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into ~/.claude/settings.json")
-    p_user.add_argument("action", choices=["install", "uninstall", "status", "trust", "untrust"])
-    p_user.add_argument("repo", type=Path, nargs="?", help="the repo to trust or untrust")
+    p_user.add_argument("action", choices=["install", "uninstall", "status"])
     p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
     p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
     p_hook.add_argument("event", choices=["pre-tool-use", "post-tool-use", "stop"])
@@ -1120,8 +1123,6 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             result = verify(args.repo.resolve(), args.keep)
             ok = result["ok"]
-        elif args.action in ("trust", "untrust"):
-            result, ok = trust_command(args.action, args.repo), True
         else:
             action = {"install": hooks.install, "uninstall": hooks.uninstall, "status": hooks.user_status}[args.action]
             result = action(args.settings or hooks.default_settings())

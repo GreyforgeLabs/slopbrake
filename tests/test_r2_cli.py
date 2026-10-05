@@ -582,49 +582,5 @@ class DefaultBranch(Scratch):
         self.assertFalse(any("one-way doors on main" in s for s in steps), steps)
 
 
-# ── B18: user-hooks status wording; B11 trust plumbing ───────────────────────
-
-PRINT = "import json, sys; from slopbrake import cli; cli.print_human('user-hooks', json.loads(sys.argv[1]))"
-
-
-class UserHooksWording(unittest.TestCase):
-    def render(self, events, runnable):
-        result = {"settings": "/x/settings.json", "events": dict.fromkeys(hooks.USER_ENTRIES, events),
-                  "installed": events, "on_path": True, "binary": "/bin/slopbrake", "runnable": runnable}
-        out = subprocess.run([sys.executable, "-c", PRINT, json.dumps(result)],
-                             env=dict(os.environ, PYTHONPATH=str(HOME)), capture_output=True, text=True, check=True)
-        return out.stdout
-
-    def test_nothing_installed_does_not_warn_about_blocking_or_uninstalling(self):
-        out = self.render(False, False)
-        self.assertNotIn("block every session", out)
-        self.assertNotIn("uninstall", out)
-        self.assertIn("install will refuse", out)
-
-    def test_installed_and_unrunnable_still_warns(self):
-        self.assertIn("block every session", self.render(True, False))
-
-    def test_extra_notes_are_printed(self):
-        result = {"settings": "/x", "events": {}, "installed": False, "on_path": True, "binary": "b",
-                  "runnable": True, "notes": ["untrusted managed repo: /r"]}
-        out = subprocess.run([sys.executable, "-c", PRINT, json.dumps(result)],
-                             env=dict(os.environ, PYTHONPATH=str(HOME)), capture_output=True, text=True, check=True)
-        self.assertIn("untrusted managed repo: /r", out.stdout)
-
-
-class TrustCommands(Scratch):
-    def test_trust_needs_a_repo(self):
-        self.assert_usage_error(self.gf("user-hooks", "trust"), "user-hooks trust needs a repo")
-
-    @unittest.skipUnless(hasattr(hooks, "trust"), "hooks.trust lands with the hooks worker (B11 b)")
-    def test_trust_and_untrust_round_trip(self):
-        self.python_repo()
-        trusted = Path(self.env["XDG_CONFIG_HOME"]) / "slopbrake/trusted.json"
-        self.assertEqual(self.gf("user-hooks", "trust", str(self.root)).returncode, 0)
-        self.assertIn(str(self.root.resolve()), trusted.read_text())
-        self.assertEqual(self.gf("user-hooks", "untrust", str(self.root)).returncode, 0)
-        self.assertNotIn(str(self.root.resolve()), trusted.read_text())
-
-
 if __name__ == "__main__":
     unittest.main()
