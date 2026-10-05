@@ -25,9 +25,13 @@ if [ "$fast" -eq 0 ]; then
     if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch -q --no-tags --unshallow origin; fi
     git fetch -q --no-tags origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
   fi
-  MUTATION_MAX=40 python3 slopbrake/kit/common/scripts/slopbrake/mutation_py.py --floor 60 \
+  # A mutant that fails fast (-f) or times out skips the tests' own cleanup, leaving their temp
+  # repos behind: keep them all in one directory and delete it afterwards.
+  scratch=$(mktemp -d)
+  TMPDIR=$scratch MUTATION_MAX=40 python3 slopbrake/kit/common/scripts/slopbrake/mutation_py.py --floor 60 \
     --test-cmd "python3 -m unittest discover -s tests -f" \
     --exclude slopbrake/cli.py --exclude slopbrake/hooks.py --exclude slopbrake/__init__.py
   case $? in 0|78) ;; *) status=1 ;; esac
+  rm -rf "$scratch"
 fi
 exit $status
