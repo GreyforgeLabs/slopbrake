@@ -1,6 +1,7 @@
 """Door floor (G2) and PR body (G1, G3, G4, C3) behaviour, through the scripts' command lines."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ HOME = Path(__file__).resolve().parents[1]
 GUARDS = HOME / "slopbrake/kit/common/scripts/slopbrake"
 RULES = HOME / "slopbrake/kit/common/.claude/door-rules.yml"
 GIT_ID = ["-c", "user.name=doors-test", "-c", "user.email=doors@test"]
-PR_ENV = ("PR_BODY_FILE", "GITHUB_EVENT_PATH", "GITHUB_BASE_REF", "SLOPBRAKE_BASE", "GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")
+PR_ENV = ("PYTHONDONTWRITEBYTECODE", "PR_BODY_FILE", "GITHUB_EVENT_PATH", "GITHUB_BASE_REF", "SLOPBRAKE_BASE", "GITHUB_ACTIONS", "GITHUB_STEP_SUMMARY")
 ON_MAIN = ("one-way door on main: commit it on a feature branch for operator review "
            "(a human may override with git commit --no-verify)")
 
@@ -169,9 +170,22 @@ class PreCommitOneWay(Scratch):
     def test_the_only_local_branch_is_the_default_branch(self):
         self.git_repo(branch="trunk")
         self.write("x.sql", "DROP TABLE users;\n")
-        no_config = clean_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-        result = script("pr_body_check.py", cwd=self.root, env=no_config)
+        config = self.write("../gitconfig", "[init]\n\tdefaultBranch = master\n")  # a branch that does not exist
+        result = script("pr_body_check.py", cwd=self.root, env=clean_env(GIT_CONFIG_GLOBAL=str(config)))
         self.assertEqual(result.returncode, 1, result.stdout)
+
+    def test_the_kits_own_bytecode_is_not_a_one_way_change(self):
+        self.write(".gitignore", "node_modules/\n")  # a TypeScript repo: __pycache__ is not ignored
+        shutil.copytree(GUARDS, self.root / "scripts/slopbrake", ignore=shutil.ignore_patterns("__pycache__"))
+        self.git_repo()
+        self.write(".claude/hooks/__pycache__/git_guard.cpython-314.pyc", "bytecode")
+        self.write("NOTES.md", "hi\n")
+        stage = [sys.executable, "scripts/slopbrake/pr_body_check.py"]
+        for _ in range(2):  # the second run sees the first run's caches, if any were written
+            result = sh(stage, self.root, clean_env())
+            self.assertEqual(result.returncode, 78, result.stdout)
+        result = script("door_classify.py", "--working-tree", "--base", "main", cwd=self.root)
+        self.assertIn("door: two-way", result.stdout)
 
     def test_outside_a_repository_is_skipped(self):
         result = self.pr_stage()
@@ -296,7 +310,7 @@ class KitRules(Scratch):
 
     def test_one_way_paths(self):
         for path in ("alembic/versions/0003_drop.py", "db/migrate/20261005_drop.rb", "app/migrate/0001.py",
-                     "src/x/auth.py", "src/oauth_client/token.py", "src/middleware/session.py", "payments/charge.py",
+                     "src/x/auth.py", "src/oauth_client/token.py", "src/authz/policies/admin.ts", "src/middleware/session.py", "payments/charge.py",
                      "src/stripe_api/client.py", ".env", ".env.production", ".github/actions/setup/action.yml",
                      ".github/CODEOWNERS", "CODEOWNERS", ".gitlab-ci.yml", "deploy/main.tf", "docker-compose.yml",
                      "docker-compose.prod.yaml", "Dockerfile.prod", "svc/Dockerfile", "k8s/deploy.yaml",
@@ -312,7 +326,11 @@ class KitRules(Scratch):
                      "Delete From users", "metadata.drop_all(engine)", "subprocess.run('rm -fr /data')",
                      "from shutil import rmtree; rmtree(p)", "op.drop_column('t', 'c')",
                      "subprocess.run([\"rm\", \"-rf\", path])", "rm -r -f build", "rm --recursive --force /srv",
-                     "rm -R -f x", "truncate users;", "db.execute('truncate table users')"):
+                     "rm -R -f x", "truncate users;", "db.execute('truncate table users')",
+                     "cur.execute('DELETE FROM \"users\"')", "sql = \"DELETE FROM `users`\"",
+                     "knex.raw(`DELETE FROM \"User\" WHERE 1=1`)", "q = 'DELETE FROM [dbo].[users]'",
+                     "db.run('DELETE FROM cache WHERE 1')", "db.run('delete from disk_usage')",
+                     "q = 'TRUNCATE `users`'", "db.execute('truncate users')", "q = 'truncate \"Users\";'"):
             with self.subTest(line=line):
                 self.assertEqual(self.door(new_file_diff("src/x.py", line)), "one-way")
 
@@ -326,6 +344,8 @@ class KitRules(Scratch):
                            ("src/x.ts", "  // DROP TABLE is forbidden"),
                            ("src/x.py", '    """Delete from the cache."""'),
                            ("src/x.py", "rm -r build"), ("src/x.py", "label = truncate(name, 10)"),
+                           ("src/x.py", "    values we truncate here"), ("src/x.py", "TRUNCATE = 10"),
+                           ("src/author.py", "x = 1"), ("src/authors.ts", "x = 1"),
                            (".env.example", "API_KEY=changeme")):
             with self.subTest(path=path):
                 self.assertEqual(self.door(new_file_diff(path, line)), "two-way")
@@ -395,7 +415,14 @@ class BodyShape(Scratch):
     def test_rollback_plans_that_say_nothing_fail(self):
         for extra in ("No rollback possible.", "Mitigation: none.", "**Rollback:** n/a", "Rollback plan: N/A", "Mitigations: none",
                       "Rollback: not applicable here", "There is no rollback for this.", "Rollback: impossible.",
-                      "Rollback: no backup exists."):
+                      "Rollback: no backup exists.", "Rollback: none. This cannot be undone.",
+                      "Rollback: none, the change can't be reverted.", "Rollback: impossible to revert.",
+                      "Rollback: there is no way to restore the data.",
+                      "No rollback: data is deleted and cannot be restored.", "No rollback: restore is not possible.",
+                      "Rollback: N/A, we won't have a backup.", "Mitigation: none, flagged for human review.",
+                      "Rollback: none (this takes down the old API).",
+                      "Rollback plan: there is no plan to restore anything.",
+                      "**Rollback plan:**\n- none\n- the data cannot be restored"):
             with self.subTest(extra=extra):
                 self.assert_fails(body(door="one-way", extra=extra), "rollback")
 
@@ -409,7 +436,9 @@ class BodyShape(Scratch):
         for extra in ("Rollback: restore from backup.", "**Rollback plan:**\n- revert the merge and run 0002 down",
                       "Mitigation: feature flag `new_billing` stays off until verified.",
                       "No rollback for the data; mitigation: snapshot the table first and restore it.",
-                      "Rollback: `alembic downgrade -1`"):
+                      "Rollback: `alembic downgrade -1`", "Rollback: if the deploy is not healthy, revert the merge.",
+                      "**Rollback plan:**\n- no data is lost\n- redeploy the previous image",
+                      "Rollback: restore `db/0002.sql` from the nightly dump."):
             with self.subTest(extra=extra):
                 result = self.check(body(door="one-way", extra=extra))
                 self.assertEqual(result.returncode, 0, result.stdout)

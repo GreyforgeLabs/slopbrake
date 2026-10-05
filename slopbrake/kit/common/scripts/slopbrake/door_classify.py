@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
     base_ref,
@@ -23,6 +24,7 @@ from common import (
     load_simple_yaml,
     parse_unified_diff,
     repo_root,
+    untracked_files,
 )
 
 DEFAULT_RULES = ".claude/door-rules.yml"
@@ -87,11 +89,20 @@ def effective_rules(merge_base: str | None, head_path: Path) -> dict[str, list[s
     return combine(base, head)
 
 
+def working_changes(base: str) -> dict:
+    """Committed, uncommitted and untracked changes, minus untracked Python bytecode caches."""
+    changes = collect_changes(base, working_tree=True)
+    for path in untracked_files():
+        if "__pycache__" in path.split("/") or path.endswith(".pyc"):
+            changes.pop(path, None)
+    return changes
+
+
 def measure(base: str, working_tree: bool, rules_path: Path | None = None):
     """Classify the change since `base`. Returns (result, warning or None)."""
     merge_base = git("merge-base", base, "HEAD").strip()
     rules = effective_rules(merge_base, rules_path or repo_root() / DEFAULT_RULES)
-    changes = collect_changes(base, working_tree=working_tree)
+    changes = working_changes(base) if working_tree else collect_changes(base, working_tree=False)
     warning = None
     if not changes and merge_base == git("rev-parse", "HEAD").strip():
         warning = f"measuring nothing: HEAD is the base ({base})"

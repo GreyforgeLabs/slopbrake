@@ -16,9 +16,17 @@ import re
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import base_ref, collect_changes, git, repo_root
-from door_classify import DEFAULT_RULES, RulesError, classify, effective_rules, measure
+from common import base_ref, git, repo_root
+from door_classify import (
+    DEFAULT_RULES,
+    RulesError,
+    classify,
+    effective_rules,
+    measure,
+    working_changes,
+)
 
 SKIP = 78
 SECTIONS = ("Summary", "Evidence", "Merge Danger", "Review log", "Open questions")
@@ -27,11 +35,15 @@ PLACEHOLDERS = ("<one-way or two-way>", "<one-word description>", "<diagram, dif
                 "<finding>", "<only things a human must decide>")
 ROLLBACK = re.compile(r"\b(?:roll[ -]?backs?|mitigations?)\b", re.IGNORECASE)
 LABELS = re.compile(r"\*\*(?:Door|Blast Radius):\*\*[ \t]*[\w-]*", re.IGNORECASE)
-# A plan names a concrete step; "no backup" or "cannot revert" does not count.
-PLAN_STEP = re.compile(r"(?<!\bno )(?<!\bnot )(?<!\bcannot )(?<!\bcan't )(?<!\bwithout )(?<!\bnever )"
-                       r"\b(?:revert|restor|back ?up|backed up|down(?:grade)?\b|snapshot|dump|flag|disabl|toggl|"
-                       r"undo|redeploy|re-?run|re-?apply|re-?enabl|re-?creat|replay|recover|reinstat|revers|rebuild|"
-                       r"roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write)", re.IGNORECASE)
+# A plan names a concrete step, with no negator before it in its clause: "restore the backup"
+# counts; "none", "no way to restore", "cannot be undone" do not.
+PLAN_STEP = re.compile(r"\b(?:revert|restor|back ?up|backed up|down[ -]?migration|downgrade|migrate down|snapshot|"
+                       r"dump|flags?\b|disabl|toggl|undo|redeploy|re-?run|re-?apply|re-?enabl|re-?creat|replay|recover|"
+                       r"reinstat|revers|rebuild|roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write)",
+                       re.IGNORECASE)
+NEGATOR = re.compile(r"\b(?:no|not|none|nothing|never|without|cannot|impossible|irreversible|unable|"
+                     r"(?:can|won|don|doesn|isn|aren|wasn|didn)['\u2019]t)\b|\bn/a\b", re.IGNORECASE)
+CLAUSE = re.compile(r"[;,!?()]|\.(?=\s|$)")
 
 
 def read_body(body_file: str | None) -> str | None:
@@ -75,17 +87,28 @@ def section(body: str, name: str) -> str:
     return match.group(1) if match else ""
 
 
+def names_a_step(text: str) -> bool:
+    for clause in CLAUSE.split(text):
+        step = PLAN_STEP.search(clause)
+        if step and not NEGATOR.search(clause[:step.start()]):
+            return True
+    return False
+
+
 def has_rollback_plan(merge_danger: str) -> bool:
-    """A rollback/mitigation line (or the lines under its bare label) that names a concrete step."""
+    """A rollback/mitigation label whose text (or the lines under a bare label) names a concrete step."""
     lines = [LABELS.sub(" ", line) for line in merge_danger.splitlines()]
     for i, line in enumerate(lines):
-        if not ROLLBACK.search(line):
-            continue
-        text = line
-        if not re.sub(r"\b(?:plan|strategy)\b|\W", "", ROLLBACK.sub("", line), flags=re.IGNORECASE):
-            text += " " + " ".join(itertools.takewhile(lambda nxt: not nxt.lstrip().startswith("**"), lines[i + 1:]))
-        if PLAN_STEP.search(" ".join(text.split())):
-            return True
+        labels = list(ROLLBACK.finditer(line))
+        for n, label in enumerate(labels):
+            if re.search(r"\b(?:no|not|without)\W*$", line[:label.start()], re.IGNORECASE):  # "no rollback"
+                continue
+            last = n + 1 == len(labels)
+            text = line[label.end():len(line) if last else labels[n + 1].start()]
+            if last and not re.sub(r"\b(?:plan|strategy)\b|\W", "", text, flags=re.IGNORECASE):
+                text += " ; " + " ; ".join(itertools.takewhile(lambda nxt: not nxt.lstrip().startswith("**"), lines[i + 1:]))
+            if names_a_step(text):
+                return True
     return False
 
 
@@ -160,7 +183,7 @@ def default_branch() -> str | None:
         if git("rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False).strip():
             return name
     configured = git("config", "init.defaultBranch", check=False).strip()
-    if configured:
+    if configured and git("rev-parse", "--verify", "-q", f"refs/heads/{configured}", check=False).strip():
         return configured
     branches = git("for-each-ref", "--format=%(refname:short)", "refs/heads", check=False).split()
     return branches[0] if len(branches) == 1 else None  # a local-only repo with one branch
@@ -175,7 +198,7 @@ def no_pr_context() -> int:
     if branch != default_branch():
         print(f"pr: skipped: no PR context on {branch}")
         return SKIP
-    changes = collect_changes("HEAD", working_tree=True)
+    changes = working_changes("HEAD")
     if not changes:
         print(f"pr: skipped: no PR context and nothing uncommitted on {branch}")
         return SKIP

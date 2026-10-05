@@ -35,7 +35,7 @@ one_way:
   # auth, money, outbound communication, public contracts
   - "**/auth/**"
   - "**/auth.*"
-  - "**/*auth*/**"
+  - "**/*auth*/**/*"  # files under an auth-named directory; "**/*auth*/**" would match author.py too
   - "**/middleware/**/session*.*"
   - "**/billing/**"
   - "**/payments/**"
@@ -63,10 +63,12 @@ one_way:
 content_patterns:
   - "(?i)\\bdrop\\s+(table|column|schema|database)\\b"
   - "(?i)\\balter\\s+table\\b.*\\bdrop\\b"
-  - "(?i)\\bdelete\\s+from\\s+(?!(the|a|an|this|that|it|its|our|your|their|memory|cache|disk)\\b)\\w"
+  # identifiers may be quoted: "User", `users`, [dbo].[users]; lowercase prose like "delete from the cache" is not SQL
+  - "\\bDELETE\\s+FROM\\b"
+  - "(?i)\\bdelete\\s+from\\s+(?!(the|a|an|this|that|it|its|our|your|their)\\b)[\\w\"`\\[]"
   - "(?i)\\btruncate\\s+table\\b"
-  - "\\bTRUNCATE\\s+\\w"
-  - "(?i)\\btruncate\\s+[\\w.\"]+\\s*(;|$)"
+  - "\\bTRUNCATE\\s+[\\w\"`\\[]"
+  - "(?i)\\btruncate\\s+([\\w.]+|\"[^\"]+\"|`[^`]+`|\\[[^\\]]+\\])\\s*(;|['\"`]\\s*([,)]|$))"
   - "\\bdrop_all\\("
   - "\\bop\\.drop_\\w+\\("
   - "sendEmail\\("
