@@ -18,28 +18,60 @@ SLOW_STAGES=(mutation)
 # whatever registry package matches a missing name.
 tool() { # tool <bin> <package> [args...]
   local bin=$1 pkg=$2; shift 2
-  if [ ! -x "node_modules/.bin/$bin" ]; then echo "$bin is not installed: $PM add -D $pkg" >&2; return 1; fi
+  if [ ! -x "node_modules/.bin/$bin" ]; then
+    echo "$bin is not installed: $PM add -D $pkg" >&2
+    if [ -f .pnp.cjs ]; then echo "  (Yarn Plug'n'Play has no node_modules/.bin: set 'nodeLinker: node-modules' in .yarnrc.yml)" >&2; fi
+    return 1
+  fi
   "node_modules/.bin/$bin" "$@"
 }
-has_script() { python3 -c 'import json, sys; sys.exit(not json.load(open("package.json")).get("scripts", {}).get(sys.argv[1]))' "$1" 2>/dev/null; }
+# has_script <name>: 0 defined, 3 not defined, 1 (with the reason) when package.json is missing or broken.
+has_script() {
+  python3 -c 'import json, sys
+try: scripts = json.load(open("package.json")).get("scripts") or {}
+except (OSError, ValueError) as e: sys.exit(f"package.json: {e}")
+sys.exit(0 if scripts.get(sys.argv[1]) else 3)' "$1"
+}
+# The typescript dependency-cruiser can load, for remedies: "typescript@<range>" from its meta.cjs.
+ts_pkg() {
+  python3 -c 'import re; print(repr("typescript@" + re.search(r"\btypescript: *\"([^\"]+)\"", open("node_modules/dependency-cruiser/src/meta.cjs").read())[1]))' 2>/dev/null || echo typescript
+}
 
 stage_lint()         { $PM run -s lint; }
 stage_types() {
-  if ! has_script typecheck; then echo 'types: skipped: no "typecheck" script in package.json (e.g. "tsc --noEmit")'; return 78; fi
-  $PM run -s typecheck
+  has_script typecheck
+  case $? in
+    0) $PM run -s typecheck ;;
+    3) echo 'types: skipped: no "typecheck" script in package.json (e.g. "tsc --noEmit")'; return 78 ;;
+    *) return 1 ;;
+  esac
 }
 stage_boundaries() {
-  # Without typescript, dependency-cruiser cannot read .ts files and passes on nothing.
+  # dependency-cruiser exits 0 having read no .ts file when typescript is missing or newer than it supports.
+  local out status
   if [ -x node_modules/.bin/depcruise ] && [ ! -f node_modules/typescript/package.json ]; then
-    echo "typescript is not installed: $PM add -D typescript" >&2; return 1
+    echo "typescript is not installed: $PM add -D $(ts_pkg)" >&2; return 1
   fi
-  tool depcruise dependency-cruiser @DEPCRUISE_PATHS@ --config .dependency-cruiser.cjs
+  out=$(tool depcruise dependency-cruiser @DEPCRUISE_PATHS@ --config .dependency-cruiser.cjs 2>&1)
+  status=$?
+  [ -z "$out" ] || printf '%s\n' "$out"
+  [ $status -eq 0 ] || return $status
+  if grep -q missing-typescript-transpiler <<<"$out"; then
+    echo "dependency-cruiser cannot load the installed typescript: $PM add -D $(ts_pkg)" >&2; return 1
+  fi
+  if grep -Eq '(^|[^0-9])0 modules' <<<"$out"; then
+    echo "boundaries: dependency-cruiser cruised 0 modules under @DEPCRUISE_PATHS@, so nothing was checked" >&2; return 1
+  fi
 }
 stage_tests()        { $PM run -s test; }
 stage_smoke() {
-  if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh
-  elif has_script smoke; then $PM run -s smoke
-  else echo "smoke: skipped: no scripts/smoke.sh or package.json \"smoke\" script (run the real entry point end to end)"; return 78; fi
+  if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; return; fi
+  has_script smoke
+  case $? in
+    0) $PM run -s smoke ;;
+    3) echo "smoke: skipped: no scripts/smoke.sh or package.json \"smoke\" script (run the real entry point end to end)"; return 78 ;;
+    *) return 1 ;;
+  esac
 }
 stage_test_quality() { tool eslint eslint --max-warnings 0 --no-error-on-unmatched-pattern @TEST_GLOBS@; }
 stage_mutation() {

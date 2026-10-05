@@ -23,8 +23,9 @@ SUBS = {
 }
 # Runs one stage and exits with its raw status, so tests see the stage's own exit code.
 STUB_RUNNER = 'run_stages() { "stage_${1//-/_}"; }\n'
-# Records its argv one per line in $ARGV_DIR/<name>, then exits $FAKE_EXIT.
-FAKE_TOOL = '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$ARGV_DIR/$(basename "$0")"\nexit "${FAKE_EXIT:-0}"\n'
+# Records its argv one per line in $ARGV_DIR/<name>, prints $FAKE_OUT, then exits $FAKE_EXIT.
+FAKE_TOOL = ('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$ARGV_DIR/$(basename "$0")"\n'
+             '[ -z "${FAKE_OUT:-}" ] || echo "$FAKE_OUT"\nexit "${FAKE_EXIT:-0}"\n')
 # A package manager that only logs: any `exec`/`install`/`add`/`dlx` in the log is a failure.
 FAKE_PM = '#!/usr/bin/env bash\necho "$(basename "$0") $*" >> "$ARGV_DIR/pm.log"\n'
 
@@ -97,7 +98,7 @@ class Project(unittest.TestCase):
         return path.read_text() if path.is_file() else ""
 
     def assert_nothing_installed(self):
-        self.assertNotRegex(self.pm_log(), r"\b(exec|install|add|dlx|x)\b|^npx")
+        self.assertNotRegex(self.pm_log(), r"(?m)\b(exec|install|add|dlx|x)\b|^npx")
 
 
 class ToolFlags(Project):
@@ -162,6 +163,56 @@ class MissingTools(Project):
         self.assert_missing("boundaries", "typescript", "typescript")
 
 
+    def test_yarn_pnp_says_why_the_tool_is_missing(self):
+        self.write(".pnp.cjs", "")
+        result = self.check("test-quality")
+        self.assertEqual(result.returncode, 1, result.out)
+        self.assertIn("eslint is not installed: npm add -D eslint", result.out)
+        self.assertIn("nodeLinker: node-modules", result.out)
+
+
+class BoundariesCruisedNothing(Project):
+    """dependency-cruiser exits 0 having read no .ts file when it cannot load the installed typescript."""
+    WARNING = ("  warn missing-typescript-transpiler: no compatible typescript transpiler found\n"
+               "✔ no dependency violations found (0 modules, 0 dependencies cruised)")
+
+    def setUp(self):
+        super().setUp()
+        self.tools("depcruise")
+
+    def test_unsupported_typescript_fails_the_stage(self):
+        result = self.check("boundaries", FAKE_OUT=self.WARNING)
+        self.assertEqual(result.returncode, 1, result.out)
+        self.assertIn("missing-typescript-transpiler", result.out)
+        self.assertIn("dependency-cruiser cannot load the installed typescript: npm add -D typescript", result.out)
+        self.assert_nothing_installed()
+
+    def test_remedy_names_the_typescript_range_dependency_cruiser_supports(self):
+        self.write("node_modules/dependency-cruiser/src/meta.cjs", """\
+            module.exports = {
+            \tsupportedTranspilers: {
+            \t\tswc: ">=1.0.0 <2.0.0",
+            \t\ttypescript: ">=2.0.0 <7.0.0",
+            \t},
+            };
+            """)
+        result = self.check("boundaries", FAKE_OUT=self.WARNING)
+        self.assertIn("npm add -D 'typescript@>=2.0.0 <7.0.0'", result.out)
+        shutil.rmtree(self.root / "node_modules/typescript")
+        self.assertIn("typescript is not installed: npm add -D 'typescript@>=2.0.0 <7.0.0'",
+                      self.check("boundaries").out)
+
+    def test_zero_modules_cruised_fails_the_stage(self):
+        result = self.check("boundaries", FAKE_OUT="✔ no dependency violations found (0 modules, 0 dependencies cruised)")
+        self.assertEqual(result.returncode, 1, result.out)
+        self.assertIn("cruised 0 modules", result.out)
+
+    def test_modules_cruised_passes(self):
+        result = self.check("boundaries", FAKE_OUT="✔ no dependency violations found (10 modules, 9 dependencies cruised)")
+        self.assertEqual(result.returncode, 0, result.out)
+        self.assertIn("10 modules", result.out)
+
+
 class PnpmMissingTools(Project):
     pm = "pnpm"
 
@@ -200,6 +251,14 @@ class Skips(Project):
         self.assertEqual(result.returncode, 3)
         self.assertIn("smoke-sh-ran", result.out)
         self.assertEqual(self.pm_log(), "")
+
+    def test_broken_package_json_fails_instead_of_skipping(self):
+        self.write("package.json", '{"scripts": {"typecheck": ')
+        for stage in ("types", "smoke"):
+            result = self.check(stage)
+            self.assertEqual(result.returncode, 1, result.out)
+            self.assertIn("package.json", result.out)
+            self.assertNotIn("skipped", result.out)
 
     def test_mutation_skips_when_no_source_changed(self):
         self.tools("stryker")
