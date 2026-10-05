@@ -2,8 +2,9 @@
 # Stop hook (rule H6): the gate must be green before the agent stops. Uncommitted code
 # changes need the fast gate; a clean tree with commits since this branch's last green run
 # (refs/slopbrake/last-green/<branch>) needs the full gate, which records the new green on
-# success. The full gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and every run
-# is cut off after SLOPBRAKE_STOP_TIMEOUT (540) seconds, inside the 600 s hook timeout.
+# success. The full gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and all runs
+# together share one SLOPBRAKE_STOP_TIMEOUT (540) second budget, inside the 600 s hook
+# timeout; running out of it is a red attempt, never a hang.
 # Gated: the project, plus the same directory in the worktree the agent is working in
 # (payload cwd) when it belongs to the same repository. On red, exit 2 feeds the failure
 # back so the agent keeps working. After 3 consecutive red stops in one session it lets
@@ -31,6 +32,8 @@ if [ -n "$CWD" ] && WT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null) \
   REPOS+=("$WT/$(git rev-parse --show-prefix)")  # an install in a monorepo subdirectory sits there in the worktree too
 fi
 
+LIMIT=${SLOPBRAKE_STOP_TIMEOUT:-540}
+DEADLINE=$((SECONDS + LIMIT))  # one budget for every repo: the hook itself is killed at 600 s
 STATE_DIR="$(git rev-parse --absolute-git-dir)/slopbrake"
 mkdir -p "$STATE_DIR"
 COUNT_FILE="$STATE_DIR/stop-red-$SESSION"
@@ -51,12 +54,18 @@ gate() {
     return 0
   fi
   mkdir -p "$(dirname "$log")"
-  local limit=${SLOPBRAKE_STOP_TIMEOUT:-540} cap=()
-  command -v timeout >/dev/null && cap=(timeout -k 10 "$limit")
+  local left=$((DEADLINE - SECONDS)) cap=() run="scripts/check${args[*]:+ ${args[*]}}"
+  if command -v timeout >/dev/null; then
+    if [ $left -le 0 ]; then
+      echo "require-green: $1: $run timed out: the ${LIMIT}s Stop budget was used up before it could run"
+      return 1
+    fi
+    cap=(timeout -k 5 "$left")
+  fi
   "${cap[@]}" scripts/check "${args[@]}" >"$log" 2>&1 </dev/null
   status=$?
   [ $status -eq 0 ] && return 0
-  [ $status -eq 124 ] && [ ${#cap[@]} -gt 0 ] && why="scripts/check ${args[*]} timed out after ${limit}s"
+  [ $status -eq 124 ] && [ ${#cap[@]} -gt 0 ] && why="$run timed out (the Stop budget is ${LIMIT}s for all repos)"
   echo "require-green: $1: $why:"
   tail -n 60 "$log"
   return 1

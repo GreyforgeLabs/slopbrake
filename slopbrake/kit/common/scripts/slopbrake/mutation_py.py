@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import base_ref, collect_changes, describe_base, git, repo_root
+from common import base_ref, collect_changes, describe_base, git, repo_root, split_lines
 
 SKIP = 78
 NO_MUTATE = re.compile(r"#\s*slopbrake:\s*no-mutate\b")
@@ -198,7 +198,7 @@ def _terminate(signum: int, _frame: object) -> None:
 
 
 def mutable_lines(path: Path, lines: set[int]) -> set[int]:
-    source = path.read_text(encoding="utf-8").splitlines()
+    source = split_lines(path.read_text(encoding="utf-8"))
     return {n for n in lines if n <= len(source) and not NO_MUTATE.search(source[n - 1])}
 
 
@@ -226,7 +226,11 @@ def main(argv: list[str] | None = None) -> int:
     if not targets:
         print(f"mutation: skipped: no changed Python source lines since {described}")
         return SKIP
+    changed = sum(len(lines) for lines in targets.values())
     targets = {path: mutable_lines(root / path, lines) for path, lines in targets.items()}
+    pragmas = changed - sum(len(lines) for lines in targets.values())
+    if pragmas:  # visible to the reviewer: every excluded line is a claim that its mutants are equivalent
+        print(f"mutation: {pragmas} changed line{'s' if pragmas != 1 else ''} excluded by no-mutate")
     plan = []
     for path, lines in sorted(targets.items()):
         try:
@@ -270,7 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 (work / path).write_text(original, encoding="utf-8")
             if ok:
-                source = original.splitlines()[line - 1].strip()
+                source = split_lines(original)[line - 1].strip()
                 survivors.append({"path": path, "line": line, "mutation": description, "source": source})
             else:
                 killed += 1
@@ -286,7 +290,8 @@ def main(argv: list[str] | None = None) -> int:
           f"base {described}; test command: {shlex.quote(args.test_cmd)}")
     if args.json:
         Path(args.json).write_text(json.dumps({"score": score, "floor": args.floor, "killed": killed, "total": total,
-                                               "survivors": survivors, "base": base}, indent=2), encoding="utf-8")
+                                               "survivors": survivors, "base": base,
+                                               "no_mutate_lines": pragmas}, indent=2), encoding="utf-8")
     return 0 if score >= args.floor else 1
 
 

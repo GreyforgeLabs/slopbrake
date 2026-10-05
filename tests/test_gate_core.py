@@ -194,6 +194,11 @@ class DiffCollection(Scratch):
         self.write("other/q.py", "b = 2\n")
         self.assertEqual(self.ranges("--base", "HEAD", cwd=self.root / "src/x"), "other/q.py:1-1")
 
+    def test_untracked_lines_are_numbered_by_newlines_only(self):
+        self.git_repo()
+        (self.root / "ff.py").write_text("a = 1\n\x0cb = 2\nc = 3\n")
+        self.assertEqual(self.ranges("--base", "HEAD"), "ff.py:1-3")
+
     def test_quoted_and_spaced_paths_parse(self):
         quoted = ('diff --git "a/caf\\303\\251 x.py" "b/caf\\303\\251 x.py"\n--- "a/caf\\303\\251 x.py"\n'
                   '+++ "b/caf\\303\\251 x.py"\n@@ -0,0 +1 @@\n+a = 1\n')
@@ -406,6 +411,24 @@ class Mutation(Scratch):
         result = self.floor("--base", "main")
         self.assertEqual(result.returncode, SKIP, result.stdout)
         self.assertIn("no mutable sites", result.stdout)
+        self.assertIn("1 changed line excluded by no-mutate", result.stdout)
+
+    def test_no_mutate_lines_are_reported_in_the_score(self):
+        self.git_repo()
+        self.seed("def tax(x):\n    return x * 2  # slopbrake: no-mutate\n\n\ndef fee(x):\n    return x + 1\n",
+                  "tax(1)\nfee(1)\n", "tax, fee")
+        result = self.floor("--base", "main")
+        self.assertIn("mutation: 1 changed line excluded by no-mutate", result.stdout)
+        self.assertIn("below floor", result.stdout)
+
+    def test_form_feeds_do_not_shift_the_pragma(self):
+        self.git_repo()
+        self.seed("", "h(5)\n", "h")  # seed() dedents, which would blank the form-feed line
+        (self.root / "shop.py").write_text("def h(x):\n    \x0c\n    if x > 1:\n"
+                                           "        return 2  # slopbrake: no-mutate\n    return 3\n")
+        result = self.floor("--base", "main")
+        self.assertIn("survived: shop.py:5 [return None] return 3", result.stdout)
+        self.assertNotIn("shop.py:4", result.stdout)
 
     def test_non_ascii_paths_are_checked(self):
         self.git_repo()
@@ -510,6 +533,23 @@ class PrePush(Scratch):
         result, _ = self.push(f"refs/heads/main {self.head} refs/heads/main {self.first}", FAIL="1")
         self.assertNotEqual(result.returncode, 0)
 
+    def test_a_ref_that_is_not_checked_out_cannot_be_pushed_unchecked(self):
+        self.git("branch", "old", "HEAD~1")
+        result, logged = self.push(f"refs/heads/old {self.first} refs/heads/old {'0' * 40}")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("check out refs/heads/old to push it", result.stderr)
+        self.assertEqual(logged, [])
+
+    def test_a_ref_already_on_the_remote_needs_no_check(self):
+        self.git("update-ref", "refs/remotes/origin/main", self.first)
+        result, logged = self.push(f"refs/tags/v1 {self.first} refs/tags/v1 {'0' * 40}")
+        self.assertEqual((result.returncode, logged), (0, []), result.stderr)
+
+    def test_an_annotated_tag_at_head_is_checked_like_head(self):
+        self.git("tag", "-a", "-m", "release", "v2")
+        result, logged = self.push(f"refs/tags/v2 {self.git('rev-parse', 'v2')} refs/tags/v2 {'0' * 40}")
+        self.assertEqual((result.returncode, len(logged)), (0, 1), result.stderr)
+
 
 class PreCommit(Scratch):
     def test_warns_when_staged_files_also_have_unstaged_changes(self):
@@ -597,6 +637,19 @@ class StopHook(Scratch):
         self.assertLess(time.monotonic() - started, 8)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("timed out", result.stderr)
+
+    def test_one_time_budget_covers_the_project_and_the_worktree(self):
+        wt = self.worktree()
+        (self.root / ".git/info/exclude").write_text("SLOW\n")
+        for repo in (self.root, wt):
+            (repo / "SLOW").write_text("")
+        (self.root / "RED").write_text("red\n")  # both dirty: both get --fast
+        started = time.monotonic()
+        result, _ = self.stop({"session_id": "s7", "cwd": str(wt)}, SLOPBRAKE_STOP_TIMEOUT="4")
+        self.assertLess(time.monotonic() - started, 6.5)  # one 4 s budget, not 4 s per repo
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr.count("timed out"), 2, result.stderr)
+        self.assertIn("scripts/check --fast timed out", result.stderr)
 
     def test_worktree_of_a_monorepo_subdirectory_install(self):
         app = self.root / "app"

@@ -158,6 +158,12 @@ def parse_unified_diff(text: str) -> dict[str, FileChange]:
     return changes
 
 
+def split_lines(text: str) -> list[str]:
+    """Lines as git and ast number them: only "\n" ends a line (splitlines() also splits on \f, \v, \x1c..)."""
+    lines = text.split("\n")
+    return lines[:-1] if lines[-1] == "" else lines
+
+
 def untracked_files() -> list[str]:
     """Untracked, not-ignored files, as paths from the repo root (whatever the cwd)."""
     out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=repo_root())
@@ -191,7 +197,7 @@ def collect_changes(base: str | None, working_tree: bool) -> dict[str, FileChang
         root = repo_root()
         for path in untracked_files():
             try:
-                lines = (root / path).read_text(encoding="utf-8").splitlines()
+                lines = split_lines((root / path).read_text(encoding="utf-8"))
             except (UnicodeDecodeError, OSError):
                 lines = []
             changes[path] = FileChange(path=path, added={i + 1: t for i, t in enumerate(lines)})

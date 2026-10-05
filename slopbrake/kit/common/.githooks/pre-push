@@ -2,18 +2,24 @@
 # Layer 1 locally: the full gate, mutation floor included, before anything leaves.
 # Git passes "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref on stdin.
 # Each push is measured against what the remote already has; inherited overrides are
-# dropped so an environment variable cannot lower or narrow the gate.
+# dropped so an environment variable cannot lower or narrow the gate. The gate checks the
+# working tree, so a ref other than HEAD is refused unless the remote already has its commits.
 unset MUTATION_FLOOR MUTATION_MAX MUTATION_TEST_CMD TEST_CMD GITHUB_BASE_REF SLOPBRAKE_BASE
 root=$(git rev-parse --show-toplevel) || exit 1
 head=$(git rev-parse -q --verify HEAD)
 status=0 seen=" "
 while read -r local_ref local_sha remote_ref remote_sha; do
   [[ "$local_sha" =~ ^0+$ ]] && continue  # deleting a remote ref: nothing to check
+  if [ "$(git rev-parse -q --verify "$local_sha^{commit}")" != "$head" ]; then  # ^{commit}: an annotated tag at HEAD is HEAD
+    [ -z "$(git rev-list -n 1 "$local_sha" --not --remotes)" ] && continue  # nothing new leaves
+    echo "pre-push: $local_ref is not checked out and the gate checks the working tree; check out $local_ref to push it" >&2
+    status=1
+    continue
+  fi
   base=
   if [[ ! "$remote_sha" =~ ^0+$ ]] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then base=$remote_sha; fi
   [[ "$seen" == *" ${base:-auto} "* ]] && continue  # same base, same tree: the same check
   seen+="${base:-auto} "
-  [ "$local_sha" = "$head" ] || echo "pre-push: $local_ref is not HEAD; the gate checks the working tree at HEAD" >&2
   echo "pre-push: $local_ref -> $remote_ref (base ${base:-default})"
   if [ -n "$base" ]; then SLOPBRAKE_BASE=$base "$root/scripts/check" </dev/null || status=1
   else "$root/scripts/check" </dev/null || status=1; fi
