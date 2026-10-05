@@ -16,6 +16,7 @@
   <a href="#what-it-catches">What it catches</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="docs/RULES.md">The rules</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#credits">Credits</a>
 </p>
 
@@ -45,18 +46,31 @@ flowchart LR
 ```sh
 uv tool install git+https://github.com/GreyforgeLabs/slopbrake    # or: pipx install git+https://…
 
-slopbrake init   path/to/repo --dry-run   # see exactly what it would add
-slopbrake init   path/to/repo             # add it; never overwrites files you own
-slopbrake verify path/to/repo             # prove every rule bites
+cd path/to/repo
+slopbrake init . --dry-run          # see exactly what it would add
+slopbrake init .                    # add it; never overwrites files you own
+git switch -c add-slopbrake         # the kit is a one-way door: the gate refuses it on the default branch
+git add -A && git commit -m 'Add slopbrake guardrails'   # init prints the exact paths to add
+slopbrake verify .                  # prove the checks bite, against the committed HEAD
+slopbrake user-hooks install        # make the hooks fire wherever a session starts
+slopbrake status .                  # anything still unwired is listed as a gap
 ```
 
-Python and TypeScript repos are supported. Every command takes `--json`. Exit codes: 0 ok, 1 a gap or a failed proof, 2 usage error.
+Merge `add-slopbrake` the way you'll merge every one-way door from now on: a human reads it first.
 
-### Every rule is proven, not configured
+**Why user-level hooks?** Claude Code loads a project's `.claude/settings.json` hooks only from the directory the session *started* in. Start a session in `~` or a parent folder, and the repo's git guard and Stop gate never fire. `user-hooks install` adds three entries to `~/.claude/settings.json` that act only inside repos Slopbrake manages and do nothing anywhere else. It refuses to install until the `slopbrake` on your `PATH` can run them.
 
-`verify` works in a throwaway git worktree. For each rule it plants a real violation and requires the check to **fail and name the rule**, then requires it to pass again once the violation is removed. A check that crashes can't pass a proof.
+Python and TypeScript repos are supported. `init`, `status`, `verify` and `user-hooks` take `--json`. Exit codes: 0 ok, 1 a gap or a failed proof, 2 usage error. A fresh Python repo shows one gap until you choose a type checker for the `types` stage in `scripts/check`; it skips until then.
 
-<p align="center"><img src="brand/verify.svg" alt="slopbrake verify output: fifteen proofs, all holding" width="720"></p>
+### The checks are proven, not configured
+
+`verify` works in a throwaway git worktree of the committed HEAD. It runs 16 proofs over the 10 rules a machine can check (L1, D1, T1, T4, G1, G2, G4, H1, H5, H6). Where a rule can be broken on purpose, it plants a real violation and requires the check to **fail and name the rule**, then requires it to pass again once the violation is removed. A check that crashes can't pass a proof, a gate that leaves out one of the kit's stages fails the L1 proof, and unwired hooks fail the H5/H6 proof. The other rules guide the reviewer and the workflow; [docs/RULES.md](docs/RULES.md) marks each one Check, Review or Process.
+
+<p align="center"><img src="brand/verify.svg" alt="slopbrake verify output: sixteen proofs, all holding" width="720"></p>
+
+### What it is not
+
+Slopbrake brakes hurried or careless agents and makes slop visible. It is not a sandbox against an agent that sets out to evade it: editing `scripts/check`, deleting kit files, environment overrides, `git stash` and shell variables can all get around a check. That's why the files that govern the gate are one-way doors, so a human sees such edits. GitHub branch protection, not Slopbrake, is what makes CI authoritative. The known limits are listed in [docs/RULES.md](docs/RULES.md#known-limits).
 
 ## What it catches
 
@@ -82,12 +96,12 @@ The fix is an independent expectation, a literal or a worked example: `assert di
 
 | Rule | Catches | Python | TypeScript |
 |:----:|---------|--------|------------|
-| **T1** | Tautological tests: constants asserted against themselves, expected values rebuilt from the test's own inputs, `expect(true).toBe(true)` | AST check | `slopbrake/no-tautological-test` ESLint rule |
-| **T4** | Tests that can't fail: mutation score below the floor, **on changed lines only** | stdlib mutator, in a copy of the tree | StrykerJS with `--mutate` line ranges |
-| **D1** | Imports that reach past a module's entry points, and import cycles | stdlib port of Pocock's rules | dependency-cruiser, Pocock's config |
-| **G1 · G2** | PR bodies without a Door and Blast Radius; a door declared lower than the rules compute | door classifier + PR-body check | same |
-| **H5** | `push --force`, `reset --hard`, `clean -f`, `branch -D`, `checkout .` in agent sessions | Claude Code hook | same |
-| **H6** | An agent stopping with red, uncommitted code (after 3 tries it may stop and report) | Claude Code Stop hook | same |
+| **T1** | Tautological tests (constants asserted against themselves, expected values rebuilt from the test's own inputs, `expect(true).toBe(true)`) and tests with no assertion at all | AST check | `no-tautological-test` and `expect-in-test` ESLint rules |
+| **T4** | Tests that can't fail: mutation score below the floor, **on changed lines only**. Nothing to mutate is a skip, never a 100% | stdlib mutator in a copy of the tree: comparisons and boundaries, arithmetic, `and`/`or`, `not`, constants and strings, deleted calls, `return None`, negated conditions | StrykerJS with `--mutate` line ranges |
+| **D1** | Imports that reach past a package's entry points, at every package level, and import cycles | stdlib port of Pocock's rules | dependency-cruiser, Pocock's config |
+| **G1 · G2** | PR bodies without a Door and Blast Radius; a door declared lower than the rules compute. The base revision's rules count too, so a PR can't loosen its own floor, and a one-way change can't be committed on the default branch | door classifier + PR-body check | same |
+| **H5** | Force pushes in every spelling (`-f`, `+ref`, `--force-with-lease`, `--mirror`, deletes), `--no-verify` and `core.hooksPath` overrides, `reset --hard`, `clean -f`, `branch -D`, whole-tree `checkout`/`restore`, `stash drop`, reflog and ref deletion. Parsed like a shell, so `bash -c`, `eval` and `env` wrappers don't hide them | Claude Code hook | same |
+| **H6** | An agent stopping with red uncommitted code, or with commits no full green run has covered (the full gate then runs and records a new last-green). After 3 red tries it may stop and report | Claude Code Stop hook | same |
 
 All 30+ rules, with their mechanisms and proofs, are in **[docs/RULES.md](docs/RULES.md)**.
 
@@ -95,7 +109,7 @@ All 30+ rules, with their mechanisms and proofs, are in **[docs/RULES.md](docs/R
 
 ### Layer 1: one gate, everywhere
 
-`scripts/check` is the one command. The pre-commit hook runs it with `--fast` (no mutation), and pre-push and CI run it in full. The Stop hook runs the fast gate before an agent may finish with uncommitted code. The checks are standard-library Python, so CI installs nothing. Mutation testing touches **only the lines you changed**, which keeps it fast enough to run on every push.
+`scripts/check` is the one command. The pre-commit hook runs it with `--fast` (no mutation), and pre-push and CI run it in full. A stage with nothing to check says `skip` with the reason, never `pass`. Mutation testing touches **only the lines you changed**, which keeps it fast enough to run on every push: since the push's remote commit, the PR's base, or, when you work straight on the default branch, since the last full green run (`refs/slopbrake/last-green/<branch>`, which every clean, all-green full run moves forward). The floor lives in the repo's own files (`scripts/check`, or `stryker.config.json` for TypeScript), so an environment variable can't lower it. The Stop hook runs the fast gate before an agent may finish with uncommitted code, and the full gate when it has commits no green run has covered. The checks are standard-library Python: they add no dependencies.
 
 ### Layer 2: a reviewer with fresh eyes that commits its fixes
 
@@ -108,14 +122,14 @@ The implementer has the most context pressure, so it doesn't carry the coding st
 
 ### Door triage: spend human attention where it can't be undone
 
-Every PR declares a **Door** and a **Blast Radius**. Slopbrake *computes a floor* from path and content rules. Migrations, `DROP TABLE`, auth, billing, deploy config, outbound email, runtime file deletion, and the gate itself are all one-way. The agent may raise the door but never lower it. Two-way doors with a green gate are merge-eligible; one-way doors wait for you.
+Every PR declares a **Door** and a **Blast Radius**. Slopbrake *computes a floor* from path and content rules. Migrations, `DROP TABLE`, auth, billing, deploy config, outbound email, runtime file deletion, and the gate itself are all one-way. The agent may raise the door but never lower it. Two-way doors with a green gate are merge-eligible; one-way doors wait for you. The rules are read from the base revision as well as the PR, so a PR can't delete or loosen the rules that judge it. Without a PR, the gate refuses a one-way change on the default branch: commit it on a feature branch for review.
 
 ```text
 $ python3 scripts/slopbrake/door_classify.py --base main
-door: one-way
+door: one-way (base main)
   - touches migrations/0007_drop_legacy.sql (path rule '**/migrations/**')
   - touches migrations/0007_drop_legacy.sql (path rule '**/*.sql')
-  - migrations/0007_drop_legacy.sql:1 adds 'DROP TABLE legacy_accounts;' (content rule 'DROP TABLE')
+  - migrations/0007_drop_legacy.sql:1 adds 'DROP TABLE legacy_accounts;' (content rule '(?i)\\bdrop\\s+(table|column|schema|database)\\b')
 ```
 
 ### Retro: comments become checks
@@ -137,11 +151,14 @@ A finding that shows up twice and is still only prose counts as a failed retro.
 |------|-------|---------|
 | `scripts/check` | repo | The one gate command. Stage commands are yours to edit. |
 | `scripts/slopbrake/` | kit | The standard-library checks. |
-| `.githooks/`, `.github/workflows/check.yml` | kit / repo | Layer 1 locally and in CI. |
+| `.githooks/` | kit | Layer 1 locally: the fast gate on commit, the full gate per pushed ref on push. |
+| `.github/workflows/check.yml` | repo | Layer 1 in CI, set up for your package manager. Only written when the repo has a GitHub remote. |
 | `.claude/agents/reviewer.md` | kit | Two-axis reviewer; review-only and fix modes. |
 | `.claude/skills/implement-ticket/` | kit | Ticket → seams → TDD → gate → parallel review → door → PR body. |
 | `.claude/skills/{tdd,pr,retro,…}` | kit | Pocock's skills, vendored unmodified, with our additions appended. |
-| `.claude/settings.json` | merged | The git-guard and Stop hooks, merged into your existing settings. |
+| `.claude/hooks/` | kit | The git guard (`git_guard.py`) and the Stop gate (`require-green.sh`). |
+| `.claude/settings.json` | merged | Wires those hooks, merged into your existing settings. |
+| `.claude/slopbrake.json` | kit | The stack and kit version; `status` flags a stale kit, and the user-level hooks act only in repos that have it. |
 | `.claude/door-rules.yml` | repo | What counts as a one-way door in this repo. |
 | `CLAUDE.md`, `CODING_STANDARDS.md`, `docs/agents/` | repo | A 40-line navigation file; the reviewer's standards; the tracker and retro log. |
 | TypeScript: `.dependency-cruiser.cjs`, `stryker.config.json`, `eslint-rules/slopbrake.mjs` | repo / kit | D1, T4, T1. |
@@ -184,7 +201,7 @@ Any mistakes in turning these ideas into checks are ours, not his.
 
 ## Developing
 
-`scripts/check` runs Slopbrake's own gate: pinned ruff, behaviour tests for every Python check (run through their command lines against seeded git repos), and RuleTester cases for the ESLint rule. The pre-commit hook and CI run it. The brand art is generated from source: `brand/make_logo.py`, `brand/src/banner.html` and `brand/make_terminal.py`.
+`scripts/check` runs Slopbrake's own gate: pinned ruff, behaviour tests for every Python check (run through their command lines against seeded git repos), Slopbrake's own T1 check over those tests, and RuleTester cases for the ESLint rules. The pre-commit hook and CI run it. The brand art is generated from source: `brand/make_logo.py`, `brand/src/banner.html` and `brand/make_terminal.py`.
 
 ## License
 
