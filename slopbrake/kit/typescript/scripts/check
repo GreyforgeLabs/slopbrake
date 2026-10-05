@@ -37,7 +37,14 @@ ts_pkg() {
   python3 -c 'import re; print(repr("typescript@" + re.search(r"\btypescript: *\"([^\"]+)\"", open("node_modules/dependency-cruiser/src/meta.cjs").read())[1]))' 2>/dev/null || echo typescript
 }
 
-stage_lint()         { $PM run -s lint; }
+stage_lint() {
+  has_script lint
+  case $? in
+    0) $PM run -s lint ;;
+    3) echo 'lint: skipped: no "lint" script in package.json (e.g. "eslint .")'; return 78 ;;
+    *) return 1 ;;
+  esac
+}
 stage_types() {
   has_script typecheck
   case $? in
@@ -63,7 +70,14 @@ stage_boundaries() {
     echo "boundaries: dependency-cruiser cruised 0 modules under @DEPCRUISE_PATHS@, so nothing was checked" >&2; return 1
   fi
 }
-stage_tests()        { $PM run -s test; }
+stage_tests() {
+  has_script test
+  case $? in
+    0) $PM run -s test ;;
+    3) echo 'tests: no test script in package.json (add one, e.g. "test": "vitest run")' >&2; return 1 ;;
+    *) return 1 ;;
+  esac
+}
 stage_smoke() {
   if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; return; fi
   has_script smoke
@@ -75,12 +89,11 @@ stage_smoke() {
 }
 stage_test_quality() { tool eslint eslint --max-warnings 0 --no-error-on-unmatched-pattern @TEST_GLOBS@; }
 stage_mutation() {
-  local ranges status
+  local base ranges
+  base=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from common import describe_base; print(describe_base())' "$G") || return 1
+  echo "mutation: base $base"
   ranges=$(python3 "$G/changed_ranges.py" @MUTATE_INCLUDE@ \
-    --exclude '**/*.test.*' --exclude '**/*.spec.*' --exclude '**/*.d.ts' --exclude '**/__tests__/**')
-  status=$?
-  if [ $status -eq 78 ]; then echo "${ranges:-mutation: skipped: no base to compare against}"; return 78; fi
-  [ $status -eq 0 ] || return 1
+    --exclude '**/*.test.*' --exclude '**/*.spec.*' --exclude '**/*.d.ts' --exclude '**/__tests__/**') || return 1
   if [ -z "$ranges" ]; then echo "mutation: skipped: no changed source lines since the base"; return 78; fi
   tool stryker "@stryker-mutator/core @stryker-mutator/vitest-runner" run stryker.config.json --mutate "$ranges"
 }

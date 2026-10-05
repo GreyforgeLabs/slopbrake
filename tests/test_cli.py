@@ -48,7 +48,9 @@ class Scratch(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def gf(self, *args, cwd=None, path_prefix=None, **env):
-        full = dict(os.environ, PYTHONPATH=str(HOME), TMPDIR=str(self.tmpdir), **env)
+        # init records the repo in the user-level trust list (B11 b): keep it out of the real ~/.config.
+        full = dict(os.environ, PYTHONPATH=str(HOME), TMPDIR=str(self.tmpdir),
+                    XDG_CONFIG_HOME=str(Path(self.tmp.name) / "config"), **env)
         if path_prefix:
             full["PATH"] = f"{path_prefix}{os.pathsep}{full['PATH']}"
         return sh([sys.executable, "-m", "slopbrake", *args], cwd or self.root, env=full)
@@ -176,21 +178,13 @@ class Init(Scratch):
         self.assertIn("scripts/slopbrake", step)
 
     def test_monorepo_subdir_never_takes_over_the_parent_hooks(self):
+        # B8 (round 2): subdirectory installs are refused outright, before anything is written.
         self.git_repo()
-        hook = self.write(".git/hooks/pre-commit", "#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
         app = self.root / "packages/app"
         self.write("packages/app/pyproject.toml", "[project]\nname = 'app'\n")
-        result = json.loads(self.gf("init", str(app), "--json").stdout)
+        self.assert_one_line_error(self.gf("init", str(app)))
         self.assertEqual(sh(["git", "config", "--get", "core.hooksPath"], self.root).stdout, "")
-        self.assertIn("by hand", result["hooks"])
-        hook.unlink()  # even with no live hooks, a subdir install leaves the repo's hooks alone
-        result = json.loads(self.gf("init", str(app), "--json").stdout)
-        self.assertEqual(sh(["git", "config", "--get", "core.hooksPath"], self.root).stdout, "")
-        self.assertIn("by hand", result["hooks"])
-        status = json.loads(self.gf("status", str(app), "--json").stdout)[0]
-        self.assertFalse(status["ok"])
-        self.assertTrue(any("git hooks" in gap for gap in status["gaps"]), status["gaps"])
+        self.assertFalse((app / ".claude").exists())
 
     def test_linked_worktree_sees_the_shared_hooks(self):
         self.python_repo()
@@ -229,17 +223,11 @@ class PythonDefaults(Scratch):
             with self.subTest(layout=name), tempfile.TemporaryDirectory() as tmp:
                 for rel, text in files.items():
                     self.write(rel, text, base=Path(tmp))
-                self.assertIn("-m pytest", cli.python_test_cmd(Path(tmp)))
+                self.assertEqual(cli.python_test_args(Path(tmp)), "-m pytest -q")
         with tempfile.TemporaryDirectory() as tmp:
             self.write("pyproject.toml", "[project]\nname='x'\ndependencies = ['pytest-ish-lib']\n", base=Path(tmp))
-            self.assertEqual(cli.python_test_cmd(Path(tmp)), "python3 -m unittest discover -s tests")
-
-    def test_interpreter_follows_uv_lock_then_venv(self):
-        self.write("pyproject.toml", "[tool.pytest.ini_options]\n")
-        (self.root / ".venv/bin").mkdir(parents=True)
-        self.assertEqual(cli.python_test_cmd(self.root), "$PWD/.venv/bin/python -m pytest -q")
-        self.write("uv.lock", "")
-        self.assertEqual(cli.python_test_cmd(self.root), "uv run --frozen python -m pytest -q")
+            self.assertEqual(cli.python_test_args(Path(tmp)), "-m unittest discover -s tests")
+    # B6 (round 2): the interpreter is chosen by scripts/check at run time; see tests/test_r2_cli.py.
 
     def test_ci_install_matches_the_test_command(self):
         self.write("pyproject.toml", "[project]\nname='x'\n[project.optional-dependencies]\ndev = ['pytest']\n"
@@ -433,15 +421,13 @@ class Verify(Scratch):
         self.assertFalse(marker.exists())
         self.assertTrue(self.proof(result, "CLAUDE.md is at most")["ok"])
 
-    def test_verify_runs_the_gate_from_a_monorepo_subdir(self):
+    def test_verify_refuses_a_monorepo_subdir(self):
+        # B8 (round 2): verify refuses subdirectory installs like init and status.
         self.git_repo()
         app = self.root / "packages/app"
         self.write("packages/app/pyproject.toml", "[project]\nname = 'app'\n")
-        self.gf("init", str(app))
-        self.write("packages/app/scripts/check", NOOP_CHECK).chmod(0o755)
-        self.commit("app with slopbrake")
-        l1 = self.proof(self.verify(app), "clean tree passes")
-        self.assertIn("NO_RECORD=1", l1["output"])
+        self.commit("app")
+        self.assert_one_line_error(self.gf("verify", str(app)))
         self.assert_nothing_leaked()
 
     def test_no_commits_is_an_environment_error_and_leaks_nothing(self):

@@ -5,6 +5,7 @@
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
   slopbrake user-hooks install|uninstall|status [--settings PATH] [--json]
+  slopbrake user-hooks trust|untrust REPO     (repos whose gate the user-level Stop hook may run)
   slopbrake hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin)
 
 init writes two kinds of files. Managed files (scripts/slopbrake, hooks, the reviewer
@@ -23,6 +24,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -58,12 +60,15 @@ SPEC_FILES = ["CLAUDE.md", "CODING_STANDARDS.md", ".claude/agents/reviewer.md",
               "docs/agents/retro-log.md", "docs/agents/issue-tracker.md"]
 CLAUDE_MD_MAX_LINES = 40
 GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/", "__pycache__/"]}
-LAST_GREEN = "refs/slopbrake/last-green"  # + /<branch>; detached HEAD has none
+LAST_GREEN = "refs/slopbrake/last-green"  # + /<branch, "/" as %2F>; detached HEAD has none
 META = ".claude/slopbrake.json"
 TYPES_PLACEHOLDER = "no type checker configured"
 ESLINT_CONFIGS = [f"eslint.config.{ext}" for ext in ("js", "mjs", "cjs", "ts", "mts", "cts")] + [
     f".eslintrc{ext}" for ext in ("", ".js", ".cjs", ".json", ".yml", ".yaml")]
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", "env", "build", "dist", "site-packages"}
+SUBDIR_UNSUPPORTED = "monorepo subdirectories are not supported yet"
+# Inherited PR context and base pins that would steer verify's proofs away from the seeded changes (B15).
+VERIFY_SCRUB = ("GITHUB_BASE_REF", "GITHUB_EVENT_PATH", "PR_BODY_FILE", "SLOPBRAKE_BASE")
 
 
 class UsageError(Exception):
@@ -123,6 +128,14 @@ def git_toplevel(path: Path) -> Path:
     return Path(result.stdout.strip()).resolve()
 
 
+def repo_root(path: Path) -> Path:
+    """The repository root `path` names; a subdirectory is a usage error (B8)."""
+    top = git_toplevel(path)
+    if path.resolve() != top:
+        raise UsageError(f"slopbrake installs at a repository root ({top}); {SUBDIR_UNSUPPORTED}")
+    return top
+
+
 def detect_stack(repo: Path) -> str:
     if (repo / "package.json").is_file() and (repo / "tsconfig.json").is_file():
         return "typescript"
@@ -144,17 +157,32 @@ def github_remote(repo: Path) -> bool:
     return "github.com" in git(repo, "remote", "-v", check=False)
 
 
-def default_branch(repo: Path) -> str:
-    for name in ("main", "master"):
-        if run(["git", "rev-parse", "--verify", "-q", name], repo).returncode == 0:
+def default_branch(repo: Path) -> str | None:
+    """The kit's rule (common.default_branch, B16), mirrored because cli cannot import the kit:
+    origin/HEAD's target, else init.defaultBranch when that branch exists, else main, else master."""
+    origin = git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False)
+    if origin:
+        return origin.split("/", 1)[1]
+    configured = git(repo, "config", "init.defaultBranch", check=False)
+    for name in [configured] * bool(configured) + ["main", "master"]:
+        if run(["git", "rev-parse", "--verify", "-q", f"refs/heads/{name}"], repo).returncode == 0:
             return name
-    return git(repo, "branch", "--show-current", check=False) or "main"
+    return None
+
+
+def current_branch(repo: Path) -> str:
+    return git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+
+
+def ratchet_ref(branch: str) -> str:
+    """One flat ref per branch, "/" encoded as %2F, so feature and feature/x never D/F-conflict (B1)."""
+    return f"{LAST_GREEN}/{branch.replace('/', '%2F')}"
 
 
 def last_green_ref(repo: Path) -> str | None:
     """The current branch's last-green ratchet; None on a detached HEAD (never recorded or used)."""
-    branch = git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False)
-    return f"{LAST_GREEN}/{branch}" if branch else None
+    branch = current_branch(repo)
+    return ratchet_ref(branch) if branch else None
 
 
 def commit_paths(repo: Path, paths: list[str], pending: list[str]) -> list[str]:
@@ -218,18 +246,19 @@ def uses_pytest(repo: Path) -> bool:
                for req in declared_requirements(pyproject(repo)))
 
 
-def python_interpreter(repo: Path) -> str:
-    # $PWD expands when scripts/check assigns TEST_CMD (at the repo root), so the mutation
-    # stage's scratch copy, which has no .venv, still runs the project's interpreter.
-    if (repo / "uv.lock").is_file():
-        return "uv run --frozen python"
-    return "$PWD/.venv/bin/python" if (repo / ".venv").is_dir() else "python3"
+def python_test_args(repo: Path) -> str:
+    """The test command's arguments: pytest when the repo configures or declares it anywhere (it runs
+    unittest tests too). scripts/check picks the interpreter at run time (B6), so worktrees work."""
+    return "-m pytest -q" if uses_pytest(repo) else "-m unittest discover -s tests"
 
 
-def python_test_cmd(repo: Path) -> str:
-    """pytest when the repo configures or declares it anywhere (it runs unittest tests too)."""
-    py = python_interpreter(repo)
-    return f"{py} -m pytest -q" if uses_pytest(repo) else f"{py} -m unittest discover -s tests"
+def has_tests(repo: Path, stack: str) -> bool:
+    name = re.compile(r"(test_.*|.*_test)\.py" if stack == "python" else r".*\.(test|spec)\.[cm]?[jt]sx?")
+    for _, dirs, files in os.walk(repo):
+        if any(name.fullmatch(f) for f in files):
+            return True
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+    return False
 
 
 def python_ci_install(repo: Path, test_cmd: str) -> str:
@@ -241,13 +270,32 @@ def python_ci_install(repo: Path, test_cmd: str) -> str:
     return f"python3 -m venv .venv && .venv/bin/python {pip}" if (repo / ".venv").is_dir() else f"python3 {pip}"
 
 
-def node_ci(repo: Path, pm: str) -> tuple[str, str]:
-    """(CI_SETUP, CI_INSTALL) for the TypeScript workflow: step items indented 6 spaces, one command."""
+def package_json(repo: Path) -> dict:
     try:
         package = json.loads(read_text(repo / "package.json") or "{}")
     except ValueError:
-        package = {}
-    package = package if isinstance(package, dict) else {}
+        return {}
+    return package if isinstance(package, dict) else {}
+
+
+def package_scripts(repo: Path) -> dict:
+    scripts = package_json(repo).get("scripts")
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def ts_layout(repo: Path) -> tuple[list[str], list[str]]:
+    """(source roots, test dirs) as globs, from whichever of src/, lib/, packages/*/src and tests/,
+    test/, __tests__ exist (B7); src/ and tests/ when none does."""
+    sources = [d for d in ("src", "lib") if (repo / d).is_dir()]
+    if any(p.is_dir() for p in repo.glob("packages/*/src")):
+        sources.append("packages/*/src")
+    tests = [d for d in ("tests", "test", "__tests__") if (repo / d).is_dir()]
+    return sources or ["src"], tests or ["tests"]
+
+
+def node_ci(repo: Path, pm: str) -> tuple[str, str]:
+    """(CI_SETUP, CI_INSTALL) for the TypeScript workflow: step items indented 6 spaces, one command."""
+    package = package_json(repo)
     engines = package.get("engines")
     version = next((f"node-version-file: {name}" for name, ok in (
         ("package.json", isinstance(engines, dict) and bool(engines.get("node"))),
@@ -294,8 +342,7 @@ def planned_files(repo: Path, stack: str) -> dict[str, str]:
     subs = substitutions(repo, stack)
     for rel in list(files):
         if rel in ("scripts/check", ".github/workflows/check.yml"):
-            for key, value in subs.items():
-                files[rel] = files[rel].replace(f"@{key}@", value)
+            files[rel] = render(files[rel], subs)
     if stack == "typescript":
         files[".dependency-cruiser.cjs"] = (KIT / "typescript" / "dependency-cruiser.cjs.tmpl").read_text(
             encoding="utf-8").replace("@PACKAGES_ROOT@", subs["PACKAGES_ROOT"])
@@ -306,26 +353,36 @@ def planned_files(repo: Path, stack: str) -> dict[str, str]:
     return files
 
 
+def render(text: str, subs: dict[str, str]) -> str:
+    for key, value in subs.items():
+        text = text.replace(f"@{key}@", value)
+    return text
+
+
 def substitutions(repo: Path, stack: str) -> dict[str, str]:
-    subs = {"DEFAULT_BRANCH": default_branch(repo), "PACKAGES_ROOT": "src"}
+    subs = {"DEFAULT_BRANCH": default_branch(repo) or current_branch(repo) or "main", "PACKAGES_ROOT": "src"}
     if stack == "python":
-        test_cmd = python_test_cmd(repo)
+        test_args = python_test_args(repo)
         subs |= {
-            "TEST_CMD": test_cmd,
+            "TEST_ARGS": test_args,
+            "TEST_CMD": f"python3 {test_args}",  # a scripts/check template from before B6
             "LINT_CMD": "uvx ruff@0.16.9 check .",
             "TYPES_CMD": f'echo "types: skipped: {TYPES_PLACEHOLDER} (edit scripts/check)"; return 78',
-            "CI_INSTALL": python_ci_install(repo, test_cmd),
+            "CI_INSTALL": python_ci_install(repo, test_args),
         }
     else:
         pm = package_manager(repo)
-        roots = ["src"] + ([] if (repo / "src").is_dir() else ["lib"])
+        sources, tests = ts_layout(repo)
+        present = [d for d in sources + tests if any(repo.glob(d))]
+        roots = [d.replace("*", "[^/]+") for d in sources]
         ci_setup, ci_install = node_ci(repo, pm)
         subs |= {
             "PM": pm,
-            "DEPCRUISE_PATHS": " ".join(d for d in ("src", "tests") if (repo / d).is_dir()) or ".",
-            "TEST_GLOBS": " ".join(f"'{d}/**/*.{kind}.{ext}'" for d in ("tests", "src") for kind in ("test", "spec")
+            "PACKAGES_ROOT": roots[0] if len(roots) == 1 else f"(?:{'|'.join(roots)})",
+            "DEPCRUISE_PATHS": " ".join(dict.fromkeys(d.split("/", 1)[0] for d in present)) or ".",
+            "TEST_GLOBS": " ".join(f"'{d}/**/*.{kind}.{ext}'" for d in tests + sources for kind in ("test", "spec")
                                    for ext in ("ts", "tsx")),
-            "MUTATE_INCLUDE": " ".join(f"--include '{root}/**/*.{ext}'" for root in roots for ext in ("ts", "tsx")),
+            "MUTATE_INCLUDE": " ".join(f"--include '{root}/**/*.{ext}'" for root in sources for ext in ("ts", "tsx")),
             "CI_SETUP": ci_setup,
             "CI_INSTALL": ci_install,
         }
@@ -350,7 +407,7 @@ def merge_settings(existing: dict, kit: dict) -> dict:
 
 
 def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
-    top = git_toplevel(repo)
+    repo = repo_root(repo)
     existing_settings = hooks.load_settings(repo / ".claude/settings.json")  # refuse before writing anything
     files = planned_files(repo, stack)
     actions: list[Action] = []
@@ -398,19 +455,18 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
             not git(repo, "rev-parse", "-q", "--verify", ratchet, check=False):
         actions.append(Action(ratchet, "create", "the last-green ratchet starts at HEAD"))
         if not dry_run:
-            if git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False):
-                git(repo, "update-ref", "-d", LAST_GREEN)  # a pre-A1 flat ref blocks the per-branch namespace
+            # Older layouts block this ref: a pre-A1 flat ref, or pre-B1 refs nested under the name.
+            nested = git(repo, "for-each-ref", "--format=%(refname)", f"{ratchet}/", check=False).split()
+            flat = [LAST_GREEN] if git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False) else []
+            for old in flat + nested:
+                git(repo, "update-ref", "-d", old)
             git(repo, "update-ref", ratchet, "HEAD")
     hooks_path = git(repo, "config", "--get", "core.hooksPath", check=False)
     hooks_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
     live_hooks = sorted(p.name for p in hooks_dir.glob("*") if not p.name.endswith(".sample")) \
         if not hooks_path and hooks_dir.is_dir() else []
     hooks_note = "core.hooksPath already .githooks"
-    if repo != top:
-        rel = repo.relative_to(top)
-        hooks_note = (f"left alone: {rel} is a subdirectory of the git repo {top}; chain by hand: run "
-                      f"{rel}/scripts/check --fast from pre-commit and {rel}/scripts/check from pre-push in {hooks_dir}")
-    elif hooks_path != ".githooks":
+    if hooks_path != ".githooks":
         if hooks_path or live_hooks:
             hooks_note = f"left alone: existing hooks ({hooks_path or ', '.join(live_hooks)}); chain .githooks by hand"
         else:
@@ -432,13 +488,28 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     check_text = read_text(repo / "scripts/check") or files.get("scripts/check", "")  # a dry run wrote nothing
     if stack == "python" and TYPES_PLACEHOLDER in check_text:
         next_steps.append("choose a type checker for the types stage in scripts/check (it skips until then)")
+    if types_unconfigured(repo, stack, check_text):
+        next_steps.append('add a "typecheck" script to package.json (e.g. "tsc --noEmit"): the types stage skips until then')
+    if not has_tests(repo, stack):
+        example = "tests/test_*.py" if stack == "python" else "tests/*.test.ts"
+        next_steps.append(f"add a first test ({example}): the tests stage, and so the pre-commit hook that guards "
+                          "the kit's own commit, fails until one exists")
+    if stack == "python" and "pytest" in python_test_args(repo) and not (repo / ".venv").is_dir() \
+            and not (repo / "uv.lock").is_file():
+        next_steps.append("scripts/check runs pytest with python3 when there is no .venv: create one with pytest "
+                          "(python3 -m venv .venv && .venv/bin/python -m pip install -e . pytest) or make sure "
+                          "python3 has pytest")
+    if not dry_run:
+        next_steps += trust_repo(repo)
     written = [a.path for a in actions if a.action in ("create", "update", "merge") and a.path != ratchet]
     paths = commit_paths(repo, [*files, ".gitignore"], written if dry_run else [])
     if paths:
         cd, add = f"cd {shlex.quote(str(repo))}", f"git add -- {' '.join(map(shlex.quote, paths))}"
         commit = "git commit -m 'Add slopbrake guardrails'"
-        branch = git(repo, "branch", "--show-current", check=False)
-        if branch == default_branch(repo):  # the pr stage blocks one-way doors, such as the kit itself, here
+        branch = current_branch(repo)
+        if not git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False):  # nothing to block yet
+            next_steps.append(f"commit the kit as the first commit on {branch or 'this branch'}: {cd} && {add} && {commit}")
+        elif branch and branch == default_branch(repo):  # the pr stage blocks one-way doors, such as the kit, here
             next_steps.append(f"commit the kit on a feature branch (the gate blocks one-way doors on {branch}): "
                               f"{cd} && git switch -c add-slopbrake && {add} && {commit}  "
                               f"(or a human commits it on {branch} with --no-verify)")
@@ -447,6 +518,21 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     next_steps.append(f"prove it: slopbrake verify {repo}")
     return {"repo": str(repo), "stack": stack, "dry_run": dry_run, "hooks": hooks_note,
             "actions": [asdict(a) for a in actions], "next_steps": next_steps}
+
+
+def trust_repo(repo: Path) -> list[str]:
+    """Let the user-level Stop gate run this repo's scripts (B11 b); a next step when that fails."""
+    try:
+        from slopbrake.hooks import trust  # the hooks module gained trust() in 0.2.0
+    except ImportError:
+        return ["user-level Stop gate: this slopbrake build cannot trust repos (slopbrake.hooks has no trust()); "
+                "reinstall slopbrake, then run: slopbrake user-hooks trust " + shlex.quote(str(repo))]
+    try:
+        trust(repo)
+    except (OSError, ValueError) as exc:
+        return [f"user-level Stop gate: could not trust {repo} ({exc}); run: slopbrake user-hooks trust "
+                + shlex.quote(str(repo))]
+    return []
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -458,13 +544,97 @@ def git_hook_gaps(repo: Path) -> list[str]:
     if configured and not hooks_dir.is_dir():
         return [f"core.hooksPath={configured} does not exist, so no git hook runs"]
     missing = [name for name in ("pre-commit", "pre-push") if not os.access(hooks_dir / name, os.X_OK)]
-    return [f"git hooks: no executable {' or '.join(missing)} in {hooks_dir}"] if missing else []
+    if missing:
+        return [f"git hooks: no executable {' or '.join(missing)} in {hooks_dir}"]
+    # Executable is not enough: a husky or lefthook setup that was never chained skips the gate (B9).
+    # Husky 9 points core.hooksPath at stubs in .husky/_ that run .husky/<hook>.
+    silent = [name for name in ("pre-commit", "pre-push") if not any(
+        "scripts/check" in read_text(d / name) for d in (hooks_dir, *[hooks_dir.parent] * (hooks_dir.name == "_")))]
+    return [(f"git hooks in {hooks_dir} do not run scripts/check ({', '.join(silent)}): chain scripts/check --fast "
+             "into pre-commit and scripts/check into pre-push")] if silent else []
 
 
 def wiring_gaps(repo: Path, local: Path | None = None) -> list[str]:
     """Claude Code hooks (H5/H6), git hooks and python3: everything the kit's hooks need to fire."""
     gaps = hooks.settings_gaps(repo, local) + git_hook_gaps(repo)
     return gaps if shutil.which("python3") else gaps + ["python3 is not on PATH (the hooks and the gate need it)"]
+
+
+def door_rule_items(text: str) -> set[tuple[str, str]]:
+    """(key, item) for every one_way glob and content pattern in a door-rules.yml (`key:` then `- item`)."""
+    items, key = set(), None
+    for line in text.splitlines():
+        if heading := re.match(r"([A-Za-z_]+):\s*(#.*)?$", line):
+            key = heading[1]
+        elif key in ("one_way", "content_patterns") and (item := re.match(
+                r"\s+-\s+(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^#]*[^#\s])", line)):
+            value = item[1]
+            items.add((key, value[1:-1] if value[:1] in "\"'" and value[-1:] == value[:1] else value))
+    return items
+
+
+def door_rule_gaps(repo: Path) -> list[str]:
+    """Kit door rules the repo's (seeded, repo-owned) door-rules.yml lacks, e.g. after init --update."""
+    rules = repo / ".claude/door-rules.yml"
+    if not rules.is_file():
+        return []  # reported as a missing spec file
+    kit = KIT / "common/.claude/door-rules.yml"
+    missing = door_rule_items(kit.read_text(encoding="utf-8")) - door_rule_items(read_text(rules))
+    return [(f".claude/door-rules.yml lacks {len(missing)} kit rule(s) (one_way, content_patterns): merge them "
+             f"by hand from {kit}")] if missing else []
+
+
+# Seeded scripts/check lines from older kits that weaken the gate (B9, B13); comment lines don't count.
+GATE_PATTERNS = [
+    (re.compile(r"\$\{(MUTATION_FLOOR|TEST_CMD):?[-=]"),
+     ("scripts/check takes {0} from the environment, so `{0}=...` lowers the gate: hardcode it as the kit's "
+      "scripts/check does")),
+    (re.compile(r"(\$PM|\$\{PM\}|\bnpm|\bpnpm) exec\b"),
+     ("scripts/check runs tools through `{0} exec`, which swallows their flags and can install a squatted "
+      "package: hand-merge the kit's scripts/check (node_modules/.bin tools)")),
+]
+
+
+def gate_gaps(check_text: str) -> list[str]:
+    gaps = []
+    for line in check_text.splitlines():
+        if not line.lstrip().startswith("#"):
+            gaps += [message.format(m[1]) for pattern, message in GATE_PATTERNS if (m := pattern.search(line))]
+    return gaps
+
+
+def types_unconfigured(repo: Path, stack: str, check_text: str) -> bool:
+    """A TS repo whose kit types stage skips: package.json has no "typecheck" script (B13)."""
+    return stack == "typescript" and "typecheck" in check_text and not package_scripts(repo).get("typecheck")
+
+
+def ts_layout_gaps(repo: Path, check_text: str) -> list[str]:
+    """Top-level dirs holding TypeScript sources that no TEST_GLOBS or --include glob in scripts/check reaches."""
+    globs = re.findall(r"(?<!--exclude )'([^'\s]*\*\*[^'\s]*)'", check_text)
+    heads = {glob.split("/", 1)[0] for glob in globs}
+    if any("*" in head for head in heads):
+        return []  # a glob that starts anywhere covers every dir
+    files = run(["git", "ls-files", "-co", "--exclude-standard", "--", "*.ts", "*.tsx", "*.mts", "*.cts"], repo).stdout
+    outside = sorted({f.split("/", 1)[0] + "/" for f in files.splitlines() if "/" in f and not f.endswith(".d.ts")
+                      and f.split("/", 1)[0] not in heads | SKIP_DIRS and not f.startswith(".")})
+    return [(f"TypeScript sources outside every scripts/check glob (no T1 or T4 there): {', '.join(outside)}; "
+             "add them to TEST_GLOBS and the mutation --include list")] if outside else []
+
+
+def user_hook_findings() -> tuple[list[str], list[str]]:
+    """(gaps, notes) from the user's ~/.claude/settings.json: disableAllHooks turns every hook off;
+    missing user-level hooks only matter for sessions started outside the repo."""
+    path = hooks.default_settings()
+    try:
+        data = hooks.load_settings(path)
+    except hooks.SettingsError as exc:
+        return [], [f"cannot read user settings: {exc}"]
+    gaps = [f"{path} sets disableAllHooks: Claude Code runs no hooks at all"] if data.get("disableAllHooks") else []
+    installed = all(any(hooks.ours(c) for entry in hooks.hook_entries(data, event) for c in hooks.commands(entry))
+                    for event in hooks.USER_ENTRIES)
+    notes = [] if installed else [("user-level hooks are not installed (sessions started outside this repo get no "
+                                   "git guard or Stop gate): slopbrake user-hooks install")]
+    return gaps, notes
 
 
 def stale_files(repo: Path, stack: str) -> list[str]:
@@ -497,13 +667,19 @@ def status(repo: Path) -> dict:
     if stack and stages:
         gaps += [f"scripts/check does not run the kit's {name} stage" for name in kit_stages(stack)
                  if name not in stages.group(1).split()]
-    if TYPES_PLACEHOLDER in read_text(repo / "scripts/check"):
+    check_text = read_text(repo / "scripts/check")
+    if TYPES_PLACEHOLDER in check_text:
         gaps.append("types stage is not configured: choose a type checker in scripts/check")
+    if types_unconfigured(repo, stack, check_text):
+        gaps.append('types stage skips: package.json has no "typecheck" script (add "typecheck": "tsc --noEmit")')
     if stack == "typescript" and not any("eslint-rules/slopbrake" in read_text(repo / name) for name in ESLINT_CONFIGS):
         gaps.append("eslint config does not load eslint-rules/slopbrake.mjs (T1 is not enforced)")
-    gaps = list(dict.fromkeys(gaps))
+    if stack == "typescript" and check_text:
+        gaps += ts_layout_gaps(repo, check_text)
+    user_gaps, notes = user_hook_findings()
+    gaps = list(dict.fromkeys(gaps + gate_gaps(check_text) + door_rule_gaps(repo) + user_gaps))
     return {"repo": str(repo), "files": present, "claude_md_lines": claude_lines, "hooks_path": hooks_path or None,
-            "ci_runs_check": ci_runs_check, "stale_files": stale, "gaps": gaps, "ok": not gaps}
+            "ci_runs_check": ci_runs_check, "stale_files": stale, "gaps": gaps, "notes": notes, "ok": not gaps}
 
 
 # ── verify ───────────────────────────────────────────────────────────────────
@@ -528,28 +704,28 @@ PY_SEEDS = {
             ("import unittest\n\n\nclass Seed(unittest.TestCase):\n    def test_red(self):\n"
             "        self.fail('seeded red test')\n")),
 }
-TS_SEEDS = {
-    "boundary_impl": ("src/{pkg}/lib/slopbrake-probe.ts", "export const probe = 1;\n"),
-    "boundary": ("tests/slopbrake-seed-boundary.test.ts",
-                 ('import { expect, test } from "vitest";\nimport { probe } from "../src/{pkg}/lib/slopbrake-probe.js";\n\n'
+TS_SEEDS = {  # {src} and {tests}: the repo's first source root and test dir (both top-level or packages/x/src)
+    "boundary_impl": ("{src}/{pkg}/lib/slopbrake-probe.ts", "export const probe = 1;\n"),
+    "boundary": ("{tests}/slopbrake-seed-boundary.test.ts",
+                 ('import { expect, test } from "vitest";\nimport { probe } from "../{src}/{pkg}/lib/slopbrake-probe.js";\n\n'
                  'test("seeded deep import", () => {\n  expect(probe).toBeGreaterThan(0);\n});\n')),
-    "tautology": ("tests/slopbrake-seed-tautology.test.ts",
+    "tautology": ("{tests}/slopbrake-seed-tautology.test.ts",
                   ('import { expect, test } from "vitest";\n\ntest("seeded tautology", () => {\n'
                   "  const items = [10, 5];\n  expect(items.reduce((a, b) => a + b, 0)).toBe(items.reduce((a, b) => a + b, 0));\n"
                   "  expect(true).toBe(true);\n});\n")),
-    "mutation_src": ("src/slopbrake-seed.ts",
+    "mutation_src": ("{src}/slopbrake-seed.ts",
                      ("export function discount(total: number, member: boolean): number {\n"
                      "  if (member && total >= 100) {\n    return total - 10;\n  }\n  return total;\n}\n")),
-    "mutation_weak": ("tests/slopbrake-seed-mutation.test.ts",
-                      ('import { expect, test } from "vitest";\nimport { discount } from "../src/slopbrake-seed.js";\n\n'
+    "mutation_weak": ("{tests}/slopbrake-seed-mutation.test.ts",
+                      ('import { expect, test } from "vitest";\nimport { discount } from "../{src}/slopbrake-seed.js";\n\n'
                       'test("discount runs", () => {\n  expect(discount(150, true)).toBeDefined();\n});\n')),
-    "mutation_strong": ("tests/slopbrake-seed-mutation.test.ts",
-                        ('import { expect, test } from "vitest";\nimport { discount } from "../src/slopbrake-seed.js";\n\n'
+    "mutation_strong": ("{tests}/slopbrake-seed-mutation.test.ts",
+                        ('import { expect, test } from "vitest";\nimport { discount } from "../{src}/slopbrake-seed.js";\n\n'
                         'test("members save ten from one hundred", () => {\n  expect(discount(150, true)).toBe(140);\n'
                         "  expect(discount(100, true)).toBe(90);\n  expect(discount(99, true)).toBe(99);\n"
                         "  expect(discount(150, false)).toBe(150);\n});\n")),
-    "red": ("tests/slopbrake-seed-red.test.ts",
-            ('import { expect, test } from "vitest";\nimport { discount } from "../src/slopbrake-seed.js";\n\n'
+    "red": ("{tests}/slopbrake-seed-red.test.ts",
+            ('import { expect, test } from "vitest";\nimport { discount } from "../{src}/slopbrake-seed.js";\n\n'
             'test("seeded red", () => {\n  expect(discount(1, false)).toBe(2);\n});\n')),
 }
 MIGRATION_DIFF = """diff --git a/migrations/0099_drop_accounts.sql b/migrations/0099_drop_accounts.sql
@@ -656,9 +832,11 @@ class Verifier:
         shutil.rmtree(self.scratch, ignore_errors=True)
 
     def env(self, **extra: str) -> dict[str, str]:
-        # Worktrees share refs: proofs must never move the last-green ratchet.
-        return dict(os.environ, SLOPBRAKE_BASE=self.head, SLOPBRAKE_NO_RECORD="1", CLAUDE_PROJECT_DIR=str(self.wt),
-                    **extra)
+        # Worktrees share refs: proofs must never move the last-green ratchet. Inherited PR context and
+        # base pins would measure something other than the seeds; the proofs set their own (B15).
+        inherited = {k: v for k, v in os.environ.items() if k not in VERIFY_SCRUB}
+        return {**inherited, "SLOPBRAKE_BASE": self.head, "SLOPBRAKE_NO_RECORD": "1",
+                "CLAUDE_PROJECT_DIR": str(self.wt), **extra}
 
     def check(self, *stages: str, **env: str) -> subprocess.CompletedProcess:
         return run(["scripts/check", *stages], self.wt, env=self.env(**env))
@@ -690,9 +868,16 @@ class Verifier:
             srcdir = "src/" if (self.wt / "src").is_dir() else ""
             fill = {"top": tops[0] if tops else "", "srcdir": srcdir}
             return {k: (p.format(**fill), t.format(**fill)) for k, (p, t) in PY_SEEDS.items()}
-        pkgs = sorted(p.name for p in (self.wt / "src").iterdir() if p.is_dir()) if (self.wt / "src").is_dir() else []
-        fill = {"pkg": pkgs[0] if pkgs else "slopbrakepkg"}
-        return {k: (p.replace("{pkg}", fill["pkg"]), t.replace("{pkg}", fill["pkg"])) for k, (p, t) in TS_SEEDS.items()}
+        sources, tests = ts_layout(self.wt)
+        src = next((str(p.relative_to(self.wt)) for p in sorted(self.wt.glob(sources[0])) if p.is_dir()), "src")
+        pkgs = sorted(p.name for p in (self.wt / src).iterdir() if p.is_dir()) if (self.wt / src).is_dir() else []
+        fill = {"{src}": src, "{tests}": tests[0], "{pkg}": pkgs[0] if pkgs else "slopbrakepkg"}
+
+        def filled(text: str) -> str:
+            for key, value in fill.items():
+                text = text.replace(key, value)
+            return text
+        return {k: (filled(p), filled(t)) for k, (p, t) in TS_SEEDS.items()}
 
     def run_all(self) -> None:
         seeds = self.seeds()
@@ -750,6 +935,21 @@ class Verifier:
             fake = subprocess.CompletedProcess([], 0 if got == door else 1, f"classified {got}", "")
             self.prove(f"{name} diff classifies {door}", True, fake, "G2")
 
+        # C8: a one-way change about to be committed on the default branch fails the pr stage. The worktree is
+        # detached, so this runs in a clone with its own refs (the user's are untouched) whose only branch,
+        # main, is the default by the kit's rule (no origin; init.defaultBranch=main).
+        clone = self.scratch / "clone"
+        run(["git", "clone", "-q", "--shared", "--no-checkout", str(self.top), str(clone)], self.scratch, check=True)
+        for args in (("remote", "remove", "origin"), ("config", "init.defaultBranch", "main"),
+                     ("checkout", "-q", "-B", "main", self.head)):
+            run(["git", *args], clone, check=True)
+        (clone / "migrations").mkdir(exist_ok=True)
+        (clone / "migrations/9998_slopbrake_seed.sql").write_text("DROP TABLE accounts;\n", encoding="utf-8")
+        run(["git", "add", "migrations/9998_slopbrake_seed.sql"], clone, check=True)
+        result = run(["scripts/check", "pr"], clone, env=self.env(CLAUDE_PROJECT_DIR=str(clone)))
+        self.prove("a one-way change on the default branch blocks the commit", False, result, "G2",
+                   "one-way door on main")
+
         # G1/G2/G4: PR body shape and the door floor, against a committed migration.
         self.write("migrations/9999_slopbrake_seed.sql", "DELETE FROM accounts;\n")
         run(["git", "add", "-A"], self.wt, check=True)
@@ -779,7 +979,7 @@ class Verifier:
 
         # H5/H6 only bite when Claude Code and git actually run the hooks.
         gaps = wiring_gaps(self.wt, local=self.repo)
-        self.prove("hooks are wired in .claude/settings.json", True,
+        self.prove("Claude Code and git hooks are wired", True,
                    subprocess.CompletedProcess([], 1 if gaps else 0, "\n".join(gaps) or "wired", ""), "H5/H6")
 
         # H1: CLAUDE.md stays a short pointer file (as committed).
@@ -793,13 +993,18 @@ NO_KIT_AT_HEAD = ("HEAD has no slopbrake kit (scripts/check, .claude/slopbrake.j
                   "if needed, commit the files `slopbrake init` wrote, then verify")
 
 
+def _terminate(signum, _frame):
+    raise SystemExit(128 + signum)  # unwinds through verify's finally, so the worktree is removed
+
+
 def verify(repo: Path, keep: bool) -> dict:
-    git_toplevel(repo)  # a missing or non-git dir is a usage error before anything runs in it
+    repo = repo_root(repo)  # a missing, non-git or subdirectory path is a usage error before anything runs
     if run(["git", "status", "--porcelain", "."], repo).stdout.strip():
         note = "working tree has uncommitted changes; verify proves the committed HEAD only"
     else:
         note = ""
     verifier = Verifier(repo, keep)
+    previous = {sig: signal.signal(sig, _terminate) for sig in (signal.SIGTERM, signal.SIGHUP)}  # B12
     try:
         verifier.setup()
         if not verifier.stack or not (verifier.wt / "scripts/check").is_file():
@@ -811,7 +1016,11 @@ def verify(repo: Path, keep: bool) -> dict:
             except Exception as exc:  # noqa: BLE001 - any harness error becomes a failed proof, not a traceback
                 verifier.proofs.append({"proof": "verify harness", "ok": False, "output": [repr(exc)]})
     finally:
+        for sig in previous:
+            signal.signal(sig, signal.SIG_IGN)  # a second TERM must not interrupt the cleanup
         verifier.cleanup()  # also when setup fails: no leaked worktree or scratch dir
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     return {"repo": str(repo), "stack": verifier.stack, "head": verifier.head, "note": note,
             "worktree": str(verifier.wt) if keep else None, "proofs": verifier.proofs,
             "ok": all(p["ok"] for p in verifier.proofs)}
@@ -832,14 +1041,24 @@ def print_human(command: str, result) -> None:
             print(f"{'ok' if r['ok'] else 'GAPS'}  {r['repo']}")
             for gap in r["gaps"]:
                 print(f"      - {gap}")
+            for note in r.get("notes", []):
+                print(f"   note  {note}")
+    elif command == "user-hooks" and "trusted" in result:
+        print(f"{'trusted' if result['trusted'] else 'untrusted'}  {result['repo']}")
     elif command == "user-hooks":
         on = " ".join(event for event, present in result["events"].items() if present) or "none"
         print(f"slopbrake user hooks in {result['settings']}: {on}")
-        if not result["on_path"]:
-            print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
+        if any(result["events"].values()):
+            if not result["on_path"]:
+                print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
+            elif not result["runnable"]:
+                print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
+                      "install this slopbrake version or run slopbrake user-hooks uninstall")
         elif not result["runnable"]:
-            print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
-                  "install this slopbrake version or run slopbrake user-hooks uninstall")
+            print(f"note: {result['binary'] or '`slopbrake` (not on PATH)'} cannot run `slopbrake hook`; "
+                  "user-hooks install will refuse until a current slopbrake is on PATH")
+        for note in result.get("notes", []):
+            print(f"note: {note}")
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -849,6 +1068,18 @@ def print_human(command: str, result) -> None:
         if result["note"]:
             print(f"note: {result['note']}")
         print("verify: all proofs hold" if result["ok"] else "verify: some proofs FAILED")
+
+
+def trust_command(action: str, repo: Path | None) -> dict:
+    """slopbrake user-hooks trust|untrust REPO: which repos the user-level Stop gate may run (B11 b)."""
+    if repo is None:
+        raise UsageError(f"user-hooks {action} needs a repo")
+    change = getattr(hooks, action, None)
+    if change is None:
+        raise UsageError(f"this slopbrake build has no hooks.{action}(); reinstall slopbrake")
+    top = git_toplevel(repo.resolve())
+    change(top)
+    return {"repo": str(top), "trusted": action == "trust"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -866,7 +1097,8 @@ def main(argv: list[str] | None = None) -> int:
     p_verify.add_argument("repo", type=Path)
     p_verify.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
     p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into ~/.claude/settings.json")
-    p_user.add_argument("action", choices=["install", "uninstall", "status"])
+    p_user.add_argument("action", choices=["install", "uninstall", "status", "trust", "untrust"])
+    p_user.add_argument("repo", type=Path, nargs="?", help="the repo to trust or untrust")
     p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
     p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
     p_hook.add_argument("event", choices=["pre-tool-use", "post-tool-use", "stop"])
@@ -878,19 +1110,18 @@ def main(argv: list[str] | None = None) -> int:
         return hooks.run(args.event, sys.stdin.read())
     try:
         if args.command == "init":
-            repo = args.repo.resolve()
-            git_toplevel(repo)
+            repo = repo_root(args.repo)
             stack = args.stack if args.stack != "auto" else recorded_stack(repo) or detect_stack(repo)
             result, ok = init(repo, stack, args.update, args.dry_run), True
         elif args.command == "status":
-            repos = [r.resolve() for r in args.repos]
-            for repo in repos:
-                git_toplevel(repo)
+            repos = [repo_root(r) for r in args.repos]
             result = [status(r) for r in repos]
             ok = all(r["ok"] for r in result)
         elif args.command == "verify":
             result = verify(args.repo.resolve(), args.keep)
             ok = result["ok"]
+        elif args.action in ("trust", "untrust"):
+            result, ok = trust_command(args.action, args.repo), True
         else:
             action = {"install": hooks.install, "uninstall": hooks.uninstall, "status": hooks.user_status}[args.action]
             result = action(args.settings or hooks.default_settings())
