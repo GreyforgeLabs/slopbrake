@@ -1,3 +1,4 @@
 graft slopbrake/kit
 graft slopbrake/vendor
+graft slopbrake/adapters
 global-exclude __pycache__ *.pyc

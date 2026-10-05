@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Codex and OpenCode (H5, H6, H7)
+
+- **New:** `slopbrake user-hooks install|uninstall|status --harness codex` merges `slopbrake-hook --harness codex pre-tool-use|post-tool-use|stop` into `~/.codex/hooks.json`, keeping other tools' entries. It refuses while `~/.codex/config.toml` lacks `[features] hooks = true` and never edits that file; `status` reminds you to trust the entries in Codex's `/hooks` screen and reports which ones `[hooks.state]` already trusts.
+- **New:** `--harness opencode` installs the OpenCode plugin `~/.config/opencode/plugins/slopbrake.js` (one dependency-free module; it refuses to overwrite a file that is not its own). It guards `bash` before it runs, records `bash`, `edit`, `write` and `apply_patch` changes, and on `session.idle` runs the Stop gate for root sessions, sending a red report back as a new prompt at most 3 times in a row. It does nothing when `slopbrake-hook` is not on `PATH`.
+
 ## 0.2.0 (2026-10-05)
 
 An audit of 0.1.0 in real use found that Slopbrake was installed but never fired, and that several of its guarantees were false while `verify` and `status` stayed green. This release makes the gate do what the README says. Rule IDs refer to [docs/RULES.md](docs/RULES.md).

@@ -4,7 +4,7 @@
   slopbrake init REPO [--stack auto|python|typescript] [--update] [--dry-run] [--json]
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
-  slopbrake user-hooks install|uninstall|status [--settings PATH] [--json]
+  slopbrake user-hooks install|uninstall|status [--harness claude|codex|opencode] [--settings PATH] [--json]
   slopbrake user-hooks trust|untrust REPO           (the Stop gate runs only trusted repos' scripts)
   slopbrake-hook pre-tool-use|post-tool-use|stop     (Claude Code runs this; hook JSON on stdin;
                                                       `slopbrake hook` is an alias)
@@ -34,7 +34,7 @@ import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from slopbrake import __version__, hooks
+from slopbrake import __version__, harness, hooks
 
 HOME = Path(__file__).resolve().parent  # the package: kit/ and vendor/ ship inside it
 KIT = HOME / "kit"
@@ -1081,7 +1081,7 @@ def print_human(command: str, result) -> None:
             for note in r.get("notes", []):
                 print(f"   note  {note}")
     elif command == "user-hooks":
-        print("\n".join(hooks.user_lines(result)))
+        print("\n".join(harness.lines(result) if "harness" in result else hooks.user_lines(result)))
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -1107,10 +1107,13 @@ def main(argv: list[str] | None = None) -> int:
     p_verify = sub.add_parser("verify", help="prove the checks bite, in a throwaway worktree")
     p_verify.add_argument("repo", type=Path)
     p_verify.add_argument("--keep", action="store_true", help="keep the worktree for inspection")
-    p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into ~/.claude/settings.json")
+    p_user = sub.add_parser("user-hooks", help="wire the git guard and Stop gate into a harness's user-level hooks")
     p_user.add_argument("action", choices=["install", "uninstall", "status", "trust", "untrust"])
     p_user.add_argument("repo", type=Path, nargs="?", help="the repo to trust or untrust")
-    p_user.add_argument("--settings", type=Path, help="settings file (default ~/.claude/settings.json)")
+    p_user.add_argument("--harness", choices=harness.HARNESSES, default="claude",
+                        help="claude (~/.claude/settings.json), codex (~/.codex/hooks.json) or opencode "
+                             "(~/.config/opencode/plugins/slopbrake.js); trust and untrust apply to all")
+    p_user.add_argument("--settings", type=Path, help="the harness's hooks file (default: as --harness says)")
     p_hook = sub.add_parser("hook", help="user-level Claude Code hook (reads the hook JSON on stdin)")
     p_hook.add_argument("event", nargs="?", help="pre-tool-use|post-tool-use|stop (hooks.main validates it: never exit 2)")
     for p in (p_init, p_status, p_verify, p_user):
@@ -1131,8 +1134,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify":
             result = verify(args.repo.resolve(), args.keep)
             ok = result["ok"]
-        else:
+        elif args.harness == "claude" or args.action in ("trust", "untrust"):
             result = hooks.user_command(args.action, args.settings, args.repo)
+            ok = result["ok"]
+        else:
+            result = harness.user_command(args.harness, args.action, args.settings)
             ok = result["ok"]
     except (UsageError, hooks.SettingsError, RuntimeError) as exc:
         message = " ".join(str(exc).split())

@@ -60,6 +60,8 @@ Merge `add-slopbrake` the way you'll merge every one-way door from now on: a hum
 
 **Why user-level hooks?** Claude Code loads a project's `.claude/settings.json` hooks only from the directory the session *started* in. Start a session in `~` or a parent folder, and the repo's git guard and Stop gate never fire. `user-hooks install` adds three entries to `~/.claude/settings.json` that act only inside repos Slopbrake manages and do nothing anywhere else. The Stop gate runs a repo's own scripts, so it only does that for repos you trust: `init` trusts the repo it installs into, and `slopbrake user-hooks trust <repo>` adds others. It refuses to install until the `slopbrake` on your `PATH` can run them.
 
+**Codex and OpenCode.** `slopbrake user-hooks install --harness codex` adds the same three hooks to `~/.codex/hooks.json` (it needs `[features] hooks = true` in `~/.codex/config.toml`; then trust them in Codex's `/hooks` screen). `--harness opencode` installs `~/.config/opencode/plugins/slopbrake.js`, which guards shell commands, records edits, and turns a red Stop gate into a new prompt. `uninstall` and `status` take `--harness` too.
+
 Python and TypeScript repos are supported, installed at the repository root (monorepo subdirectories are not supported yet). `init`, `status`, `verify` and `user-hooks` take `--json`. Exit codes: 0 ok, 1 a gap or a failed proof, 2 usage error. A fresh Python repo shows one gap until you choose a type checker for the `types` stage in `scripts/check`; it skips until then.
 
 ### The checks are proven, not configured
