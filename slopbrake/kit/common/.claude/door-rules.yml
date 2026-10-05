@@ -1,52 +1,100 @@
 # Door floor for scripts/slopbrake/door_classify.py (rule G2).
 # A change matching any rule is a one-way door: human review required, never auto-merged.
 # Agents may raise a door to one-way; they may never lower it. Globs are gitignore-style
-# (`**/` spans directories). content_patterns are regexes matched against added lines.
-# Supported syntax: `key: value` and `key:` followed by `- item` lines.
+# (`**/` spans directories); one_way globs ignore case (src/Auth/ matches **/auth/**),
+# ignore lists do not. content_patterns are regexes matched against added lines
+# (`(?i)` makes one case-insensitive); comment-only lines (# or //) are not scanned.
+# Supported syntax: `key: value` and `key:` followed by `- item` lines. Each key appears once:
+# add repo rules to the existing lists. A PR is classified with the union of its own rules
+# and the base branch's rules (ignore lists and exemptions come from the base only).
 
 one_way:
   # data and schema
   - "**/migrations/**"
+  - "**/alembic/versions/**"
+  - "**/migrate/**"
   - "**/*.sql"
-  - "**/schema.*"
+  - "**/schema.prisma"
+  - "**/schema.rb"
+  - "**/db/schema.*"
   # infrastructure, deploy and CI
   - "infra/**"
-  - ".github/workflows/**"
-  - "**/Dockerfile"
+  - ".github/**"
+  - "**/CODEOWNERS"
+  - ".gitlab-ci.yml"
+  - "**/*.tf"
+  - "**/Dockerfile*"
+  - "**/docker-compose*.y*ml"
+  - "**/k8s/**"
+  - "**/helm/**"
   - "**/wrangler.toml"
   - "**/vercel.json"
+  # secrets and environment
+  - "**/.env"
+  - "**/.env.*"
   # auth, money, outbound communication, public contracts
   - "**/auth/**"
+  - "**/auth.*"
+  - "**/*auth*/**/*"  # files under an auth-named directory; "**/*auth*/**" would match author.py too
+  - "**/middleware/**/session*.*"
   - "**/billing/**"
+  - "**/payments/**"
+  - "**/stripe*/**"
   - "**/email/**"
   - "**/notifications/**"
   - "**/openapi.*"
-  # the auto-merge decider itself: the operator reviews the classifier (G3)
+  # the auto-merge decider and the gate itself: the operator reviews these (G3)
   - ".claude/door-rules.yml"
   - ".claude/settings.json"
   - ".claude/hooks/**"
+  - ".claude/agents/**"
+  - ".claude/skills/**"
+  - "**/CLAUDE.md"
+  - "CODING_STANDARDS.md"
   - "scripts/check"
+  - "scripts/smoke.sh"
   - "scripts/slopbrake/**"
   - ".githooks/**"
+  - "stryker.config.json"
+  - "eslint-rules/**"
+  - "eslint.config.*"
+  - ".dependency-cruiser.cjs"
 
 content_patterns:
-  - "DROP TABLE"
-  - "DROP COLUMN"
-  - "DELETE FROM"
-  - "TRUNCATE "
+  - "(?i)\\bdrop\\s+(table|column|schema|database)\\b"
+  - "(?i)\\balter\\s+table\\b.*\\bdrop\\b"
+  # identifiers may be quoted: "User", `users`, [dbo].[users]; lowercase prose like "delete from the cache" is not SQL
+  - "\\bDELETE\\s+FROM\\b"
+  - "(?i)\\bdelete\\s+from\\s+(?!(the|a|an|this|that|it|its|our|your|their)\\b)[\\w\"`\\[]"
+  - "(?i)\\btruncate\\s+table\\b"
+  - "\\bTRUNCATE\\s+[\\w\"`\\[]"
+  - "(?i)\\btruncate\\s+([\\w.]+|\"[^\"]+\"|`[^`]+`|\\[[^\\]]+\\])\\s*(;|['\"`]\\s*([,)]|$))"
+  - "\\bdrop_all\\("
+  - "\\bop\\.drop_\\w+\\("
   - "sendEmail\\("
-  - "rm -rf "
   # deleting files or directories at runtime (user data paths)
-  - "shutil\\.rmtree\\("
+  - "\\brm(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
+  - "[\"']rm[\"']\\s*,\\s*[\"']-[a-zA-Z]*[rRf]"
+  - "\\brmtree\\("
   - "os\\.(remove|unlink|rmdir)\\("
   - "\\.(unlink|rmdir)\\("
   - "fs\\.(rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\\("
 
+# Paths that are not classified at all: templates without real values.
+ignore:
+  - "**/.env.example"
+  - "**/.env.sample"
+  - "**/.env.template"
+
 # Paths whose added lines are not content-scanned (fixtures quoting SQL, for example).
 content_ignore:
   - "tests/**"
+  - "**/tests/**"
+  - "**/__tests__/**"
   - "**/*.test.*"
+  - "**/*.spec.*"
   - "**/test_*.py"
+  - "**/conftest.py"
   - "docs/**"
   - "**/*.md"
 

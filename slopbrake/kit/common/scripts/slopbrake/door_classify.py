@@ -3,44 +3,114 @@
 
 The result is a floor: an agent may raise a two-way change to one-way, never lower it.
 Rules live in .claude/door-rules.yml (path globs + regexes matched against added lines).
+When a base exists, the base revision's rules count too, so a change cannot lower its own floor.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
     base_ref,
     collect_changes,
+    git,
     glob_to_regex,
     load_simple_yaml,
     parse_unified_diff,
     repo_root,
+    untracked_files,
 )
 
 DEFAULT_RULES = ".claude/door-rules.yml"
+LISTS = ("one_way", "content_patterns", "ignore", "content_ignore")
+KEYS = (*LISTS, "default")
 
 
-def load_rules(path: Path) -> dict[str, list[str]]:
-    data = load_simple_yaml(path.read_text(encoding="utf-8"))
+class RulesError(Exception):
+    pass
+
+
+def parse_rules(text: str, source: str) -> dict[str, list[str]]:
+    keys = [key.strip() for key in re.findall(r"^([^\s#-][^:\n]*)", text, re.MULTILINE)]
+    for key in keys:
+        if key not in KEYS:
+            raise RulesError(f"{source}: unknown key {key!r}; allowed keys: {', '.join(KEYS)}")
+        if keys.count(key) > 1:  # a second `one_way:` would silently replace the first list
+            raise RulesError(f"{source}: duplicate key {key!r}; merge the lists under one '{key}:'")
+    try:
+        data = load_simple_yaml(text)
+    except ValueError as exc:
+        raise RulesError(f"{source}: {exc}") from None
     rules: dict[str, list[str]] = {}
-    for key in ("one_way", "content_patterns", "ignore", "content_ignore"):
+    for key in LISTS:
         value = data.get(key, [])
         if not isinstance(value, list):  # list("x/**") would silently become one-character globs
-            raise SystemExit(f"{path}: {key} must be a list of '- item' lines, got {value!r}")
+            raise RulesError(f"{source}: {key} must be a list of '- item' lines, got {value!r}")
         rules[key] = value
     if data.get("default", "two_way") not in ("two_way", "one_way"):
-        raise SystemExit(f"{path}: default must be two_way or one_way")
+        raise RulesError(f"{source}: default must be two_way or one_way")
     rules["default"] = [str(data.get("default", "two_way"))]
     return rules
 
 
+def load_rules(path: Path) -> dict[str, list[str]]:
+    return parse_rules(path.read_text(encoding="utf-8"), str(path))
+
+
+def combine(base: dict | None, head: dict | None) -> dict[str, list[str]]:
+    """Base rules are the floor: the change may add rules, never remove or exempt."""
+    if base is None or head is None:
+        rules = base or head
+        if rules is None:
+            raise RulesError(f"no door rules: {DEFAULT_RULES} is missing in the working tree and at the base")
+        return rules
+    def union(key):
+        return base[key] + [item for item in head[key] if item not in base[key]]
+    strict = "one_way" in (base["default"][0], head["default"][0])
+    return {"one_way": union("one_way"), "content_patterns": union("content_patterns"),
+            "ignore": base["ignore"], "content_ignore": base["content_ignore"],
+            "default": ["one_way" if strict else "two_way"]}
+
+
+def effective_rules(merge_base: str | None, head_path: Path) -> dict[str, list[str]]:
+    head = load_rules(head_path) if head_path.is_file() else None
+    base = None
+    if merge_base:
+        shown = subprocess.run(["git", "show", f"{merge_base}:{DEFAULT_RULES}"], cwd=repo_root(),
+                               capture_output=True, text=True, check=False)
+        if shown.returncode == 0:
+            base = parse_rules(shown.stdout, f"{merge_base[:12]}:{DEFAULT_RULES}")
+    return combine(base, head)
+
+
+def working_changes(base: str) -> dict:
+    """Committed, uncommitted and untracked changes, minus untracked Python bytecode caches."""
+    changes = collect_changes(base, working_tree=True)
+    for path in untracked_files():
+        if "__pycache__" in path.split("/") or path.endswith(".pyc"):
+            changes.pop(path, None)
+    return changes
+
+
+def measure(base: str, working_tree: bool, rules_path: Path | None = None):
+    """Classify the change since `base`. Returns (result, warning or None)."""
+    merge_base = git("merge-base", base, "HEAD").strip()
+    rules = effective_rules(merge_base, rules_path or repo_root() / DEFAULT_RULES)
+    changes = working_changes(base) if working_tree else collect_changes(base, working_tree=False)
+    warning = None
+    if not changes and merge_base == git("rev-parse", "HEAD").strip():
+        warning = f"measuring nothing: HEAD is the base ({base})"
+    return classify(changes, rules) | {"base": base}, warning
+
+
 def classify(changes, rules) -> dict[str, object]:
-    path_rules = [(glob, glob_to_regex(glob)) for glob in rules["one_way"]]
+    path_rules = [(glob, re.compile(glob_to_regex(glob).pattern, re.IGNORECASE)) for glob in rules["one_way"]]
     ignore = [glob_to_regex(glob) for glob in rules["ignore"]]
     content_ignore = [glob_to_regex(glob) for glob in rules["content_ignore"]]
     content = [(pattern, re.compile(pattern)) for pattern in rules["content_patterns"]]
@@ -57,6 +127,8 @@ def classify(changes, rules) -> dict[str, object]:
         if any(rx.match(change.path) for rx in content_ignore):
             continue
         for lineno, text in sorted(change.added.items()):
+            if text.lstrip().startswith(("#", "//")):  # comment-only line
+                continue
             for pattern, rx in content:
                 if rx.search(text):
                     reasons.append(f"{change.path}:{lineno} adds {text.strip()[:80]!r} (content rule {pattern!r})")
@@ -69,27 +141,32 @@ def classify(changes, rules) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", help="base ref (default: SLOPBRAKE_BASE, CI base, main/master)")
-    parser.add_argument("--rules", help=f"rules file (default: {DEFAULT_RULES})")
+    parser.add_argument("--rules", help=f"rules file (default: {DEFAULT_RULES}); the base's rules still apply")
     parser.add_argument("--diff-file", help="classify this unified diff instead of git")
     parser.add_argument("--working-tree", action="store_true", help="include uncommitted and untracked changes")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
-    rules_path = Path(args.rules) if args.rules else repo_root() / DEFAULT_RULES
-    rules = load_rules(rules_path)
-    if args.diff_file:
-        changes = parse_unified_diff(Path(args.diff_file).read_text(encoding="utf-8"))
-        base = None
-    else:
-        base = base_ref(args.base)
-        if base is None:
-            raise SystemExit("door-classify: no base ref found; pass --base")
-        changes = collect_changes(base, working_tree=args.working_tree)
-    result = classify(changes, rules) | {"base": base}
+    try:
+        if args.diff_file:
+            rules = load_rules(Path(args.rules) if args.rules else repo_root() / DEFAULT_RULES)
+            changes = parse_unified_diff(Path(args.diff_file).read_text(encoding="utf-8"))
+            result = classify(changes, rules) | {"base": None}
+        else:
+            base = base_ref(args.base)
+            if base is None:
+                print("door-classify: no base ref found; pass --base", file=sys.stderr)
+                return 2
+            result, warning = measure(base, args.working_tree, Path(args.rules) if args.rules else None)
+            if warning:
+                print(f"door-classify: warning: {warning}", file=sys.stderr)
+    except (RulesError, OSError) as exc:
+        print(f"door-classify: {exc}", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"door: {result['door']}")
+        print(f"door: {result['door']}" + (f" (base {result['base']})" if result["base"] else ""))
         for reason in result["reasons"]:
             print(f"  - {reason}")
     return 0
