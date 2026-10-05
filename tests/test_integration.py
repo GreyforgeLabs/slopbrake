@@ -147,5 +147,14 @@ class StatusSeesTrackedBytecode(Scratch):
         self.assertIn("kit bytecode is tracked in git", result.stdout)
 
 
+class IsolatedFromTheOperator(unittest.TestCase):
+    def test_the_suite_never_writes_the_operators_trust_store(self):
+        # init trusts its repo; a suite run against the real ~/.config would fill the operator's trust
+        # store with temp repos. scripts/check points XDG_CONFIG_HOME/XDG_STATE_HOME at a scratch dir.
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config").resolve()
+        self.assertNotEqual(config, (Path.home() / ".config").resolve(),
+                            "run the tests through scripts/check (or set XDG_CONFIG_HOME to a scratch dir)")
+
+
 if __name__ == "__main__":
     unittest.main()

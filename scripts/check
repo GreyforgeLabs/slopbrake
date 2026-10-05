@@ -7,6 +7,11 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 # Git exports these to hooks; the tests run git in temp repos and must not inherit them.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+# The tests run `slopbrake init`, which records trusted repos under XDG_CONFIG_HOME, and the hooks keep
+# session state under XDG_STATE_HOME: never the operator's own.
+isolated=$(mktemp -d)
+trap 'rm -rf "$isolated"' EXIT
+export XDG_CONFIG_HOME="$isolated/config" XDG_STATE_HOME="$isolated/state"
 fast=0
 [ "${1:-}" = --fast ] && fast=1
 status=0
