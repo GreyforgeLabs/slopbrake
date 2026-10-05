@@ -1,25 +1,64 @@
 #!/bin/bash
-# Stop hook (rule H6): with uncommitted code changes, the fast gate must be green before
-# the agent stops. On red, exit 2 feeds the failure back so the agent keeps working.
-# After 3 consecutive red stops in one session it lets the agent stop and report
-# (loop limit, rule C2) instead of trapping it.
+# Stop hook (rule H6): the gate must be green before the agent stops. Uncommitted code
+# changes need the fast gate; a clean tree with commits since the last green run
+# (refs/slopbrake/last-green) needs the full gate, which records the new green on success.
+# Gated: the project, plus the worktree the agent is working in (payload cwd) when it
+# belongs to the same repository. On red, exit 2 feeds the failure back so the agent
+# keeps working. After 3 consecutive red stops in one session it lets the agent stop and
+# report (loop limit, rule C2) instead of trapping it.
 
 INPUT=$(cat)
-SESSION=$(printf '%s' "$INPUT" | jq -r '.session_id // "unknown"')
+PARSE='(.session_id // "unknown"), (.cwd // "")'
+if command -v jq >/dev/null 2>&1; then
+  PARSED=$(printf '%s' "$INPUT" | jq -r "$PARSE" 2>/dev/null)
+else
+  PARSED=$(printf '%s' "$INPUT" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+print(d.get("session_id") or "unknown"); print(d.get("cwd") or "")' 2>/dev/null)
+fi
+{ read -r SESSION; read -r CWD; } <<<"$PARSED"
+SESSION=$(printf '%s' "${SESSION:-unknown}" | tr -c 'A-Za-z0-9_.-' '_')
+
 ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
-cd "$ROOT" 2>/dev/null || exit 0
-[ -x scripts/check ] || exit 0
+cd "$ROOT" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1 || exit 0
+ROOT=$PWD
+REPOS=("$ROOT")
+if [ -n "$CWD" ] && WT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null) \
+   && [ "$WT" != "$(git rev-parse --show-toplevel)" ] \
+   && [ "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)" = "$(git rev-parse --path-format=absolute --git-common-dir)" ]; then
+  REPOS+=("$WT")
+fi
 
-# Docs-only changes don't need the gate.
-CHANGED=$(git status --porcelain --untracked-files=all | awk '{print $NF}' | grep -vE '\.(md|txt)$')
-[ -z "$CHANGED" ] && exit 0
-
-STATE_DIR="$(git rev-parse --git-dir)/slopbrake"
+STATE_DIR="$(git rev-parse --absolute-git-dir)/slopbrake"
 mkdir -p "$STATE_DIR"
 COUNT_FILE="$STATE_DIR/stop-red-$SESSION"
-LOG="$STATE_DIR/stop-check.log"
 
-if scripts/check --fast >"$LOG" 2>&1; then
+# gate DIR: runs what DIR needs; on red prints why and the log tail, returns 1.
+gate() {
+  cd "$1" 2>/dev/null && [ -x scripts/check ] || return 0
+  local log args=() why last
+  log="$(git rev-parse --absolute-git-dir)/slopbrake/stop-check.log"
+  # Docs-only changes don't need the gate.
+  if git -c core.quotePath=false status --porcelain --untracked-files=all | awk '{print $NF}' | grep -qvE '\.(md|txt)$'; then
+    args=(--fast) why="uncommitted code changes and scripts/check --fast is red"
+  elif last=$(git rev-parse -q --verify refs/slopbrake/last-green) && [ "$last" != "$(git rev-parse HEAD)" ] \
+       && git merge-base --is-ancestor "$last" HEAD; then
+    why="commits since the last green run (${last:0:12}) and the full scripts/check is red"
+  else
+    return 0
+  fi
+  mkdir -p "$(dirname "$log")"
+  scripts/check "${args[@]}" >"$log" 2>&1 </dev/null && return 0
+  echo "require-green: $1: $why:"
+  tail -n 60 "$log"
+  return 1
+}
+
+REPORT=
+for repo in "${REPOS[@]}"; do
+  out=$(gate "$repo") || REPORT+="$out"$'\n'
+done
+if [ -z "$REPORT" ]; then
   rm -f "$COUNT_FILE"
   exit 0
 fi
@@ -27,12 +66,12 @@ fi
 COUNT=$(( $(cat "$COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 if [ "$COUNT" -ge 3 ]; then
   rm -f "$COUNT_FILE"
-  echo "require-green: scripts/check --fast is still red after 3 attempts; stopping is allowed, but report the failure to the operator (log: $LOG)." >&2
+  echo "require-green: the gate is still red after 3 attempts; stopping is allowed, but report the failure to the operator (logs: .git/slopbrake/stop-check.log)." >&2
   exit 0
 fi
 echo "$COUNT" > "$COUNT_FILE"
 {
-  echo "require-green: uncommitted code changes and scripts/check --fast is red (attempt $COUNT/3). Fix it before stopping:"
-  tail -n 60 "$LOG"
+  echo "Fix it before stopping (attempt $COUNT/3):"
+  printf '%s' "$REPORT"
 } >&2
 exit 2

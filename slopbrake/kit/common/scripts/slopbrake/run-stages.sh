@@ -6,6 +6,10 @@
 #   scripts/check tests lint      only the named stages
 #
 # Every stage runs even after a failure, so one run shows everything that is red.
+# A stage with nothing to check prints "<stage>: skipped: <reason>" and returns 78 (a skip,
+# not a failure). A full run that is all green on a clean tree records HEAD as
+# refs/slopbrake/last-green, the base later checks use on the default branch
+# (SLOPBRAKE_NO_RECORD=1 opts out).
 
 run_stages() {
   # Git exports these to hooks (`commit -a` points GIT_INDEX_FILE at a temporary index).
@@ -20,7 +24,9 @@ run_stages() {
       *) selected+=("$arg") ;;
     esac
   done
+  local full=0
   if [ ${#selected[@]} -eq 0 ]; then
+    [ "$fast" -eq 0 ] && full=1
     for name in "${STAGES[@]}"; do
       if [ "$fast" -eq 1 ] && [[ " ${SLOW_STAGES[*]:-} " == *" $name "* ]]; then continue; fi
       selected+=("$name")
@@ -38,9 +44,22 @@ run_stages() {
     "stage_${name//-/_}"
     status=$?
     if [ $status -eq 0 ]; then results+=("pass  $name ($((SECONDS - start))s)")
+    elif [ $status -eq 78 ]; then results+=("skip  $name ($((SECONDS - start))s)")
     else results+=("FAIL  $name ($((SECONDS - start))s)"); failed=1; fi
   done
   echo "── summary ──"
   printf '%s\n' "${results[@]}"
+  [ $failed -eq 0 ] && [ $full -eq 1 ] && _record_last_green
   return $failed
+}
+
+_record_last_green() {
+  local ref=refs/slopbrake/last-green head
+  [ "${SLOPBRAKE_NO_RECORD:-}" = 1 ] && return
+  head=$(git rev-parse -q --verify HEAD) || return
+  [ -z "$(git status --porcelain)" ] || return
+  # A base that skips commits after the last green run did not check them: don't vouch for them.
+  if [ -n "${SLOPBRAKE_BASE:-}" ] && git rev-parse -q --verify "$ref" >/dev/null \
+     && ! git merge-base --is-ancestor "$SLOPBRAKE_BASE" "$ref" 2>/dev/null; then return; fi
+  git update-ref "$ref" "$head" && echo "last-green: recorded ${head:0:12}"
 }
