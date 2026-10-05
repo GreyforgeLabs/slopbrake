@@ -25,6 +25,7 @@ OVERRIDES = ("SLOPBRAKE_BASE", "GITHUB_BASE_REF", "SLOPBRAKE_NO_RECORD", "MUTATI
              "MUTATION_TEST_CMD", "TEST_CMD", "CLAUDE_PROJECT_DIR")
 CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
 SKIP = 78
+GREEN = "refs/slopbrake/last-green/"  # + branch
 
 
 def sh(cmd, cwd, env=None, stdin=None, **extra):
@@ -70,8 +71,8 @@ class Scratch(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def last_green(self):
-        return sh(["git", "rev-parse", "-q", "--verify", "refs/slopbrake/last-green"], self.root).stdout.strip()
+    def last_green(self, branch="main"):
+        return sh(["git", "rev-parse", "-q", "--verify", GREEN + branch], self.root).stdout.strip()
 
 
 class BaseSelection(Scratch):
@@ -97,20 +98,49 @@ class BaseSelection(Scratch):
 
     def test_on_the_base_branch_last_green_is_the_base(self):
         self.git_repo()
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD")
+        self.git("update-ref", GREEN + "main", "HEAD")
         self.write("shop.py", "x = 1\n")
         self.commit("work on main")
         base, described = self.base()
-        self.assertEqual(base, "refs/slopbrake/last-green")
+        self.assertEqual(base, GREEN + "main")
         self.assertIn("last-green", described)
         self.assertIn("main", described)
 
     def test_explicit_head_still_means_uncommitted_only(self):
         self.git_repo()
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD")
+        self.git("update-ref", GREEN + "main", "HEAD")
         self.write("shop.py", "x = 1\n")
         self.commit("work on main")
         self.assertEqual(self.base(SLOPBRAKE_BASE="HEAD")[0], "HEAD")
+
+    def test_a_green_run_on_another_branch_does_not_move_the_base(self):
+        self.git_repo()
+        self.git("update-ref", GREEN + "main", "HEAD")
+        self.git("checkout", "-q", "-b", "feat")
+        self.write("NOTES.md", "x\n")
+        self.commit("doc")
+        self.git("update-ref", GREEN + "feat", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.write("shop.py", "x = 1\n")
+        self.commit("work on main")
+        self.assertEqual(self.base()[0], GREEN + "main")
+
+    def test_detached_head_never_uses_last_green(self):
+        self.git_repo()
+        self.git("update-ref", GREEN + "main", "HEAD")
+        self.write("shop.py", "x = 1\n")
+        self.commit("work on main")
+        self.git("checkout", "-q", "--detach")
+        self.assertEqual(self.base()[0], "main")
+
+    def test_no_base_falls_back_to_last_green(self):
+        self.git_repo(branch="trunk")
+        self.git("update-ref", GREEN + "trunk", "HEAD")
+        self.write("shop.py", "x = 1\n")
+        self.commit("work on trunk")
+        base, described = self.base()
+        self.assertEqual(base, GREEN + "trunk")
+        self.assertIn("last-green", described)
 
     def test_no_base_is_described(self):
         self.git_repo(branch="trunk")
@@ -135,6 +165,28 @@ class DiffCollection(Scratch):
         self.commit("hidden")
         self.assertEqual(self.ranges("--base", "main"), "src/blob.sql:1-1,src/q.py:1-2")
 
+    def test_committed_binary_files_do_not_crash_the_checks(self):
+        self.git_repo()
+        self.git("checkout", "-q", "-b", "feat")
+        self.write(".claude/door-rules.yml", (KIT / "common/.claude/door-rules.yml").read_text())
+        (self.root / "logo.png").write_bytes(bytes(range(256)) * 3 + b"\xaa\xff\xfe")
+        self.write("calc.py", "def f(x):\n    return x * 2\n")
+        self.commit("png")
+        self.assertEqual(self.ranges("--base", "main", "--include", "*.py"), "calc.py:1-2")
+        for args in (["door_classify.py", "--json", "--base", "main"],
+                     ["mutation_py.py", "--base", "main", "--test-cmd", "true"]):
+            with self.subTest(args[0]):
+                result = script(*args, cwd=self.root)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn(result.returncode, (0, 1), result.stderr)
+
+    def test_only_newlines_split_diff_lines(self):
+        text = ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -0,0 +1,2 @@\n"
+                "+a\x0b+fake\x0cdiff --git a/y b/y\n+b\n")
+        changes = parse_unified_diff(text)
+        self.assertEqual(list(changes), ["x.py"])
+        self.assertEqual(changes["x.py"].added, {1: "a\x0b+fake\x0cdiff --git a/y b/y", 2: "b"})
+
     def test_untracked_files_are_found_from_a_subdirectory(self):
         self.git_repo()
         self.write("src/x/sub/keep.py", "a = 1\n")
@@ -148,6 +200,9 @@ class DiffCollection(Scratch):
         self.assertEqual(parse_unified_diff(quoted)["café x.py"].added, {1: "a = 1"})
         spaced = "diff --git a/my file.py b/my file.py\n--- a/my file.py\n+++ b/my file.py\n@@ -0,0 +1 @@\n+b\n"
         self.assertEqual(list(parse_unified_diff(spaced)), ["my file.py"])
+        tricky = ("diff --git a/my b/x.py b/my b/x.py\nnew file mode 100644\n--- /dev/null\n+++ b/my b/x.py\n"
+                  "@@ -0,0 +1 @@\n+c\n")
+        self.assertEqual(list(parse_unified_diff(tricky)), ["my b/x.py"])
 
 
 class StageRunner(Scratch):
@@ -185,6 +240,19 @@ class StageRunner(Scratch):
         self.assertEqual(self.check().returncode, 0)
         self.assertEqual(self.last_green(), self.head)
 
+    def test_last_green_is_per_branch_and_never_detached(self):
+        self.assertEqual(self.check().returncode, 0)
+        self.git("checkout", "-q", "-b", "feat")
+        self.write("NOTES.md", "x\n")
+        self.commit("doc")
+        self.assertEqual(self.check().returncode, 0)
+        self.assertEqual(self.last_green("feat"), self.git("rev-parse", "HEAD"))
+        self.assertEqual(self.last_green("main"), self.head)
+        self.git("checkout", "-q", "--detach", "HEAD~1")
+        self.check()
+        refs = self.git("for-each-ref", "--format=%(refname)", "refs/slopbrake/").split()
+        self.assertEqual(refs, [GREEN + "feat", GREEN + "main"])
+
     def test_partial_red_dirty_or_opted_out_runs_do_not_record(self):
         runs = {"fast": (["--fast"], {}), "stage list": (["a", "b", "c"], {}),
                 "red": ([], {"FAIL_C": "1"}), "opt-out": ([], {"SLOPBRAKE_NO_RECORD": "1"})}
@@ -197,7 +265,7 @@ class StageRunner(Scratch):
         self.assertEqual(self.last_green(), "")
 
     def test_an_explicit_base_that_skips_unverified_commits_does_not_record(self):
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD")
+        self.git("update-ref", GREEN + "main", "HEAD")
         self.write("shop.py", "x = 1\n")
         self.commit("unverified")
         self.check(SLOPBRAKE_BASE="HEAD")
@@ -250,7 +318,7 @@ class Mutation(Scratch):
 
     def test_commits_on_the_default_branch_are_checked_since_last_green(self):
         self.git_repo()
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD")
+        self.git("update-ref", GREEN + "main", "HEAD")
         self.seed("def tax(x):\n    return x * 2 + 1\n", "tax(500)\n", "tax")
         self.commit("committed on main")
         result = self.floor()
@@ -303,6 +371,25 @@ class Mutation(Scratch):
         self.assertIn("shop.py:6 [delete call]", result.stdout)
         self.assertIn("shop.py:7 [delete call]", result.stdout)
         self.assertNotIn("'hi '", result.stdout)  # f-string parts are not string mutants
+
+    def test_lookup_strings_are_not_crash_killed(self):
+        self.git_repo()
+        self.seed('import json\n\n\ndef load(path, cfg):\n    with open(path, encoding="utf-8") as f:\n'
+                  '        data = json.load(f)\n    host = cfg["host"]\n    return f"{host}:{data[\'port\']}"\n',
+                  'import json, os, tempfile\nfd, p = tempfile.mkstemp()\nos.write(fd, json.dumps({"port": 1}).encode())\n'
+                  'os.close(fd)\nload(p, {"host": "h"})\n', "load")
+        result = self.floor("--base", "main")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("0/1 mutants killed", result.stdout)
+
+    def test_messages_and_names_are_not_string_mutants(self):
+        self.git_repo()
+        self.seed('"""Shop."""\nimport logging\n__all__ = ["tax"]\n"Bare note."\nlog = logging.getLogger("shop")\n\n\n'
+                  'def tax(x):\n    if x < 0:\n        raise ValueError("negative")\n    return x\n\n\n'
+                  'if __name__ == "__main__":\n    pass\n',
+                  "self.assertEqual(tax(5), 5)\n", "tax")
+        result = self.floor("--base", "main")
+        self.assertNotIn("[string", result.stdout)
 
     def test_string_concatenation_is_not_killed_by_a_crash(self):
         self.git_repo()
@@ -450,13 +537,14 @@ class StopHook(Scratch):
         self.executable("scripts/check", f"""\
             #!/usr/bin/env bash
             cd "$(dirname "$0")/.."
-            echo "$PWD args=$*" >> {str(self.log)!r}
+            echo "$PWD args=$* max=${{MUTATION_MAX-unset}}" >> {str(self.log)!r}
+            [ -e SLOW ] && sleep 10
             if [ -e RED ] || [ -n "${{FAIL:-}}" ]; then echo "FAIL  tests"; exit 1; fi
             """)
         self.commit("gate")
 
     def stop(self, payload, env=None, **extra):
-        env = dict(env or CLEAN_ENV, CLAUDE_PROJECT_DIR=str(self.root), **extra)
+        env = dict(env or CLEAN_ENV, **{"CLAUDE_PROJECT_DIR": str(self.root), **extra})
         result = sh([str(HOOKS / "require-green.sh")], self.root, env=env, stdin=json.dumps(payload))
         logged = self.log.read_text().splitlines() if self.log.exists() else []
         self.log.unlink(missing_ok=True)
@@ -474,7 +562,7 @@ class StopHook(Scratch):
         result, logged = self.stop({"session_id": "s1", "cwd": str(wt / "sub")})
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn(str(wt), result.stderr)
-        self.assertEqual(logged, [f"{wt} args=--fast"])
+        self.assertEqual(logged, [f"{wt} args=--fast max=unset"])
 
     def test_parses_the_payload_without_jq(self):
         wt = self.worktree()
@@ -489,14 +577,38 @@ class StopHook(Scratch):
         self.assertTrue((self.root / ".git/slopbrake/stop-red-s1").exists())
 
     def test_committed_work_since_last_green_gets_the_full_gate(self):
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD~1")
+        self.git("update-ref", GREEN + "main", "HEAD~1")
         result, logged = self.stop({"session_id": "s2"}, FAIL="1")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(logged, [f"{self.root} args="])
+        self.assertEqual(logged, [f"{self.root} args= max=40"])
         self.assertIn("FAIL  tests", result.stderr)
-        self.git("update-ref", "refs/slopbrake/last-green", "HEAD")
+        self.git("update-ref", GREEN + "main", "HEAD")
         result, logged = self.stop({"session_id": "s2"}, FAIL="1")
         self.assertEqual((result.returncode, logged), (0, []))
+
+    def test_the_full_gate_is_bounded(self):
+        self.git("update-ref", GREEN + "main", "HEAD~1")
+        _, logged = self.stop({"session_id": "s5"}, SLOPBRAKE_STOP_MUTANTS="7")
+        self.assertEqual(logged, [f"{self.root} args= max=7"])
+        (self.root / ".git/info/exclude").write_text("SLOW\n")
+        (self.root / "SLOW").write_text("")
+        started = time.monotonic()
+        result, _ = self.stop({"session_id": "s5"}, SLOPBRAKE_STOP_TIMEOUT="1")
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("timed out", result.stderr)
+
+    def test_worktree_of_a_monorepo_subdirectory_install(self):
+        app = self.root / "app"
+        app.mkdir()
+        shutil.move(str(self.root / "scripts"), str(app / "scripts"))
+        self.commit("move the install into app/")
+        wt = self.aux / "wt"
+        self.git("worktree", "add", "-q", "-b", "feat", str(wt))
+        (wt / "app/RED").write_text("red\n")
+        result, logged = self.stop({"session_id": "s6", "cwd": str(wt)}, CLAUDE_PROJECT_DIR=str(app))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(logged, [f"{wt}/app args=--fast max=unset"])
 
     def test_three_red_stops_then_it_lets_go(self):
         (self.root / "RED").write_text("red\n")

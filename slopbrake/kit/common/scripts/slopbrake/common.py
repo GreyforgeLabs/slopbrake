@@ -14,8 +14,9 @@ from pathlib import Path
 
 def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
     # quotePath off: non-ASCII names come out verbatim, not as "\303\251" octal escapes.
-    result = subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=cwd, capture_output=True, text=True,
-                            check=False)
+    # errors="replace": `diff --text` prints binary files' raw bytes.
+    result = subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=cwd, capture_output=True,
+                            encoding="utf-8", errors="replace", check=False)
     if check and result.returncode != 0:
         raise SystemExit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout
@@ -30,7 +31,15 @@ def _ref_exists(ref: str) -> bool:
                           capture_output=True, check=False).returncode == 0
 
 
-LAST_GREEN = "refs/slopbrake/last-green"  # HEAD after the last full green run (scripts/check records it)
+def last_green() -> str | None:
+    """This branch's refs/slopbrake/last-green/<branch> (HEAD after its last full green run, recorded by
+    scripts/check), when it exists and is an ancestor of HEAD. Never on a detached HEAD."""
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
+    ref = "refs/slopbrake/last-green/" + branch
+    if branch and _ref_exists(ref) and subprocess.run(["git", "merge-base", "--is-ancestor", ref, "HEAD"],
+                                                      capture_output=True, check=False).returncode == 0:
+        return ref
+    return None
 
 
 def _select_base(explicit: str | None) -> tuple[str | None, str]:
@@ -49,12 +58,11 @@ def _select_base(explicit: str | None) -> tuple[str | None, str]:
         base = next((ref for ref in auto if _ref_exists(ref)), None)
         how = "upstream" if base and base == upstream else "default"
         if base is None:
-            return None, ""
+            green = last_green()
+            return (green, "no base ref") if green else (None, "")
     # HEAD is on the base branch: the base shows nothing committed, so measure since the last green run.
-    if head and git("merge-base", base, "HEAD", check=False).strip() == head and _ref_exists(LAST_GREEN) \
-            and subprocess.run(["git", "merge-base", "--is-ancestor", LAST_GREEN, "HEAD"],
-                               capture_output=True, check=False).returncode == 0:
-        return LAST_GREEN, f"HEAD is on {base}"
+    if head and git("merge-base", base, "HEAD", check=False).strip() == head and (green := last_green()):
+        return green, f"HEAD is on {base}"
     return base, how
 
 
@@ -62,7 +70,8 @@ def base_ref(explicit: str | None = None) -> str | None:
     """The ref a change is measured against.
 
     --base flag > GITHUB_BASE_REF (as origin/<x>) > SLOPBRAKE_BASE > the branch's upstream > origin/HEAD > main >
-    master > origin/main > origin/master. When HEAD is on that base, the last green run instead.
+    master > origin/main > origin/master. When HEAD is on that base, or none exists, this branch's last
+    green run instead (see last_green).
     """
     return _select_base(explicit)[0]
 
@@ -73,8 +82,8 @@ def describe_base(explicit: str | None = None) -> str:
     if base is None:
         return "no base ref (no upstream, origin/HEAD, main or master; set SLOPBRAKE_BASE)"
     sha = git("rev-parse", "--short", base + "^{commit}", check=False).strip() or "?"
-    if base == LAST_GREEN:
-        return f"last-green {sha} (last full green run; {how})"
+    if base.startswith("refs/slopbrake/last-green/"):
+        return f"last-green {sha} (last full green run on {base.rsplit('last-green/', 1)[1]}; {how})"
     return f"{base} {sha}" + (f" (from {how})" if how not in ("", "default") else "")
 
 
@@ -115,15 +124,28 @@ def parse_unified_diff(text: str) -> dict[str, FileChange]:
     current: FileChange | None = None
     new_line = 0
     in_hunk = False  # `+++ b/path` is a header only before the first hunk; inside one it is content
-    for line in text.splitlines():
+    # Only "\n" ends a diff line: str.splitlines() also splits on \f, \v, \x1c.. inside content.
+    for line in text.split("\n"):
+        line = line.removesuffix("\r")
         if line.startswith("diff --git "):
-            match = re.match(_PATH + " " + _PATH.replace(".*?", ".*") + "$", line[len("diff --git "):])
-            old, new = (unquote_path(match.group(1)), unquote_path(match.group(2))) if match else (None, None)
+            rest = line[len("diff --git "):]
+            half = (len(rest) - 1) // 2
+            if rest[:2] == "a/" and rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3:]:
+                old = new = rest[2:half]  # unquoted and unrenamed: the halves match, even with " b/" inside
+            else:
+                match = re.match(_PATH + " " + _PATH.replace(".*?", ".*") + "$", rest)
+                old, new = (unquote_path(match.group(1)), unquote_path(match.group(2))) if match else (None, None)
             current = FileChange(path=new or "", old_path=old)
             changes[current.path] = current
             in_hunk = False
         elif current is None:
             continue
+        elif line.startswith("+++ ") and not in_hunk and line[4:] != "/dev/null":
+            path = unquote_path(line[4:].removesuffix("\t"))  # unambiguous, where the header is not
+            if path != current.path:
+                changes.pop(current.path, None)
+                current.path = path
+                changes[path] = current
         elif line.startswith("deleted file mode") and not in_hunk:
             current.deleted = True
         elif line.startswith("@@"):

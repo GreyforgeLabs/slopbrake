@@ -8,8 +8,8 @@
 # Every stage runs even after a failure, so one run shows everything that is red.
 # A stage with nothing to check prints "<stage>: skipped: <reason>" and returns 78 (a skip,
 # not a failure). A full run that is all green on a clean tree records HEAD as
-# refs/slopbrake/last-green, the base later checks use on the default branch
-# (SLOPBRAKE_NO_RECORD=1 opts out).
+# refs/slopbrake/last-green/<branch>, the base later checks use on the default branch
+# (never on a detached HEAD; SLOPBRAKE_NO_RECORD=1 opts out).
 
 run_stages() {
   # Git exports these to hooks (`commit -a` points GIT_INDEX_FILE at a temporary index).
@@ -54,8 +54,10 @@ run_stages() {
 }
 
 _record_last_green() {
-  local ref=refs/slopbrake/last-green head
+  local ref branch head
   [ "${SLOPBRAKE_NO_RECORD:-}" = 1 ] && return
+  branch=$(git symbolic-ref -q --short HEAD) || return  # per branch: green elsewhere vouches for nothing here
+  ref=refs/slopbrake/last-green/$branch
   head=$(git rev-parse -q --verify HEAD) || return
   [ -z "$(git status --porcelain)" ] || return
   # A base that skips commits after the last green run did not check them: don't vouch for them.

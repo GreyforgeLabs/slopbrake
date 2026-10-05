@@ -48,15 +48,31 @@ def is_test_path(path: str) -> bool:
 
 
 def unmutable_ids(tree: ast.AST) -> set[int]:
-    """Constants a mutant must not touch: docstrings, f-string text, string annotations."""
+    """Constants a mutant must not touch: docstrings and bare strings, f-string text, string annotations,
+    and strings that are lookups, arguments or names (keys, subscripts, call arguments, __all__,
+    "__main__"): changing those mostly raises KeyError/LookupError, a crash "kill" no assertion earned,
+    or only alters a message."""
     ids = set()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
-            first = node.body[0]
-            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
-                ids.add(id(first.value))
-        if isinstance(node, (ast.JoinedStr, getattr(ast, "TemplateStr", ast.JoinedStr))):
-            ids |= {id(v) for v in node.values if isinstance(v, ast.Constant)}
+        strings = []
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            strings.append(node.value)
+        elif isinstance(node, (ast.JoinedStr, getattr(ast, "TemplateStr", ast.JoinedStr))):
+            strings += node.values
+        elif isinstance(node, ast.Subscript):
+            strings += node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        elif isinstance(node, ast.Call):
+            strings += node.args + [k.value for k in node.keywords]
+        elif isinstance(node, ast.Dict):
+            strings += [k for k in node.keys if k is not None]
+        elif isinstance(node, ast.Compare) and any(isinstance(n, ast.Name) and n.id == "__name__"
+                                                   for n in [node.left, *node.comparators]):
+            strings += node.comparators
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+                strings += list(ast.walk(node.value))
+        ids |= {id(n) for n in strings if isinstance(n, ast.Constant) and isinstance(n.value, str)}
         annotations = [getattr(node, "annotation", None), getattr(node, "returns", None)]
         ids |= {id(n) for a in annotations if isinstance(a, ast.AST) for n in ast.walk(a)}
     return ids
