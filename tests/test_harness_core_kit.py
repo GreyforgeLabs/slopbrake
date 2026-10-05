@@ -69,6 +69,20 @@ class GrokRunsTheProjectHooks(Scratch):
         self.assertEqual(sorted(p.name for p in state.glob("stop-red-*")), ["stop-red-grok-7"])
 
 
+    def test_require_green_skips_grok_session_end_stops(self):
+        self.write("scripts/check", "#!/bin/sh\necho ran >> check-ran\nexit 1\n", mode=0o755)
+        self.commit("red gate")
+        self.write("app.py", "x = 1\n")
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(self.root), SLOPBRAKE_STOP_TIMEOUT="60")
+        for reason in ("channel_closed", "shutdown"):
+            payload = {"hookEventName": "stop", "sessionId": "grok-8", "cwd": str(self.root), "reason": reason}
+            result = sh([str(HOOKS / "require-green.sh")], self.root, env=env, stdin=json.dumps(payload))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "check-ran").exists())
+        payload = {"hookEventName": "stop", "sessionId": "grok-8", "cwd": str(self.root), "reason": "end_turn"}
+        result = sh([str(HOOKS / "require-green.sh")], self.root, env=env, stdin=json.dumps(payload))
+        self.assertEqual(result.returncode, 2, result.stderr)
+
 class HooksDisabled(Scratch):
     def gf(self, *args):
         base = self.root.parent

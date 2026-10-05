@@ -124,6 +124,33 @@ class Grok(Scratch):
         self.assertFalse(self.marker.exists())
 
 
+    def test_write_and_hashline_edit_record_their_repo(self):
+        shop, web, docs = self.repo("shop"), self.repo("web"), self.repo("docs")
+        for tool, args in (("write", {"file_path": str(shop / "src/new.py"), "content": "x"}),
+                           ("hashline_edit", {"file_path": str(web / "src/a.py"), "edits": []}),
+                           ("hashline_edit", {"path": str(docs / "src/a.py"), "edits": []})):
+            payload = grok("PostToolUse", cwd=str(self.base), toolName=tool, toolInput=args)
+            self.assertEqual(self.hook(["--harness", "grok", "post-tool-use"], payload).returncode, 0, tool)
+        self.assertEqual(self.touched("g1"), sorted([str(shop), str(web), str(docs)]))
+
+    def test_an_unhashable_tool_name_is_ignored_quietly(self):
+        shop = self.repo("shop")
+        result = self.hook(["--harness", "grok", "post-tool-use"],
+                           grok("PostToolUse", cwd=str(shop), toolName={"x": 1}, toolInput={"file_path": "src/a.py"}))
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+
+class PreToolUse(Scratch):
+    def test_only_shell_commands_are_guarded(self):
+        shop = self.repo("shop")
+        patch = "*** Begin Patch\n*** Update File: README.md\n+Never run `git push --force` on main\n*** End Patch\n"
+        payload = {"session_id": "c1", "cwd": str(shop), "tool_name": "apply_patch", "tool_input": {"command": patch}}
+        self.assertEqual(self.hook(["--harness", "codex", "pre-tool-use"], payload).returncode, 0)
+        for name in ("Bash", None):
+            bash = dict(payload, tool_name=name, tool_input={"command": "git push --force origin main"})
+            self.assertEqual(self.hook(["--harness", "codex", "pre-tool-use"], bash).returncode, 2, name)
+
+
 PATCH = """*** Begin Patch
 *** Add File: {add}
 +print("new")

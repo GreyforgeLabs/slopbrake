@@ -6,7 +6,8 @@ The Stop gate runs a repo's own scripts only when the operator trusts the repo
 (${XDG_CONFIG_HOME:-~/.config}/slopbrake/trusted.json; `slopbrake init` adds its repo).
 
   slopbrake-hook [--harness claude|codex|opencode|grok] pre-tool-use|post-tool-use|stop
-                                                      hook JSON on stdin (alias: slopbrake hook)
+                                                      hook JSON on stdin (`slopbrake hook <event>` is
+                                                      a Claude-only alias: it takes no --harness)
   slopbrake user-hooks install|uninstall|status [--settings PATH]
   slopbrake user-hooks trust|untrust REPO
 """
@@ -42,7 +43,7 @@ PATCH_TARGET = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to)
 GROK_KEYS = {"sessionId": "session_id", "toolName": "tool_name", "toolInput": "tool_input", "toolUseId": "tool_use_id",
              "hookEventName": "hook_event_name", "stopHookActive": "stop_hook_active",
              "transcriptPath": "transcript_path"}
-GROK_TOOLS = {"run_terminal_command": "Bash", "search_replace": "Edit"}
+GROK_TOOLS = {"run_terminal_command": "Bash", "search_replace": "Edit", "hashline_edit": "Edit", "write": "Write"}
 USER_ENTRIES = {
     "PreToolUse": {"matcher": "Bash", "hooks": [{"type": "command", "command": f"{PROGRAM} pre-tool-use"}]},
     "PostToolUse": {"matcher": "|".join((*EDIT_TOOLS, "Bash")),
@@ -381,7 +382,7 @@ def post_tool_use(payload: dict) -> int:
     args = payload.get("tool_input") or {}
     repos = set()
     if payload.get("tool_name") in EDIT_TOOLS:
-        target = args.get("file_path") or args.get("notebook_path")
+        target = args.get("file_path") or args.get("notebook_path") or args.get("path")  # path: grok's hashline_edit?
         root = managed_root(cwd / Path(target).expanduser()) if target else None
         repos = {str(root)} if root else set()
     elif payload.get("tool_name") in PATCH_TOOLS:
@@ -449,8 +450,9 @@ def stop(payload: dict, text: str, harness: str = "claude") -> int:
 
 
 def pre_tool_use(payload: dict, guard: Path = KIT_GUARD) -> int:
+    """Guard shell commands only: an apply_patch also carries tool_input.command, but it is patch text."""
     command = (payload.get("tool_input") or {}).get("command")
-    if not isinstance(command, str) or not command.strip():
+    if payload.get("tool_name") not in (None, "Bash") or not isinstance(command, str) or not command.strip():
         return 0
     spec = importlib.util.spec_from_file_location("slopbrake_git_guard", guard)
     module = importlib.util.module_from_spec(spec)
@@ -476,7 +478,8 @@ def normalize(payload: dict, harness: str) -> dict:
                 value = payload[camel]
                 payload[snake] = "".join(map(str.capitalize, value.split("_"))) \
                     if snake == "hook_event_name" and isinstance(value, str) else value
-        payload["tool_name"] = GROK_TOOLS.get(payload.get("tool_name"), payload.get("tool_name"))
+        name = payload.get("tool_name")
+        payload["tool_name"] = GROK_TOOLS.get(name, name) if isinstance(name, str) else name
     args = payload.get("tool_input")
     if isinstance(args, dict) and isinstance(args.get("workdir"), str) and args["workdir"]:
         base = Path(payload.get("cwd") or os.getcwd())
@@ -511,8 +514,8 @@ def run(event: str, text: str, harness: str = "claude") -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The `slopbrake-hook [--harness H] <event>` console script (and `slopbrake hook`). Never exits 2 on bad
-    usage."""
+    """The `slopbrake-hook [--harness H] <event>` console script (and `slopbrake hook <event>`, Claude only).
+    Never exits 2 on bad usage."""
     argv = list(sys.argv[1:] if argv is None else argv)
     harness = "claude"
     if argv and argv[0].startswith("--harness="):

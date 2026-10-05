@@ -11,15 +11,16 @@
 # the agent stop and report (loop limit, rule C2) instead of trapping it.
 
 INPUT=$(cat)
-PARSE='(.session_id // .sessionId // "unknown"), (.cwd // "")'  # grok sends camelCase keys
+PARSE='(.session_id // .sessionId // "unknown"), (.cwd // ""), (.reason // "")'  # grok sends camelCase keys
 if command -v jq >/dev/null 2>&1; then
   PARSED=$(printf '%s' "$INPUT" | jq -r "$PARSE" 2>/dev/null)
 else
   PARSED=$(printf '%s' "$INPUT" | python3 -c 'import json, sys
 d = json.load(sys.stdin)
-print(d.get("session_id") or d.get("sessionId") or "unknown"); print(d.get("cwd") or "")' 2>/dev/null)
+print(d.get("session_id") or d.get("sessionId") or "unknown"); print(d.get("cwd") or ""); print(d.get("reason") or "")' 2>/dev/null)
 fi
-{ read -r SESSION; read -r CWD; } <<<"$PARSED"
+{ read -r SESSION; read -r CWD; read -r REASON; } <<<"$PARSED"
+case "$REASON" in channel_closed|shutdown) exit 0 ;; esac  # grok's observe-only Stop at session end
 SESSION=$(printf '%s' "${SESSION:-unknown}" | tr -c 'A-Za-z0-9_.-' '_')
 
 ROOT="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}"
