@@ -9,15 +9,16 @@
 //   - an implementation constant asserted against a literal (`expect(MAX_LEN).toBe(280)`)
 //     or an expected value derived from one (`"a".repeat(MAX_LEN)`),
 //   - an expected value computed with reduce/map/filter/length/Math.* from the inputs
-//     given to the code under test, inline or through a local variable,
+//     given to the code under test, inline or through a local variable (other built-ins,
+//     such as `JSON.parse(s)`, are an independent oracle and pass),
 //   - an expected value recomputed from the same inputs (`expect(add(a, b)).toBe(a + b)`).
 // Property checks built from the result (`expect(xs).toEqual([...xs].sort())`,
-// `expect(double(xs).length).toBe(xs.length)`) are fine.
+// `expect(double(xs).length).toBe(xs.length)`, `expect(f(xs)).toEqual(f(xs).filter(p))`) are fine.
 // Suppress one assertion with a reason on the line or the line above:
 //   // slopbrake: allow-tautology: <why the expected value is independent>
 //
 // slopbrake/expect-in-test flags test()/it() callbacks with no assertion: no expect()/assert
-// call, directly or in a helper declared at the top of the file (one level). .skip and .todo
+// call (expect*/assert* names count, expected* does not), directly or in a helper declared at the top of the file (one level). .skip and .todo
 // are ignored. Suppress with a reason on the line of the test or the line above:
 //   // slopbrake: allow-no-assert: <why crashing is the only failure>
 
@@ -31,7 +32,7 @@ const ALLOW = /slopbrake:\s*allow-tautology:\s*\S/;
 const ALLOW_NO_ASSERT = /slopbrake:\s*allow-no-assert:\s*\S/;
 const IDENTITY_MATCHERS = new Set(["toBe", "strictEqual"]);
 const TEST_FUNCTIONS = new Set(["test", "it"]);
-const ASSERT_NAME = /^(assert|expect|should$)/;
+const ASSERT_NAME = /^(assert|expect)($|[A-Z_])|^should$/; // assertEqual, expectTypeOf; not expectedTotal
 const ASSERT_MODULE = /^(node:)?assert(\/strict)?$|^chai$/;
 
 const isConstName = (name) => /^[A-Z][A-Z0-9_]*$/.test(name) && /[A-Z]/.test(name);
@@ -74,6 +75,10 @@ function calleeName(call) {
   return "";
 }
 
+// Math.max(a, b) restates an aggregate; other built-ins (JSON.parse) are an independent oracle.
+const isMathCall = (call) => call.callee.type === "MemberExpression" && call.callee.object.type === "Identifier"
+  && call.callee.object.name === "Math";
+
 function isGlobalCall(call) {
   const callee = call.callee;
   return callee.type === "MemberExpression" && callee.object.type === "Identifier" && GLOBAL_OBJECTS.has(callee.object.name);
@@ -109,7 +114,7 @@ function namesIn(node) {
 
 function aggregateIn(node) {
   for (const n of walk(node)) {
-    if (n.type === "CallExpression" && (AGGREGATE_METHODS.has(calleeName(n)) || isGlobalCall(n)) && !n.arguments.every(isLiteral)) {
+    if (n.type === "CallExpression" && (AGGREGATE_METHODS.has(calleeName(n)) || isMathCall(n)) && !n.arguments.every(isLiteral)) {
       return calleeName(n);
     }
     if (n.type === "MemberExpression" && !n.computed && n.property.name === "length") return "length";
@@ -204,7 +209,10 @@ export const noTautologicalTest = {
       const resultNames = new Set([...namesIn(rawActual), ...namesIn(rawExpected)]);
       const overlap = [...used].some((n) => inputs.has(n));
       const usesResult = [...used].some((n) => resultNames.has(n) && !inputs.has(n));
-      const fromInputs = overlap && !usesResult;
+      // A second run of the code under test (`adults(xs).filter(...)`) builds on the result, not the inputs.
+      const tested = new Set(callsUnderTest(actual).map((c) => sourceCode.getText(c.callee)));
+      const reruns = callsUnderTest(expected).some((c) => tested.has(sourceCode.getText(c.callee)));
+      const fromInputs = overlap && !usesResult && !reruns;
       const aggregate = aggregateIn(expected);
       if (aggregate && fromInputs) return `expected value is computed with ${aggregate} from the test inputs; use a literal or worked example`;
       if (fromInputs && [...used].every((n) => inputs.has(n)) && ["BinaryExpression", "TemplateLiteral", "LogicalExpression"].includes(expected.type)) {

@@ -5,7 +5,7 @@ import { test } from "node:test";
 import plugin from "../../slopbrake/kit/typescript/eslint-rules/slopbrake.mjs";
 
 const tester = new RuleTester({ languageOptions: { parser: tsParser, ecmaVersion: 2022, sourceType: "module" } });
-const header = 'import { expect, test } from "vitest";\nimport { MAX_LEN, ERR_TOO_LONG, add, total, truncate, validate, sortAll, maxOf, mean, adults, count, getInstance, memo, double } from "../src/shop.js";\n';
+const header = 'import { expect, test } from "vitest";\nimport { MAX_LEN, ERR_TOO_LONG, add, total, truncate, validate, sortAll, maxOf, mean, adults, count, getInstance, memo, double, parse } from "../src/shop.js";\n';
 const wrap = (body) => `${header}test("t", () => {\n${body}\n});\n`;
 const flagged = (body, reason) => ({ code: wrap(body), errors: [{ messageId: "tautology", data: { reason } }] });
 
@@ -23,6 +23,11 @@ test("no-tautological-test", () => {
       wrap("const seed = 3;\nexpect(add(seed, 0)).toBe(add(seed, 0));"),
       // Length preservation is a property of the result, not a restatement.
       wrap("const xs = [1, 2];\nexpect(double(xs).length).toBe(xs.length);"),
+      // A second run of the code under test in the expected value is a property of the result.
+      wrap("const xs = [3, 1];\nexpect(adults(xs)).toEqual(adults(xs).filter((p) => p.age >= 18));"),
+      wrap("const xs = [3, 1];\nexpect(sortAll(xs)).toEqual([...sortAll(xs)].sort());"),
+      // A built-in other than Math is an independent oracle (differential test), like json.loads in Python.
+      wrap('const s = "[1]";\nexpect(parse(s)).toEqual(JSON.parse(s));'),
     ],
     invalid: [
       flagged("expect(MAX_LEN).toBe(280);", "asserts the value of implementation constant MAX_LEN; that restates its definition"),
@@ -43,6 +48,10 @@ test("no-tautological-test", () => {
         "expected value is computed with reduce from the test inputs; use a literal or worked example"),
       flagged("const people = [{ age: 20 }, { age: 3 }];\nexpect(adults(people)).toEqual(people.filter((p) => p.age >= 18));",
         "expected value is computed with filter from the test inputs; use a literal or worked example"),
+      flagged("const items = [1, 2];\nexpect(total(items)).toBe(items.map((i) => price(i)).reduce((a, b) => a + b, 0));",
+        "expected value is computed with reduce from the test inputs; use a literal or worked example"),
+      flagged("const xs = { a: 1 };\nexpect(count(xs)).toBe(Object.keys(xs).length);",
+        "expected value is computed with length from the test inputs; use a literal or worked example"),
       flagged("const xs = [1, 2];\nexpect(count(xs)).toBe(xs.length);",
         "expected value is computed with length from the test inputs; use a literal or worked example"),
       // No code under test re-runs, or a zero-argument call compared by value: still a restatement.

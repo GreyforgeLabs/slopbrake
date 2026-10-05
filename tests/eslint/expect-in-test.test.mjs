@@ -37,6 +37,8 @@ test("expect-in-test", () => {
       flagged('describe("suite", () => {\n  it("a", () => add(1, 2));\n  it("b", () => {\n    expect(add(1, 2)).toBe(3);\n  });\n});'),
       flagged('function outer() {\n  checkSum();\n}\nfunction checkSum() {\n  expect(add(1, 2)).toBe(3);\n}\ntest("two levels", () => {\n  outer();\n});'),
       flagged('// slopbrake: allow-no-assert:\ntest("no reason", () => {\n  add(1, 2);\n});'),
+      // A value builder named expected* is not an assertion.
+      flagged('const expectedTotal = (xs) => xs.length;\ntest("builds", () => {\n  add(1, expectedTotal([1]));\n});'),
     ],
   });
 });
