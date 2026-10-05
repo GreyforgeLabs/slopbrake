@@ -6,7 +6,11 @@ the tracked tree: the working tree is never modified, so an editable install tha
 live service imports stays untouched. A mutant is killed when the test command fails
 or times out. Below the floor the check fails and lists the surviving mutants; they
 are evidence for the reviewer. Nothing to mutate exits 78 (a skip, not a pass).
-A line ending in `# slopbrake: no-mutate` is never mutated (for equivalent mutants).
+When only tests changed, the first-party modules those tests import (a deleted test file is
+read from the base) are mutated whole, sampled to at most TESTS_ONLY_MAX mutants, so a
+weakened or deleted test is still caught.
+A line ending in `# slopbrake: no-mutate` is never mutated (for equivalent mutants); every
+changed line with mutation sites marked so fails the stage.
 """
 from __future__ import annotations
 
@@ -15,7 +19,6 @@ import ast
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -25,10 +28,19 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import base_ref, collect_changes, describe_base, git, repo_root, split_lines
+from common import (
+    base_ref,
+    collect_changes,
+    describe_base,
+    git,
+    merge_base,
+    repo_root,
+    split_lines,
+)
 
 SKIP = 78
-NO_MUTATE = re.compile(r"#\s*slopbrake:\s*no-mutate\b")
+NO_MUTATE = re.compile(r"#\s*slopbrake:\s*no-mutate\s*$")
+TESTS_ONLY_MAX = 40
 
 COMPARE_SWAP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE, ast.GtE: ast.Lt, ast.Gt: ast.LtE,
                 ast.LtE: ast.Gt, ast.In: ast.NotIn, ast.NotIn: ast.In, ast.Is: ast.IsNot, ast.IsNot: ast.Is}
@@ -169,6 +181,8 @@ def apply(node: ast.AST, kind: str, detail: int) -> str:
 def copy_tree(root: Path, dest: Path) -> None:
     listed = git("ls-files", "-co", "--exclude-standard", "-z", cwd=root)
     for rel in filter(None, listed.split("\0")):
+        if "__pycache__" in rel.split("/"):  # a stale .pyc with the mutant's mtime and size would hide it
+            continue
         src = root / rel
         if src.is_file() or src.is_symlink():
             target = dest / rel
@@ -197,6 +211,27 @@ def _terminate(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)  # unwinds through `finally`, so the scratch copy is removed
 
 
+def imported_modules(root: Path, source: str) -> set[str]:
+    """First-party modules (paths from the root) a test file's source imports, at the root or under src/."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names |= {node.module} | {f"{node.module}.{alias.name}" for alias in node.names}
+    found = set()
+    for name in names:
+        for top in (root, root / "src"):
+            for candidate in (top / (name.replace(".", "/") + ".py"), top / name.replace(".", "/") / "__init__.py"):
+                if candidate.is_file():
+                    found.add(str(candidate.relative_to(root)))
+    return found
+
+
 def mutable_lines(path: Path, lines: set[int]) -> set[int]:
     source = split_lines(path.read_text(encoding="utf-8"))
     return {n for n in lines if n <= len(source) and not NO_MUTATE.search(source[n - 1])}
@@ -220,18 +255,40 @@ def main(argv: list[str] | None = None) -> int:
         print(f"mutation: skipped: {described}")
         return SKIP
     changes = collect_changes(base, working_tree=True)
-    targets = {c.path: set(c.added) for c in changes.values()
-               if c.path.endswith(".py") and not c.deleted and c.added and not is_test_path(c.path)
-               and not any(c.path.startswith(prefix) for prefix in args.exclude) and (root / c.path).is_file()}
-    if not targets:
-        print(f"mutation: skipped: no changed Python source lines since {described}")
-        return SKIP
-    changed = sum(len(lines) for lines in targets.values())
-    targets = {path: mutable_lines(root / path, lines) for path, lines in targets.items()}
-    pragmas = changed - sum(len(lines) for lines in targets.values())
-    if pragmas:  # visible to the reviewer: every excluded line is a claim that its mutants are equivalent
-        print(f"mutation: {pragmas} changed line{'s' if pragmas != 1 else ''} excluded by no-mutate")
-    plan = []
+
+    def first_party(path: str) -> bool:
+        return path.endswith(".py") and not any(path.startswith(prefix) for prefix in args.exclude)
+
+    def wanted(path: str) -> bool:
+        return first_party(path) and (root / path).is_file()
+
+    live = [c for c in changes.values() if not c.deleted and wanted(c.path)]
+    targets = {c.path: set(c.added) for c in live if c.added and not is_test_path(c.path)}
+    marked = {path: lines - mutable_lines(root / path, lines) for path, lines in targets.items()}
+    pragmas = sum(len(lines) for lines in marked.values())
+    # Visible to the reviewer in every outcome: each excluded line claims its mutants are equivalent.
+    print(f"mutation: {pragmas} changed line{'s' if pragmas != 1 else ''} excluded by no-mutate")
+    tests_only = not targets
+    if tests_only:  # weakened (even deleted) assertions change only tests: mutate what they import, whole
+        def test_source(change) -> str:  # a deleted test file is read from the base
+            if not change.deleted:
+                return (root / change.path).read_text(encoding="utf-8", errors="replace")
+            return git("show", f"{merge_base(base)}:{change.old_path or change.path}", check=False)
+
+        tests = [c for c in changes.values()
+                 if is_test_path(c.path) and (wanted(c.path) or c.deleted and first_party(c.path))]
+        modules = {m for c in tests for m in imported_modules(root, test_source(c))
+                   if wanted(m) and not is_test_path(m)}
+        if not modules:
+            print(f"mutation: skipped: no changed Python source lines since {described}")
+            return SKIP
+        print(f"mutation: only tests changed since {described}; mutating the modules they import: "
+              + ", ".join(sorted(modules)))
+        targets = {m: set(range(1, len(split_lines((root / m).read_text(encoding="utf-8"))) + 1)) for m in modules}
+        marked = {path: lines - mutable_lines(root / path, lines) for path, lines in targets.items()}
+        args.max_mutants = min(args.max_mutants, TESTS_ONLY_MAX)
+    targets = {path: lines - marked[path] for path, lines in targets.items()}
+    plan, hidden = [], 0
     for path, lines in sorted(targets.items()):
         try:
             tree = ast.parse((root / path).read_text(encoding="utf-8"))
@@ -239,6 +296,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"mutation: cannot parse {path}: {exc}")
             return 1
         plan += [(path, index) for index in range(len(sites(tree, lines)))]
+        hidden += len(sites(tree, marked[path]))
+    if not plan and hidden and not tests_only:
+        print(f"mutation: every changed line is marked no-mutate; mark only equivalent mutants (base {described})")
+        return 1
     if not plan:
         print(f"mutation: skipped: no mutable sites on the changed lines since {described}")
         return SKIP
@@ -287,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"survived: {s['path']}:{s['line']} [{s['mutation']}] {s['source'][:90]}")
     verdict = "ok" if score >= args.floor else "below floor"
     print(f"mutation: {killed}/{total} mutants killed = {score:.0f}% (floor {args.floor:.0f}%) {verdict}; "
-          f"base {described}; test command: {shlex.quote(args.test_cmd)}")
+          f"base {described}; test command: {args.test_cmd}")
     if args.json:
         Path(args.json).write_text(json.dumps({"score": score, "floor": args.floor, "killed": killed, "total": total,
                                                "survivors": survivors, "base": base,

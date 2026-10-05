@@ -19,9 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (
     base_ref,
     collect_changes,
+    empty_tree,
     git,
     glob_to_regex,
     load_simple_yaml,
+    merge_base,
     parse_unified_diff,
     repo_root,
     untracked_files,
@@ -100,11 +102,11 @@ def working_changes(base: str) -> dict:
 
 def measure(base: str, working_tree: bool, rules_path: Path | None = None):
     """Classify the change since `base`. Returns (result, warning or None)."""
-    merge_base = git("merge-base", base, "HEAD").strip()
-    rules = effective_rules(merge_base, rules_path or repo_root() / DEFAULT_RULES)
+    fork = merge_base(base)  # may be the empty tree, which holds no rules file
+    rules = effective_rules(None if fork == empty_tree() else fork, rules_path or repo_root() / DEFAULT_RULES)
     changes = working_changes(base) if working_tree else collect_changes(base, working_tree=False)
     warning = None
-    if not changes and merge_base == git("rev-parse", "HEAD").strip():
+    if not changes and fork == git("rev-parse", "HEAD").strip():
         warning = f"measuring nothing: HEAD is the base ({base})"
     return classify(changes, rules) | {"base": base}, warning
 

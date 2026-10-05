@@ -1,23 +1,47 @@
 #!/usr/bin/env bash
 # Layer 1 locally: the full gate, mutation floor included, before anything leaves.
 # Git passes "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref on stdin.
-# Each push is measured against what the remote already has; inherited overrides are
-# dropped so an environment variable cannot lower or narrow the gate. The gate checks the
-# working tree, so a ref other than HEAD is refused unless the remote already has its commits.
+# Each push is measured against what the remote already has (for a new branch: <remote>/HEAD,
+# else <remote>/main or master, else the empty tree); inherited overrides are dropped so an
+# environment variable cannot lower or narrow the gate. The gate checks the working tree, so
+# it must be HEAD and clean: a ref other than HEAD, or uncommitted changes to tracked files,
+# are refused unless the remote already has the commits.
 unset MUTATION_FLOOR MUTATION_MAX MUTATION_TEST_CMD TEST_CMD GITHUB_BASE_REF SLOPBRAKE_BASE
+remote=$1
 root=$(git rev-parse --show-toplevel) || exit 1
 head=$(git rev-parse -q --verify HEAD)
 status=0 seen=" "
 while read -r local_ref local_sha remote_ref remote_sha; do
   [[ "$local_sha" =~ ^0+$ ]] && continue  # deleting a remote ref: nothing to check
+  [ -z "$(git rev-list -n 1 "$local_sha" --not --remotes)" ] && continue  # nothing new leaves
   if [ "$(git rev-parse -q --verify "$local_sha^{commit}")" != "$head" ]; then  # ^{commit}: an annotated tag at HEAD is HEAD
-    [ -z "$(git rev-list -n 1 "$local_sha" --not --remotes)" ] && continue  # nothing new leaves
-    echo "pre-push: $local_ref is not checked out and the gate checks the working tree; check out $local_ref to push it" >&2
+    elsewhere=$(git worktree list --porcelain | awk -v ref="$local_ref" '/^worktree /{wt=substr($0, 10)} $0 == "branch " ref {print wt}')
+    if [ -n "$elsewhere" ]; then
+      echo "pre-push: $local_ref is checked out in another worktree and the gate checks this one; push it from $elsewhere" >&2
+    else
+      echo "pre-push: $local_ref is not checked out and the gate checks the working tree; check out $local_ref and push from a clean tree" >&2
+    fi
+    status=1
+    continue
+  fi
+  dirty=$(git -c core.quotePath=false status --porcelain --untracked-files=no)
+  if [ -n "$dirty" ]; then
+    {
+      echo "pre-push: uncommitted changes to tracked files; the gate would check them, not $local_ref:"
+      sed 's/^/  /' <<<"$dirty"
+      echo "pre-push: commit or stash them and push from a clean tree."
+    } >&2
     status=1
     continue
   fi
   base=
-  if [[ ! "$remote_sha" =~ ^0+$ ]] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then base=$remote_sha; fi
+  if [[ ! "$remote_sha" =~ ^0+$ ]] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then base=$remote_sha
+  elif [[ "$remote_sha" =~ ^0+$ ]]; then  # a new branch: what the remote already has
+    for ref in "$remote/HEAD" "$remote/main" "$remote/master"; do
+      base=$(git rev-parse -q --verify "refs/remotes/$ref^{commit}") && break
+    done
+    [ -n "$base" ] || base=$(git hash-object -t tree /dev/null)
+  fi
   [[ "$seen" == *" ${base:-auto} "* ]] && continue  # same base, same tree: the same check
   seen+="${base:-auto} "
   echo "pre-push: $local_ref -> $remote_ref (base ${base:-default})"

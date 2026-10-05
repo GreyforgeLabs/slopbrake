@@ -143,7 +143,7 @@ class BaseSelection(Scratch):
         self.assertIn("last-green", described)
 
     def test_no_base_is_described(self):
-        self.git_repo(branch="trunk")
+        self.git("init", "-q", "-b", "trunk")  # B2: only a repo with no commits has no base
         base, described = self.base()
         self.assertEqual(base, "None")
         self.assertIn("no base ref", described)
@@ -289,7 +289,7 @@ class PythonTemplate(Scratch):
         self.git_repo()
         template = (KIT / "python/scripts/check").read_text()
         for key, value in (("LINT_CMD", "true"), ("TYPES_CMD", "true"),
-                           ("TEST_CMD", "python3 -m unittest discover -s tests")):
+                           ("TEST_ARGS", "-m unittest discover -s tests")):  # B6: the template resolves python
             template = template.replace(f"@{key}@", value)
         shutil.copytree(GUARDS, self.root / "scripts/slopbrake")
         self.executable("scripts/check", template)
@@ -332,7 +332,7 @@ class Mutation(Scratch):
         self.assertIn("last-green", result.stdout)
 
     def test_no_base_is_a_loud_skip(self):
-        self.git_repo(branch="trunk")
+        self.git("init", "-q", "-b", "trunk")  # B2: only a repo with no commits has no base
         self.seed("def tax(x):\n    return x * 2\n", "tax(500)\n", "tax")
         result = self.floor()
         self.assertEqual(result.returncode, SKIP, result.stdout)
@@ -409,8 +409,8 @@ class Mutation(Scratch):
         self.git_repo()
         self.seed("CACHE = 128  # slopbrake: no-mutate\n", "pass\n", "CACHE")
         result = self.floor("--base", "main")
-        self.assertEqual(result.returncode, SKIP, result.stdout)
-        self.assertIn("no mutable sites", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout)  # B14: the pragma alone cannot clear the floor
+        self.assertIn("every changed line is marked no-mutate", result.stdout)
         self.assertIn("1 changed line excluded by no-mutate", result.stdout)
 
     def test_no_mutate_lines_are_reported_in_the_score(self):
@@ -521,7 +521,9 @@ class PrePush(Scratch):
                               f"refs/heads/new {self.head} refs/heads/new {zero}",
                               f"(delete) {zero} refs/heads/old {self.first}",
                               f"refs/heads/x {self.head} refs/heads/x {'1' * 40}")
+        empty = self.git("hash-object", "-t", "tree", os.devnull)  # B4: a new branch with no remote refs
         self.assertEqual(logged, [f"base={self.first} floor=unset test=unset gh=unset args=",
+                                  f"base={empty} floor=unset test=unset gh=unset args=",
                                   "base=unset floor=unset test=unset gh=unset args="])
 
     def test_inherited_overrides_are_dropped(self):
@@ -537,7 +539,7 @@ class PrePush(Scratch):
         self.git("branch", "old", "HEAD~1")
         result, logged = self.push(f"refs/heads/old {self.first} refs/heads/old {'0' * 40}")
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("check out refs/heads/old to push it", result.stderr)
+        self.assertIn("check out refs/heads/old and push from a clean tree", result.stderr)  # B4 wording
         self.assertEqual(logged, [])
 
     def test_a_ref_already_on_the_remote_needs_no_check(self):
@@ -552,7 +554,7 @@ class PrePush(Scratch):
 
 
 class PreCommit(Scratch):
-    def test_warns_when_staged_files_also_have_unstaged_changes(self):
+    def test_blocks_when_staged_files_also_have_unstaged_changes(self):  # B4: was a warning
         self.git_repo()
         self.executable("scripts/check", "#!/usr/bin/env bash\nexit 0\n")
         hook = self.root / ".githooks/pre-commit"
@@ -564,7 +566,7 @@ class PreCommit(Scratch):
         self.git("add", "calc.py")
         self.write("calc.py", "x = 2\n")
         result = sh(["git", *GIT_ID, "commit", "-q", "-m", "partial"], self.root)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("unstaged changes", result.stderr)
         self.assertIn("calc.py", result.stderr)
 
@@ -582,6 +584,7 @@ class StopHook(Scratch):
             if [ -e RED ] || [ -n "${{FAIL:-}}" ]; then echo "FAIL  tests"; exit 1; fi
             """)
         self.commit("gate")
+        self.git("update-ref", GREEN + "main", "HEAD")  # as init creates it; B2: without one main is unverified
 
     def stop(self, payload, env=None, **extra):
         env = dict(env or CLEAN_ENV, **{"CLAUDE_PROJECT_DIR": str(self.root), **extra})
@@ -656,6 +659,7 @@ class StopHook(Scratch):
         app.mkdir()
         shutil.move(str(self.root / "scripts"), str(app / "scripts"))
         self.commit("move the install into app/")
+        self.git("update-ref", GREEN + "main", "HEAD")
         wt = self.aux / "wt"
         self.git("worktree", "add", "-q", "-b", "feat", str(wt))
         (wt / "app/RED").write_text("red\n")

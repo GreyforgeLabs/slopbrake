@@ -4,6 +4,7 @@ Standard library only, so every check runs in CI without an install step.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -31,15 +32,48 @@ def _ref_exists(ref: str) -> bool:
                           capture_output=True, check=False).returncode == 0
 
 
+def _is_ancestor(ref: str, of: str = "HEAD") -> bool:
+    return subprocess.run(["git", "merge-base", "--is-ancestor", ref, of], capture_output=True, check=False).returncode == 0
+
+
+@functools.cache
+def empty_tree() -> str:
+    """The empty tree's id: a base before every commit, so every line is new."""
+    return git("hash-object", "-t", "tree", os.devnull).strip()
+
+
+def merge_base(base: str) -> str:
+    """merge-base(base, HEAD); the empty tree when base is the empty tree or shares no history with HEAD."""
+    found = "" if base == empty_tree() else git("merge-base", base, "HEAD", check=False).strip()
+    return found or empty_tree()
+
+
+def last_green_ref(branch: str) -> str:
+    """The branch's ratchet ref, "/" encoded as %2F so feature and feature/x never collide.
+    run-stages.sh and require-green.sh spell the same rule in bash."""
+    return "refs/slopbrake/last-green/" + branch.replace("/", "%2F")
+
+
+def _branch() -> str:
+    return git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
+
+
 def last_green() -> str | None:
-    """This branch's refs/slopbrake/last-green/<branch> (HEAD after its last full green run, recorded by
-    scripts/check), when it exists and is an ancestor of HEAD. Never on a detached HEAD."""
-    branch = git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
-    ref = "refs/slopbrake/last-green/" + branch
-    if branch and _ref_exists(ref) and subprocess.run(["git", "merge-base", "--is-ancestor", ref, "HEAD"],
-                                                      capture_output=True, check=False).returncode == 0:
-        return ref
-    return None
+    """This branch's ratchet (HEAD after its last full green run, recorded by scripts/check),
+    when it exists and is an ancestor of HEAD. Never on a detached HEAD."""
+    branch = _branch()
+    ref = last_green_ref(branch)
+    return ref if branch and _ref_exists(ref) and _is_ancestor(ref) else None
+
+
+def _since_last_green(branch: str) -> tuple[str, str]:
+    """Base for commits that no remote has: everything since the branch's last full green run."""
+    ref = last_green_ref(branch)
+    if branch and _ref_exists(ref):
+        if _is_ancestor(ref):
+            return ref, f"HEAD is on {branch}"
+        return merge_base(ref), "ratchet not an ancestor"  # amended, rebased or reset past it
+    return empty_tree(), "no ratchet"
 
 
 def _select_base(explicit: str | None) -> tuple[str | None, str]:
@@ -49,29 +83,35 @@ def _select_base(explicit: str | None) -> tuple[str | None, str]:
     base, how = next(((ref, how) for ref, how in given if ref), (None, ""))
     head = git("rev-parse", "-q", "--verify", "HEAD", check=False).strip()
     if base:
-        # An explicit base at HEAD itself means "uncommitted work only"; keep it.
-        if git("rev-parse", "-q", "--verify", base + "^{commit}", check=False).strip() == head:
+        # An explicit base at HEAD itself means "uncommitted work only"; keep it. So does the empty tree.
+        if base == empty_tree() or git("rev-parse", "-q", "--verify", base + "^{commit}", check=False).strip() == head:
             return base, how
     else:
         upstream = git("rev-parse", "-q", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).strip()
         auto = ([upstream] if upstream else []) + ["origin/HEAD", "main", "master", "origin/main", "origin/master"]
         base = next((ref for ref in auto if _ref_exists(ref)), None)
         how = "upstream" if base and base == upstream else "default"
-        if base is None:
-            green = last_green()
-            return (green, "no base ref") if green else (None, "")
-    # HEAD is on the base branch: the base shows nothing committed, so measure since the last green run.
+        if base is None:  # no base ref: this branch is the only line of history
+            return _since_last_green(_branch()) if head else (None, "")
+        # The base is HEAD's own local branch (no remote has its commits): since the last green run, never
+        # "nothing committed". A remote-tracking base at HEAD already has (and gated) every commit.
+        branch = _branch()
+        if head and branch and git("rev-parse", "--symbolic-full-name", base, check=False).strip() == "refs/heads/" + branch:
+            return _since_last_green(branch)
+    # HEAD is on the base: the base shows nothing committed, so measure since the last green run.
     if head and git("merge-base", base, "HEAD", check=False).strip() == head and (green := last_green()):
         return green, f"HEAD is on {base}"
     return base, how
 
 
 def base_ref(explicit: str | None = None) -> str | None:
-    """The ref a change is measured against.
+    """The ref (or tree) a change is measured against.
 
     --base flag > GITHUB_BASE_REF (as origin/<x>) > SLOPBRAKE_BASE > the branch's upstream > origin/HEAD > main >
-    master > origin/main > origin/master. When HEAD is on that base, or none exists, this branch's last
-    green run instead (see last_green).
+    master > origin/main > origin/master. When HEAD is on that base, this branch's last green run instead
+    (see last_green). On the base branch itself with no remote holding its commits, or with no base ref at
+    all: the ratchet; merge-base(ratchet, HEAD) when it is no longer an ancestor; the empty tree when there
+    is none, so commits are never skipped. Callers needing a merge-base use merge_base(): it may be a tree.
     """
     return _select_base(explicit)[0]
 
@@ -80,10 +120,19 @@ def describe_base(explicit: str | None = None) -> str:
     """base_ref for humans: which ref, at which commit, and why."""
     base, how = _select_base(explicit)
     if base is None:
-        return "no base ref (no upstream, origin/HEAD, main or master; set SLOPBRAKE_BASE)"
+        return "no base ref (no commits yet)"
+    branch = _branch()
+    if how == "no ratchet":
+        return f"the empty tree (no last-green ratchet for {branch or 'this detached HEAD'} yet, so every line is new)"
     sha = git("rev-parse", "--short", base + "^{commit}", check=False).strip() or "?"
+    if how == "ratchet not an ancestor":
+        sha = "the empty tree" if base == empty_tree() else sha  # no shared history left (an amended root)
+        return (f"{sha}, the merge-base with last-green ({last_green_ref(branch)} is not an ancestor of HEAD: "
+                "amended, rebased or reset)")
     if base.startswith("refs/slopbrake/last-green/"):
-        return f"last-green {sha} (last full green run on {base.rsplit('last-green/', 1)[1]}; {how})"
+        return f"last-green {sha} (last full green run on {branch}; {how})"
+    if base == empty_tree():
+        return f"the empty tree (from {how})"
     return f"{base} {sha}" + (f" (from {how})" if how not in ("", "default") else "")
 
 
@@ -170,26 +219,34 @@ def untracked_files() -> list[str]:
     return [p for p in out.split("\0") if p]
 
 
+def python_files(root: Path, skip: set[str]) -> list[Path]:
+    """Sorted *.py files under root. Never enters a `skip` name, .claude/ (kit state and Claude Code's
+    worktrees) or a nested checkout: a directory holding a .git file (a linked worktree, a submodule)."""
+    found = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip and d != ".claude" and not os.path.isfile(os.path.join(dirpath, d, ".git"))]
+        found += [Path(dirpath, f) for f in files if f.endswith(".py")]
+    return sorted(found)
+
+
 def collect_changes(base: str | None, working_tree: bool) -> dict[str, FileChange]:
     """Changes since the merge-base with `base`.
 
     working_tree=False: committed changes only (merge-base...HEAD), the PR view.
     working_tree=True: also uncommitted and untracked files, the local-gate view.
-    No common history (an orphan branch, no commits yet): everything counts as new.
+    No common history (an orphan branch, no commits yet) or the empty tree as base: everything counts as new.
     """
     if base is None:
         return {}
-    if not _ref_exists(base):
+    if base != empty_tree() and not _ref_exists(base):
         raise SystemExit(f"base ref {base!r} does not exist (fetch it, or set SLOPBRAKE_BASE)")
     has_head = bool(git("rev-parse", "-q", "--verify", "HEAD", check=False).strip())
     if not has_head and not working_tree:
         return {}
-    merge_base = git("merge-base", base, "HEAD", check=False).strip() if has_head else ""
-    if not merge_base:
-        merge_base = git("hash-object", "-t", "tree", os.devnull).strip()  # the empty tree
+    since = merge_base(base) if has_head else empty_tree()
     # --text/--no-textconv: `-diff` attributes and binary-looking files must not hide added lines.
     args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--unified=0", "--find-renames",
-            "--src-prefix=a/", "--dst-prefix=b/", merge_base]
+            "--src-prefix=a/", "--dst-prefix=b/", since]
     if not working_tree:
         args.append("HEAD")
     changes = parse_unified_diff(git(*args, cwd=repo_root()))
