@@ -323,7 +323,7 @@ class Mutation(Scratch):
         result = self.run_floor("".join(f"        self.assertEqual(discount({a}), {b})\n" for a, b in
                                         (("150, True", 140), ("100, True", 90), ("99, True", 99), ("150, False", 150))))
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("7/7 mutants killed", result.stdout)
+        self.assertIn("8/8 mutants killed", result.stdout)
 
     def test_working_tree_is_left_untouched(self):
         self.run_floor("        self.assertIsNotNone(discount(150, True))\n")
@@ -343,7 +343,7 @@ class Mutation(Scratch):
     def test_nothing_changed_is_skipped(self):
         self.git_repo()
         result = script("mutation_py.py", "--base", "main", cwd=self.root)
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 78)
         self.assertIn("skipped", result.stdout)
 
 

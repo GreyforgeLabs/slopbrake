@@ -13,7 +13,10 @@ from pathlib import Path
 
 
 def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
-    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    # quotePath off: non-ASCII names come out verbatim, not as "\303\251" octal escapes.
+    # errors="replace": `diff --text` prints binary files' raw bytes.
+    result = subprocess.run(["git", "-c", "core.quotePath=false", *args], cwd=cwd, capture_output=True,
+                            encoding="utf-8", errors="replace", check=False)
     if check and result.returncode != 0:
         raise SystemExit(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout
@@ -28,17 +31,60 @@ def _ref_exists(ref: str) -> bool:
                           capture_output=True, check=False).returncode == 0
 
 
-def base_ref(explicit: str | None = None) -> str | None:
-    """The ref a change is measured against: flag, env, CI base, then main/master."""
-    for ref in (explicit, os.environ.get("SLOPBRAKE_BASE")):
-        if ref:
-            return ref
-    if os.environ.get("GITHUB_BASE_REF"):
-        return "origin/" + os.environ["GITHUB_BASE_REF"]
-    for ref in ("origin/HEAD", "main", "master", "origin/main", "origin/master"):
-        if _ref_exists(ref):
-            return ref
+def last_green() -> str | None:
+    """This branch's refs/slopbrake/last-green/<branch> (HEAD after its last full green run, recorded by
+    scripts/check), when it exists and is an ancestor of HEAD. Never on a detached HEAD."""
+    branch = git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
+    ref = "refs/slopbrake/last-green/" + branch
+    if branch and _ref_exists(ref) and subprocess.run(["git", "merge-base", "--is-ancestor", ref, "HEAD"],
+                                                      capture_output=True, check=False).returncode == 0:
+        return ref
     return None
+
+
+def _select_base(explicit: str | None) -> tuple[str | None, str]:
+    """(ref, how it was chosen). See base_ref."""
+    given = [(explicit, "--base"), (os.environ.get("GITHUB_BASE_REF") and "origin/" + os.environ["GITHUB_BASE_REF"],
+                                    "GITHUB_BASE_REF"), (os.environ.get("SLOPBRAKE_BASE"), "SLOPBRAKE_BASE")]
+    base, how = next(((ref, how) for ref, how in given if ref), (None, ""))
+    head = git("rev-parse", "-q", "--verify", "HEAD", check=False).strip()
+    if base:
+        # An explicit base at HEAD itself means "uncommitted work only"; keep it.
+        if git("rev-parse", "-q", "--verify", base + "^{commit}", check=False).strip() == head:
+            return base, how
+    else:
+        upstream = git("rev-parse", "-q", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", check=False).strip()
+        auto = ([upstream] if upstream else []) + ["origin/HEAD", "main", "master", "origin/main", "origin/master"]
+        base = next((ref for ref in auto if _ref_exists(ref)), None)
+        how = "upstream" if base and base == upstream else "default"
+        if base is None:
+            green = last_green()
+            return (green, "no base ref") if green else (None, "")
+    # HEAD is on the base branch: the base shows nothing committed, so measure since the last green run.
+    if head and git("merge-base", base, "HEAD", check=False).strip() == head and (green := last_green()):
+        return green, f"HEAD is on {base}"
+    return base, how
+
+
+def base_ref(explicit: str | None = None) -> str | None:
+    """The ref a change is measured against.
+
+    --base flag > GITHUB_BASE_REF (as origin/<x>) > SLOPBRAKE_BASE > the branch's upstream > origin/HEAD > main >
+    master > origin/main > origin/master. When HEAD is on that base, or none exists, this branch's last
+    green run instead (see last_green).
+    """
+    return _select_base(explicit)[0]
+
+
+def describe_base(explicit: str | None = None) -> str:
+    """base_ref for humans: which ref, at which commit, and why."""
+    base, how = _select_base(explicit)
+    if base is None:
+        return "no base ref (no upstream, origin/HEAD, main or master; set SLOPBRAKE_BASE)"
+    sha = git("rev-parse", "--short", base + "^{commit}", check=False).strip() or "?"
+    if base.startswith("refs/slopbrake/last-green/"):
+        return f"last-green {sha} (last full green run on {base.rsplit('last-green/', 1)[1]}; {how})"
+    return f"{base} {sha}" + (f" (from {how})" if how not in ("", "default") else "")
 
 
 @dataclass
@@ -49,21 +95,57 @@ class FileChange:
     added: dict[int, str] = field(default_factory=dict)  # new line number -> text
 
 
+_PATH = r'("(?:[^"\\]|\\.)*"|[ab]/.*?)'
+_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
+
+
+def unquote_path(text: str) -> str:
+    """Git's C-style quoted path ("a/caf\\303\\251.py") back to the name, without the a/ or b/ prefix."""
+    if text.startswith('"'):
+        raw, i, body = bytearray(), 0, text[1:-1]
+        while i < len(body):
+            char = body[i]
+            if char != "\\":
+                raw += char.encode()
+                i += 1
+            elif body[i + 1:i + 4].isdigit() and len(body[i + 1:i + 4]) == 3:
+                raw.append(int(body[i + 1:i + 4], 8))
+                i += 4
+            else:
+                raw.append(_ESCAPES.get(body[i + 1], ord(body[i + 1])))
+                i += 2
+        text = raw.decode("utf-8", "surrogateescape")
+    return text[2:] if text[:2] in ("a/", "b/") else text
+
+
 def parse_unified_diff(text: str) -> dict[str, FileChange]:
     """Parse `git diff --unified=0` output into per-file added lines."""
     changes: dict[str, FileChange] = {}
     current: FileChange | None = None
     new_line = 0
     in_hunk = False  # `+++ b/path` is a header only before the first hunk; inside one it is content
-    for line in text.splitlines():
+    # Only "\n" ends a diff line: str.splitlines() also splits on \f, \v, \x1c.. inside content.
+    for line in text.split("\n"):
+        line = line.removesuffix("\r")
         if line.startswith("diff --git "):
-            match = re.match(r'diff --git "?a/(.+?)"? "?b/(.+?)"?$', line)
-            old, new = (match.group(1), match.group(2)) if match else (None, None)
+            rest = line[len("diff --git "):]
+            half = (len(rest) - 1) // 2
+            if rest[:2] == "a/" and rest[half:half + 3] == " b/" and rest[2:half] == rest[half + 3:]:
+                old = new = rest[2:half]  # unquoted and unrenamed: the halves match, even with " b/" inside
+            else:
+                match = re.match(_PATH + " " + _PATH.replace(".*?", ".*") + "$", rest)
+                old, new = (unquote_path(match.group(1)), unquote_path(match.group(2))) if match else (None, None)
             current = FileChange(path=new or "", old_path=old)
             changes[current.path] = current
             in_hunk = False
         elif current is None:
             continue
+        elif line.startswith("+++ ") and not in_hunk and line[4:] != "/dev/null":
+            path = unquote_path(line[4:].removesuffix("\t"))  # unambiguous, where the header is not
+            if path != current.path:
+                changes.pop(current.path, None)
+                current.path = path
+                changes[path] = current
         elif line.startswith("deleted file mode") and not in_hunk:
             current.deleted = True
         elif line.startswith("@@"):
@@ -76,8 +158,15 @@ def parse_unified_diff(text: str) -> dict[str, FileChange]:
     return changes
 
 
+def split_lines(text: str) -> list[str]:
+    """Lines as git and ast number them: only "\n" ends a line (splitlines() also splits on \f, \v, \x1c..)."""
+    lines = text.split("\n")
+    return lines[:-1] if lines[-1] == "" else lines
+
+
 def untracked_files() -> list[str]:
-    out = git("ls-files", "--others", "--exclude-standard", "-z")
+    """Untracked, not-ignored files, as paths from the repo root (whatever the cwd)."""
+    out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=repo_root())
     return [p for p in out.split("\0") if p]
 
 
@@ -86,20 +175,29 @@ def collect_changes(base: str | None, working_tree: bool) -> dict[str, FileChang
 
     working_tree=False: committed changes only (merge-base...HEAD), the PR view.
     working_tree=True: also uncommitted and untracked files, the local-gate view.
+    No common history (an orphan branch, no commits yet): everything counts as new.
     """
     if base is None:
         return {}
-    merge_base = git("merge-base", base, "HEAD").strip()
-    args = ["diff", "--no-color", "--no-ext-diff", "--unified=0", "--find-renames",
+    if not _ref_exists(base):
+        raise SystemExit(f"base ref {base!r} does not exist (fetch it, or set SLOPBRAKE_BASE)")
+    has_head = bool(git("rev-parse", "-q", "--verify", "HEAD", check=False).strip())
+    if not has_head and not working_tree:
+        return {}
+    merge_base = git("merge-base", base, "HEAD", check=False).strip() if has_head else ""
+    if not merge_base:
+        merge_base = git("hash-object", "-t", "tree", os.devnull).strip()  # the empty tree
+    # --text/--no-textconv: `-diff` attributes and binary-looking files must not hide added lines.
+    args = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--text", "--unified=0", "--find-renames",
             "--src-prefix=a/", "--dst-prefix=b/", merge_base]
     if not working_tree:
         args.append("HEAD")
-    changes = parse_unified_diff(git(*args))
+    changes = parse_unified_diff(git(*args, cwd=repo_root()))
     if working_tree:
         root = repo_root()
         for path in untracked_files():
             try:
-                lines = (root / path).read_text(encoding="utf-8").splitlines()
+                lines = split_lines((root / path).read_text(encoding="utf-8"))
             except (UnicodeDecodeError, OSError):
                 lines = []
             changes[path] = FileChange(path=path, added={i + 1: t for i, t in enumerate(lines)})
