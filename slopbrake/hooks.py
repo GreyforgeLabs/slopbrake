@@ -5,7 +5,8 @@ project hooks only from the session's starting directory, so these run from
 The Stop gate runs a repo's own scripts only when the operator trusts the repo
 (${XDG_CONFIG_HOME:-~/.config}/slopbrake/trusted.json; `slopbrake init` adds its repo).
 
-  slopbrake-hook pre-tool-use|post-tool-use|stop      hook JSON on stdin (alias: slopbrake hook)
+  slopbrake-hook [--harness claude|codex|opencode|grok] pre-tool-use|post-tool-use|stop
+                                                      hook JSON on stdin (alias: slopbrake hook)
   slopbrake user-hooks install|uninstall|status [--settings PATH]
   slopbrake user-hooks trust|untrust REPO
 """
@@ -34,7 +35,14 @@ KIT_GUARD = Path(__file__).resolve().parent / "kit/common/.claude/hooks/git_guar
 PROGRAM = "slopbrake-hook"
 LEGACY = "slopbrake hook"  # 0.2.0 entries; install replaces them
 EVENTS = ("pre-tool-use", "post-tool-use", "stop")
+HARNESSES = ("claude", "codex", "opencode", "grok")
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+PATCH_TOOLS = ("apply_patch",)  # Codex (text in tool_input.command) and OpenCode (patchText)
+PATCH_TARGET = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.MULTILINE)
+GROK_KEYS = {"sessionId": "session_id", "toolName": "tool_name", "toolInput": "tool_input", "toolUseId": "tool_use_id",
+             "hookEventName": "hook_event_name", "stopHookActive": "stop_hook_active",
+             "transcriptPath": "transcript_path"}
+GROK_TOOLS = {"run_terminal_command": "Bash", "search_replace": "Edit"}
 USER_ENTRIES = {
     "PreToolUse": {"matcher": "Bash", "hooks": [{"type": "command", "command": f"{PROGRAM} pre-tool-use"}]},
     "PostToolUse": {"matcher": "|".join((*EDIT_TOOLS, "Bash")),
@@ -356,11 +364,19 @@ def recall(payload: dict, command: str) -> dict | None:
     return update_json(state_path(payload.get("session_id")), change)
 
 
+def patch_targets(payload: dict) -> list[str]:
+    """The files an apply_patch call names (added, updated, deleted, or moved to)."""
+    args = payload.get("tool_input") or {}
+    text = args.get("command") or args.get("patchText") or payload.get("patchText")
+    return PATCH_TARGET.findall(text) if isinstance(text, str) else []
+
+
 def post_tool_use(payload: dict) -> int:
     """Record the managed repos this tool call changed: edit targets directly, and for Bash every repo
     whose snapshot differs from PreToolUse's (or that had none, such as a fresh clone). A Bash call is judged
     from the cwd PreToolUse saw: after a `cd` the payload's cwd is already inside the repo it moved to, which
-    PreToolUse may never have snapshotted. Without a PreToolUse snapshot nothing is recorded."""
+    PreToolUse may never have snapshotted. Without a PreToolUse snapshot nothing is recorded. An apply_patch
+    is a direct edit of every file it names."""
     cwd = Path(payload.get("cwd") or os.getcwd())
     args = payload.get("tool_input") or {}
     repos = set()
@@ -368,6 +384,8 @@ def post_tool_use(payload: dict) -> int:
         target = args.get("file_path") or args.get("notebook_path")
         root = managed_root(cwd / Path(target).expanduser()) if target else None
         repos = {str(root)} if root else set()
+    elif payload.get("tool_name") in PATCH_TOOLS:
+        repos = {str(root) for target in patch_targets(payload) if (root := managed_root(cwd / Path(target).expanduser()))}
     elif payload.get("tool_name") == "Bash":
         command = str(args.get("command", ""))
         taken = recall(payload, command) if state_path(payload.get("session_id")).is_file() else None
@@ -394,10 +412,12 @@ def run_gate(hook: Path, repo: Path, text: str, left: float) -> tuple[int, str]:
     return proc.returncode, err
 
 
-def stop(payload: dict, text: str) -> int:
+def stop(payload: dict, text: str, harness: str = "claude") -> int:
     """Block (exit 2) when a trusted, changed repo's gate is red. A gate that cannot run, times out or
-    misses the budget is reported without blocking (exit 1), so it never traps the session."""
-    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    misses the budget is reported without blocking (exit 1), so it never traps the session. Nothing goes to
+    stdout (Codex wants JSON or nothing there). CLAUDE_PROJECT_DIR means the project's own Stop hook ran only
+    under Claude Code: other harnesses set it (grok, gemini-cli) or inherit it from a Claude Code shell."""
+    project = os.environ.get("CLAUDE_PROJECT_DIR") if harness == "claude" else None
     project_root = Path(project).expanduser().resolve() if project else None
     failures, problems, deadline = [], [], time.monotonic() + STOP_BUDGET  # Claude Code kills the hook at 600 s
     for repo in map(Path, touched(payload.get("session_id"))):
@@ -445,16 +465,40 @@ def pre_tool_use(payload: dict, guard: Path = KIT_GUARD) -> int:
     return 0
 
 
-def run(event: str, text: str) -> int:
+def normalize(payload: dict, harness: str) -> dict:
+    """The payload in Claude Code's shape. grok sends camelCase keys (and grok's own event and tool names);
+    Codex and OpenCode's adapter send Claude's keys. A tool_input.workdir (Codex exec, OpenCode bash) is
+    where the call runs, so it becomes the cwd."""
+    payload = dict(payload)
+    if harness == "grok":
+        for camel, snake in GROK_KEYS.items():
+            if camel in payload and snake not in payload:  # grok's hook_event_name already holds Claude's name
+                value = payload[camel]
+                payload[snake] = "".join(map(str.capitalize, value.split("_"))) \
+                    if snake == "hook_event_name" and isinstance(value, str) else value
+        payload["tool_name"] = GROK_TOOLS.get(payload.get("tool_name"), payload.get("tool_name"))
+    args = payload.get("tool_input")
+    if isinstance(args, dict) and isinstance(args.get("workdir"), str) and args["workdir"]:
+        base = Path(payload.get("cwd") or os.getcwd())
+        payload["cwd"] = os.path.normpath(base / os.path.expanduser(args["workdir"]))
+    return payload
+
+
+def run(event: str, text: str, harness: str = "claude") -> int:
     """Exit code for one hook event. Errors never break sessions outside managed repos."""
     payload = None
     try:
         payload = json.loads(text)
         if not isinstance(payload, dict):
             return 0
+        payload = normalize(payload, harness)
         if event == "pre-tool-use":
             return pre_tool_use(payload)
-        return post_tool_use(payload) if event == "post-tool-use" else stop(payload, text)
+        if event == "post-tool-use":
+            return post_tool_use(payload)
+        if harness == "grok" and payload.get("reason") not in (None, "end_turn"):
+            return 0  # grok's extra observe-only Stop at session end: nothing can act on a gate there
+        return stop(payload, json.dumps(payload), harness)
     except Exception as exc:  # noqa: BLE001 - reported only where slopbrake is in charge
         try:
             managed = bool(isinstance(payload, dict) and payload.get("cwd") and managed_toplevel(payload["cwd"]))
@@ -467,12 +511,20 @@ def run(event: str, text: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """The `slopbrake-hook <event>` console script (and `slopbrake hook`). Never exits 2 on bad usage."""
-    argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 1 or argv[0] not in EVENTS:
-        print(f"usage: {PROGRAM} {'|'.join(EVENTS)}  (Claude Code hook JSON on stdin)", file=sys.stderr)
+    """The `slopbrake-hook [--harness H] <event>` console script (and `slopbrake hook`). Never exits 2 on bad
+    usage."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    harness = "claude"
+    if argv and argv[0].startswith("--harness="):
+        harness = argv.pop(0).partition("=")[2]
+    elif argv and argv[0] == "--harness" and len(argv) > 1:
+        harness = argv[1]
+        del argv[:2]
+    if len(argv) != 1 or argv[0] not in EVENTS or harness not in HARNESSES:
+        print(f"usage: {PROGRAM} [--harness {'|'.join(HARNESSES)}] {'|'.join(EVENTS)}  (hook JSON on stdin)",
+              file=sys.stderr)
         return 1
-    return run(argv[0], sys.stdin.buffer.read().decode("utf-8", errors="replace"))
+    return run(argv[0], sys.stdin.buffer.read().decode("utf-8", errors="replace"), harness)
 
 
 # ── user settings ────────────────────────────────────────────────────────────
