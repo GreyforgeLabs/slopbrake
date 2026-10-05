@@ -26,6 +26,7 @@ from door_classify import (
     effective_rules,
     measure,
     staged_changes,
+    tracked_changes,
     working_changes,
 )
 
@@ -43,9 +44,9 @@ PLAN_STEP = re.compile(r"\b(?:revert|restor|back ?up|backed up|down[ -]?migratio
                        r"reinstat|revers|rebuild|roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write|"
                        r"roll[ -]back|undeploy|make\s+rollback)",
                        re.IGNORECASE)
-# "roll back" / "make rollback" used as a step, not as a "Roll back:" label.
-STEP_VERB = re.compile(r"\b(?:make\s+rollback|roll[ -]back)\b(?!\s*(?:plan|strategy)?\s*(?::|\*\*))", re.IGNORECASE)
-NEGATOR = re.compile(r"\b(?:no|not|none|nothing|never|without|cannot|impossible|irreversible|unable|"
+# "roll back" / "make rollback" / "undeploy" used as a step, not as a "Roll back:" label.
+STEP_VERB = re.compile(r"\b(?:make\s+rollback|roll[ -]back|undeploy)\b(?!\s*(?:plan|strategy)?\s*(?::|\*\*))", re.IGNORECASE)
+NEGATOR = re.compile(r"\b(?:no|not|none|nothing|nobody|never|without|cannot|impossible|irreversible|unable|"
                      r"(?:can|won|don|doesn|isn|aren|wasn|didn)['\u2019]t)\b|\bn/a\b", re.IGNORECASE)
 CLAUSE = re.compile(r"[;,!?()]|\.(?=\s|$)")
 
@@ -185,8 +186,9 @@ def branch_name() -> str | None:
 def no_pr_context(quiet: bool = False) -> int:
     """C8: block a one-way change about to be committed on the default branch.
 
-    What is staged is what the commit adds, so a non-empty index (or a hook's GIT_INDEX_FILE) is judged;
-    otherwise the uncommitted working tree. quiet: print only a block or an error.
+    A hook's GIT_INDEX_FILE is exactly what the commit adds. scripts/check unsets it, so a non-empty index is
+    judged together with tracked edits on disk (`commit -a` and `commit -- <path>` add them); an empty index
+    means the whole uncommitted working tree. quiet: print only a block or an error.
     """
     say = (lambda _message: None) if quiet else print
     branch = branch_name()
@@ -196,24 +198,30 @@ def no_pr_context(quiet: bool = False) -> int:
     if branch != default_branch():
         say(f"pr: skipped: no PR context on {branch}")
         return SKIP
-    changes, what = staged_changes(), "staged"
-    if not changes and not os.environ.get("GIT_INDEX_FILE"):
-        changes, what = working_changes("HEAD"), "uncommitted"
-    if not changes:
-        say(f"pr: skipped: no PR context and nothing uncommitted on {branch}")
+    views, what, empty = [staged_changes()], "staged change", "nothing staged"
+    if not os.environ.get("GIT_INDEX_FILE"):  # a hook's own index is exactly the commit
+        if views[0]:
+            views.append(tracked_changes())
+            what = "staged change (with tracked edits on disk)"
+        else:
+            views, what, empty = [working_changes("HEAD")], "uncommitted change", "nothing uncommitted"
+    if not any(views):
+        say(f"pr: skipped: no PR context and {empty} on {branch}")
         return SKIP
     try:
-        result = classify(changes, effective_rules("HEAD", repo_root() / DEFAULT_RULES))
+        rules = effective_rules("HEAD", repo_root() / DEFAULT_RULES)
+        results = [classify(view, rules) for view in views]
     except RulesError as exc:
         print(f"pr: door rules: {exc}")
         return 1
-    if result["door"] == "one-way":
+    reasons = list(dict.fromkeys(r for result in results if result["door"] == "one-way" for r in result["reasons"]))
+    if reasons:
         print(f"pr: one-way door on {branch}: commit it on a feature branch for operator review "
               "(a human may override with git commit --no-verify)")
-        for reason in result["reasons"]:
+        for reason in reasons:
             print(f"  - {reason}")
         return 1
-    say(f"pr: skipped: no PR context; the {what} change on {branch} is two-way")
+    say(f"pr: skipped: no PR context; the {what} on {branch} is two-way")
     return SKIP
 
 

@@ -87,11 +87,12 @@ content_patterns:
   - "\\bdrop_all\\("
   - "\\bop\\.drop_\\w+\\("
   - "sendEmail\\("
-  # the gate's own scripts and tool tables
+  # the gate's own scripts and tool tables. Patterns cannot be scoped to a path, so any source line starting
+  # with a "test"/"lint"/"check"... key (a dict, an i18n file) is one-way too; deleting such a line adds none.
   - "^\\s*\"(lint|test|typecheck|smoke|check)\"\\s*:"
   - "^\\[tool\\.(ruff|pytest|mypy|pyright|coverage)"
   # deleting files or directories at runtime (user data paths); removing only build outputs is not
-  - "\\brm(?!(?:\\s+(?:-[\\w-]*|(?:\\./)?(?:dist|build|node_modules|coverage|\\.cache|tmp|out|\\.next)/?))+\\s*(?:[;|&\"'`)]|$))(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
+  - "\\brm(?!(?:\\s+-[\\w-]*)*(?:\\s+(?:\\./)?(?:dist|build|node_modules|coverage|\\.cache|tmp|out|\\.next)/?)+(?:\\s*(?:[;|&)]|$)|[\"'`]|\\s+#))(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
   - "[\"']rm[\"']\\s*,\\s*[\"']-[a-zA-Z]*[rRf]"
   - "\\brmtree\\("
   - "os\\.(remove|unlink|rmdir)\\("

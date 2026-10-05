@@ -1,10 +1,12 @@
 """Round 2 door decisions: B10 (rules, C8 with a PR body), B16 (default branch), B17 (G3 steps, auth globs),
 and C8 judging the staged commit rather than the working tree."""
 import json
+import shutil
 import sys
 import unittest
 
 from test_doors import (
+    GIT_ID,
     GUARDS,
     ON_MAIN,
     RULES,
@@ -91,9 +93,39 @@ class B10Rules(R2Scratch):
 
     def test_removing_anything_else_stays_one_way(self):
         for line in ("rm -rf dist ~/data", "rm -rf $OUT", "rm -rf dist && rm -rf /srv", "rm -rf /tmp/x",
-                     "rm -rf dist/*", "rm -rf build-cache", "rm -rf distribution", "rm -rf ../dist"):
+                     "rm -rf dist/*", "rm -rf build-cache", "rm -rf distribution", "rm -rf ../dist",
+                     'rm -rf "$DATA_DIR"', "rm -rf '/var/lib/app'", 'rm -rf "/data"', 'rm -rf "$HOME"/uploads',
+                     'rm -rf -- "$1"', "rm -rf `cat dirs`", 'os.system("rm -rf " + user_dir)',
+                     'rm -rf dist "$DATA_DIR"', "os.system('rm -rf dist ' + user_dir)"):
             with self.subTest(line=line):
                 self.assertEqual(self.door("Makefile", line), "one-way")
+
+
+    def test_a_trailing_comment_keeps_the_build_output_exemption(self):
+        for line in ("rm -rf dist # clean", "rm -rf build node_modules  # fresh install"):
+            with self.subTest(line=line):
+                self.assertEqual(self.door("Makefile", line), "two-way")
+
+    def test_a_file_renamed_out_of_docs_is_classified(self):
+        self.git_repo()
+        self.write("docs/drafts/0003_drop.sql", "DROP TABLE users;\n")
+        self.commit("draft")
+        (self.root / "db/migrations").mkdir(parents=True)
+        self.git("mv", "docs/drafts/0003_drop.sql", "db/migrations/0003_drop.sql")
+        result = self.pr_stage()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("db/migrations/0003_drop.sql", result.stdout)
+        self.commit("move")
+        result = script("door_classify.py", "--json", "--base", "HEAD~1", cwd=self.root, env=self.env())
+        self.assertEqual(json.loads(result.stdout)["door"], "one-way", result.stdout)
+
+    def test_a_file_renamed_into_docs_still_counts_its_old_path(self):
+        self.git_repo()
+        self.write(".env.production", "KEY=1\n")
+        self.commit("env")
+        (self.root / "docs").mkdir()
+        self.git("mv", ".env.production", "docs/env.txt")
+        self.assertEqual(self.pr_stage().returncode, 1)
 
 
 class C8WithABody(R2Scratch):
@@ -161,6 +193,65 @@ class C8JudgesTheCommit(R2Scratch):
         self.assertEqual(self.pr_stage().returncode, 1)
 
 
+    def test_an_unstaged_tracked_one_way_edit_blocks_while_something_is_staged(self):
+        # run-stages.sh unsets GIT_INDEX_FILE, so `commit -a` / `commit -- <path>` content may still be unstaged
+        self.git_repo()
+        self.write("db/schema.sql", "CREATE TABLE users (id int);\n")
+        self.commit("schema")
+        self.write("README.md", "# demo, fixed\n")
+        self.git("add", "README.md")
+        self.write("db/schema.sql", "CREATE TABLE users (id int);\nDROP TABLE users;\n")
+        result = self.pr_stage()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("db/schema.sql", result.stdout)
+
+    def test_a_hook_index_with_nothing_staged_says_so(self):
+        self.git_repo()
+        index = self.git("rev-parse", "--git-path", "index")
+        result = self.pr_stage(GIT_INDEX_FILE=str(self.root / index))
+        self.assertEqual(result.returncode, 78, result.stdout)
+        self.assertIn("nothing staged", result.stdout)
+
+
+class C8ThroughTheRealHook(R2Scratch):
+    """The pre-commit hook runs scripts/check, whose runner unsets GIT_INDEX_FILE."""
+
+    def setUp(self):
+        super().setUp()
+        self.git_repo()
+        shutil.copytree(GUARDS, self.root / "scripts/slopbrake", ignore=shutil.ignore_patterns("__pycache__"))
+        self.write("scripts/check", """\
+            #!/usr/bin/env bash
+            cd "$(dirname "$0")/.."
+            source scripts/slopbrake/run-stages.sh
+            STAGES=(pr)
+            stage_pr() { python3 scripts/slopbrake/pr_body_check.py; }
+            run_stages "$@"
+            """)
+        self.write(".githooks/pre-commit", "#!/usr/bin/env bash\nexec scripts/check --fast\n")
+        for rel in ("scripts/check", ".githooks/pre-commit"):
+            (self.root / rel).chmod(0o755)
+        self.git("config", "core.hooksPath", ".githooks")
+        self.write("db/schema.sql", "CREATE TABLE users (id int);\n")
+        self.commit("gate and schema")
+        self.write("README.md", "# demo, fixed\n")
+        self.git("add", "README.md")
+        self.write("db/schema.sql", "CREATE TABLE users (id int);\nDROP TABLE users;\n")
+
+    def hook_commit(self, *args):
+        head = self.git("rev-parse", "HEAD")
+        result = sh(["git", *GIT_ID, "commit", "-q", *args], self.root, self.env())
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertIn("one-way door on main", result.stdout + result.stderr)
+
+    def test_commit_all_is_blocked(self):
+        self.hook_commit("-a", "-m", "sneaky")
+
+    def test_commit_only_a_path_is_blocked(self):
+        self.hook_commit("-m", "sneaky", "--", "db/schema.sql")
+
+
 class B16DefaultBranch(R2Scratch):
     def default_branch(self):
         code = f"import sys; sys.path.insert(0, {str(GUARDS)!r}); import common; print(common.default_branch())"
@@ -218,9 +309,14 @@ class B17Steps(unittest.TestCase):
     def test_negated_roll_back_is_not_a_step(self):
         for text in ("Rollback: no roll back possible.", "There is no way to roll back.",
                      "Rollback: none; roll back is impossible.", "Rollback: we cannot undeploy this.",
-                     "Rollback: none.", "No rollback."):
+                     "Rollback: none.", "No rollback.", "This is irreversible; nobody can roll back."):
             with self.subTest(text=text):
                 self.assertFalse(has_rollback_plan(text))
+
+
+    def test_undeploy_is_a_step_like_roll_back(self):
+        self.assertTrue(has_rollback_plan("undeploy the service"))
+        self.assertTrue(has_rollback_plan("roll back the service"))
 
 
 class B17AuthGlobs(R2Scratch):
