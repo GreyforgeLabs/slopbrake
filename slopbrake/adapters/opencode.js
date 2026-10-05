@@ -10,7 +10,7 @@ import { delimiter, join, resolve } from "node:path";
 const PROGRAM = "slopbrake-hook";
 const MAX_CONTINUATIONS = 3; // in a row per root session, like rule C2; a real user message resets it
 const TIMEOUT_MS = { "pre-tool-use": 30_000, "post-tool-use": 30_000, stop: 600_000 };
-const EDITS = { edit: "Edit", write: "Write" };
+const EDITS = { edit: "Edit", multiedit: "Edit", write: "Write" };
 
 function onPath() {
   return (process.env.PATH || "").split(delimiter).some((dir) => {

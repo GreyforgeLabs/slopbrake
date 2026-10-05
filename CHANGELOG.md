@@ -5,7 +5,8 @@
 ### Codex and OpenCode (H5, H6, H7)
 
 - **New:** `slopbrake user-hooks install|uninstall|status --harness codex` merges `slopbrake-hook --harness codex pre-tool-use|post-tool-use|stop` into `~/.codex/hooks.json`, keeping other tools' entries. It refuses while `~/.codex/config.toml` lacks `[features] hooks = true` and never edits that file; `status` reminds you to trust the entries in Codex's `/hooks` screen and reports which ones `[hooks.state]` already trusts.
-- **New:** `--harness opencode` installs the OpenCode plugin `~/.config/opencode/plugins/slopbrake.js` (one dependency-free module; it refuses to overwrite a file that is not its own). It guards `bash` before it runs, records `bash`, `edit`, `write` and `apply_patch` changes, and on `session.idle` runs the Stop gate for root sessions, sending a red report back as a new prompt at most 3 times in a row. It does nothing when `slopbrake-hook` is not on `PATH`.
+- **New:** `--harness opencode` installs the OpenCode plugin `~/.config/opencode/plugins/slopbrake.js` (one dependency-free module; it refuses to overwrite a file that is not its own). It guards `bash` before it runs, records `bash`, `edit`, `multiedit`, `write` and `apply_patch` changes, and on `session.idle` runs the Stop gate for root sessions, sending a red report back as a new prompt at most 3 times in a row. It does nothing when `slopbrake-hook` is not on `PATH`.
+- Both installers refuse, and `status` is not ok, unless the `slopbrake-hook` on `PATH` answers `--harness codex|opencode pre-tool-use`: an older build that rejects `--harness` would make every hook a silent no-op. Codex entries count as installed only when matcher and timeout match too; install rewrites one that differs. Codex keys its trust by entry position, so removing or replacing slopbrake's entries can renumber a later entry in the same event, which then needs trusting again (`status` says so).
 
 ## 0.2.0 (2026-10-05)
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
+import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
@@ -24,7 +26,9 @@ CODEX_ENTRIES = {
     "Stop": {"hooks": [{"type": "command", "command": f"{CODEX_COMMAND} stop", "timeout": 600}]},
 }
 CODEX_TRUST = ("Codex runs a new or changed hook only after the operator trusts it in Codex's /hooks screen "
-               "(it records the trust under [hooks.state] in config.toml)")
+               "(it records the trust under [hooks.state] in config.toml, keyed by each entry's position: removing "
+               "or replacing slopbrake's entries can renumber later entries in the same event, which then need "
+               "trusting again)")
 PLUGIN = Path(__file__).resolve().parent / "adapters/opencode.js"
 PLUGIN_MARKER = "// installed by slopbrake"
 
@@ -33,11 +37,27 @@ def snake(event: str) -> str:
     return "".join(f"_{c.lower()}" if c.isupper() else c for c in event).lstrip("_")
 
 
-def not_ready() -> str | None:
+def runnable(harness: str) -> tuple[str | None, bool]:
+    """The `slopbrake-hook` the harness would run, and whether it answers `--harness <harness> pre-tool-use`
+    with exit 0: an older build on PATH answers `pre-tool-use` but rejects `--harness`, so every hook would fail."""
+    binary = shutil.which(hooks.PROGRAM)
+    if not binary:
+        return None, False
+    # The harness runs it without the installer's PYTHONPATH: a dev checkout must not prop up an old build.
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    try:
+        result = subprocess.run([binary, "--harness", harness, "pre-tool-use"], input="{}", capture_output=True,
+                                text=True, timeout=30, check=False, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return binary, False
+    return binary, result.returncode == 0
+
+
+def not_ready(harness: str) -> str | None:
     """Why the harness could not run slopbrake-hook, or None when it can."""
-    binary, ready = hooks.runnable()
-    return None if ready else (f"{binary or hooks.PROGRAM} cannot run `{hooks.PROGRAM} pre-tool-use`"
-                               f"{'' if binary else ' (not on PATH)'}; install this slopbrake version first")
+    binary, ready = runnable(harness)
+    return None if ready else (f"{binary or hooks.PROGRAM} cannot run `{hooks.PROGRAM} --harness {harness} "
+                               f"pre-tool-use`{'' if binary else ' (not on PATH)'}; install this slopbrake version first")
 
 
 # ── Codex ────────────────────────────────────────────────────────────────────
@@ -63,12 +83,11 @@ def hooks_feature(config: dict | None) -> bool:
 
 
 def codex_position(data: dict, event: str) -> tuple[int, int] | None:
-    """(group, handler) of our command in hooks.json, as Codex numbers them in [hooks.state] keys."""
-    want = CODEX_ENTRIES[event]["hooks"][0]["command"]
+    """(group, handler) of our exact entry (matcher and timeout too) in hooks.json, as Codex numbers them in
+    [hooks.state] keys; None when it is missing or differs, so install rewrites it."""
     for group, entry in enumerate(hooks.hook_entries(data, event)):
-        for handler, command in enumerate(hooks.commands(entry)):
-            if command == want:
-                return group, handler
+        if entry == CODEX_ENTRIES[event]:
+            return group, 0
     return None
 
 
@@ -86,7 +105,7 @@ def codex_status(path: Path) -> dict:
         keys = [f"{p}:{snake(event)}:{where[0]}:{where[1]}" for p in spellings] if where else []
         entry = next((state[key] for key in keys if isinstance(state.get(key), dict)), None)
         trusted[event] = entry is not None and entry.get("enabled", True) is not False
-    binary, ready = hooks.runnable()
+    binary, ready = runnable("codex")
     events = {event: where is not None for event, where in positions.items()}
     installed = all(events.values())
     return {"harness": "codex", "settings": str(path), "config": str(path.parent / "config.toml"),
@@ -102,7 +121,7 @@ def codex_install(path: Path) -> dict:
         raise hooks.SettingsError(f"Codex runs hooks only with '[features] hooks = true' in {path.parent / 'config.toml'}"
                                   f"{f' ({problem})' if problem else ''}; add it yourself (slopbrake does not edit "
                                   "config.toml), then install again")
-    if why := not_ready():
+    if why := not_ready("codex"):
         raise hooks.SettingsError(why)
     if not codex_status(path)["installed"]:
         hooks.strip_ours(data)
@@ -137,7 +156,7 @@ def opencode_status(path: Path) -> dict:
     text = plugin_text(path)
     installed = text is not None and text.startswith(PLUGIN_MARKER)
     current = installed and text == PLUGIN.read_text(encoding="utf-8")
-    binary, ready = hooks.runnable()
+    binary, ready = runnable("opencode")
     return {"harness": "opencode", "settings": str(path), "installed": installed, "current": current,
             "foreign": text is not None and not installed, "on_path": binary is not None, "binary": binary,
             "runnable": ready, "ok": current and ready}
@@ -148,7 +167,7 @@ def opencode_install(path: Path) -> dict:
     if status["foreign"]:
         raise hooks.SettingsError(f"{path} is not slopbrake's plugin (no '{PLUGIN_MARKER}' first line); "
                                   "move it aside, then install again")
-    if why := not_ready():
+    if why := not_ready("opencode"):
         raise hooks.SettingsError(why)
     if not status["current"]:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,7 +208,8 @@ def runner_lines(result: dict, harness: str) -> list[str]:
     if result["runnable"]:
         return []
     found = f"{result['binary']} cannot run it" if result["binary"] else "none on PATH"
-    return [f"note: {harness} cannot run `{hooks.PROGRAM}` ({found}); install refuses until it can"]
+    command = f"{hooks.PROGRAM} --harness {result['harness']}"
+    return [f"note: {harness} cannot run `{command}` ({found}); install refuses until it can"]
 
 
 def lines(result: dict) -> list[str]:
