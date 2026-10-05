@@ -12,7 +12,15 @@ G=scripts/slopbrake
 source "$G/run-stages.sh"
 
 export MUTATION_FLOOR=60
-TEST_CMD="@TEST_CMD@"
+# The interpreter is resolved on every run, so a linked worktree (no .venv of its own) uses the
+# main checkout's: ./.venv, else <main worktree>/.venv, else python3. Absolute and quoted, because
+# the mutation stage runs TEST_CMD through a shell from a scratch copy of the tree.
+PY=python3
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+for candidate in "$PWD/.venv/bin/python" "${common:+${common%/*}/.venv/bin/python}"; do
+  if [ -x "$candidate" ]; then PY=$candidate; break; fi
+done
+TEST_CMD="'${PY//\'/\'\\\'\'}' @TEST_ARGS@"  # single-quoted: POSIX sh reads it too
 
 STAGES=(lint types boundaries tests smoke test-quality mutation pr)
 SLOW_STAGES=(mutation)
@@ -20,7 +28,7 @@ SLOW_STAGES=(mutation)
 stage_lint()         { @LINT_CMD@; }
 stage_types()        { @TYPES_CMD@; }
 stage_boundaries()   { python3 "$G/boundaries_py.py" .; }
-stage_tests()        { $TEST_CMD; }
+stage_tests()        { eval "$TEST_CMD"; }
 stage_smoke()        { if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; else echo "smoke: skipped: no scripts/smoke.sh (run the real entry point end to end there)"; return 78; fi; }
 stage_test_quality() { python3 "$G/tautology_py.py" .; }
 stage_mutation()     { python3 "$G/mutation_py.py" --test-cmd "$TEST_CMD"; }

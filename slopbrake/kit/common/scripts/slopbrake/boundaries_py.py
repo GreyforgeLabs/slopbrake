@@ -27,6 +27,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import python_files
+
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "build", "dist", "__pycache__", ".tox",
              "site-packages", ".mypy_cache", ".pytest_cache", "runtime"}
 
@@ -173,7 +176,7 @@ def violations(root: Path) -> list[tuple[str, str]]:
     repo = Repo(root)
     problems: list[tuple[str, str]] = []
     graph: dict[str, set[str]] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in python_files(root, SKIP_DIRS):
         rel = path.relative_to(root)
         if SKIP_DIRS & set(rel.parts):
             continue

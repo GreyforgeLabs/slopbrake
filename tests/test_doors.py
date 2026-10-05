@@ -108,9 +108,10 @@ class MeasuringNothing(Scratch):
         self.git_repo()
         self.write("db/migrations/0002_drop.sql", "DROP TABLE users;\n")
         self.commit("drop users")
+        self.git("update-ref", "refs/slopbrake/last-green/main", "HEAD")  # B2: on main the base is the ratchet
         result = script("door_classify.py", "--json", cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("measuring nothing: HEAD is the base (main)", result.stderr)
+        self.assertIn("measuring nothing: HEAD is the base (refs/slopbrake/last-green/main)", result.stderr)
 
     def test_a_real_base_has_no_warning(self):
         self.git_repo()
@@ -257,9 +258,8 @@ class BaseRules(Scratch):
 
 class NoBase(Scratch):
     def test_pr_body_without_a_resolvable_base_fails(self):
-        self.git_repo(branch="trunk")
+        self.git("init", "-q", "-b", "trunk")  # B2: with commits there is always a base; none before the first
         self.write("migrations/002.sql", "DROP TABLE users;\n")
-        self.commit("drop")
         self.write("body.md", body())
         result = script("pr_body_check.py", "--body-file", "body.md", cwd=self.root)
         self.assertEqual(result.returncode, 1, result.stdout)

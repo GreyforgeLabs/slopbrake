@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Layer 1 locally: the fast gate (no mutation) before every commit.
-# The gate checks the working tree, so a partly staged file is checked as it is on disk,
-# not as it will be committed: say so loudly.
+# The gate checks the working tree, so a staged file that also has unstaged changes would be
+# checked as it is on disk, not as it will be committed: refuse instead of checking the wrong tree.
 partial=$(comm -12 <(git -c core.quotePath=false diff --cached --name-only | sort) \
                    <(git -c core.quotePath=false diff --name-only | sort))
 if [ -n "$partial" ]; then
   {
-    echo "pre-commit: WARNING: staged files with unstaged changes too; the gate checks the working tree, not this commit:"
+    echo "pre-commit: staged files also have unstaged changes, so the gate would check a different tree than this commit:"
     sed 's/^/  /' <<<"$partial"
-    echo "pre-commit: stage the rest (git add) so the gate sees exactly what you commit."
+    echo "pre-commit: stage them or stash them; a human may override with --no-verify."
   } >&2
+  exit 1
 fi
 exec "$(git rev-parse --show-toplevel)/scripts/check" --fast

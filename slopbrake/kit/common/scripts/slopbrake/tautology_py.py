@@ -38,6 +38,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import python_files
+
 EQUALITY_ASSERTS = {"assertEqual", "assertEquals", "assertIs", "assertListEqual", "assertDictEqual",
                     "assertTupleEqual", "assertSetEqual", "assertCountEqual", "assertAlmostEqual",
                     "assertSequenceEqual", "assertMultiLineEqual", "assert_equal"}
@@ -376,9 +379,7 @@ def test_files(roots: list[Path]):
         if root.is_file():
             yield root
             continue
-        for path in sorted(root.rglob("*.py")):
-            if SKIP_DIRS & set(path.parts):
-                continue
+        for path in python_files(root, SKIP_DIRS):
             if path.name.startswith("test") or path.name.endswith("_test.py"):  # unittest's test*.py, pytest's
                 yield path
 

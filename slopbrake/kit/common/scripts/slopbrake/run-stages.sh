@@ -8,8 +8,8 @@
 # Every stage runs even after a failure, so one run shows everything that is red.
 # A stage with nothing to check prints "<stage>: skipped: <reason>" and returns 78 (a skip,
 # not a failure). A full run that is all green on a clean tree records HEAD as
-# refs/slopbrake/last-green/<branch>, the base later checks use on the default branch
-# (never on a detached HEAD; SLOPBRAKE_NO_RECORD=1 opts out).
+# refs/slopbrake/last-green/<branch, "/" as %2F>, the base later checks use on the default
+# branch (never on a detached HEAD; SLOPBRAKE_NO_RECORD=1 opts out).
 
 run_stages() {
   # Git exports these to hooks (`commit -a` points GIT_INDEX_FILE at a temporary index).
@@ -57,11 +57,14 @@ _record_last_green() {
   local ref branch head
   [ "${SLOPBRAKE_NO_RECORD:-}" = 1 ] && return
   branch=$(git symbolic-ref -q --short HEAD) || return  # per branch: green elsewhere vouches for nothing here
-  ref=refs/slopbrake/last-green/$branch
+  ref=refs/slopbrake/last-green/${branch//\//%2F}  # %2F: feature and feature/x never collide
   head=$(git rev-parse -q --verify HEAD) || return
   [ -z "$(git status --porcelain)" ] || return
   # A base that skips commits after the last green run did not check them: don't vouch for them.
+  # (The empty tree skips nothing: every line was new.)
   if [ -n "${SLOPBRAKE_BASE:-}" ] && git rev-parse -q --verify "$ref" >/dev/null \
+     && [ "$SLOPBRAKE_BASE" != "$(git hash-object -t tree /dev/null)" ] \
      && ! git merge-base --is-ancestor "$SLOPBRAKE_BASE" "$ref" 2>/dev/null; then return; fi
-  git update-ref "$ref" "$head" && echo "last-green: recorded ${head:0:12}"
+  if git update-ref "$ref" "$head"; then echo "last-green: recorded ${head:0:12}"
+  else echo "last-green: WARNING: could not record $ref; the next Stop runs the full gate again" >&2; fi
 }

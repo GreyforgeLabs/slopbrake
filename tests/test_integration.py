@@ -86,6 +86,7 @@ class StopHookOnNewBranches(Scratch):
         self.assertIn("full gate ran", result.stderr)
 
     def test_the_default_branch_with_nothing_new_lets_the_agent_stop(self):
+        sh(["git", "update-ref", "refs/slopbrake/last-green/main", "HEAD"], self.root)  # B2: init's ratchet
         self.assertEqual(self.stop().returncode, 0)
 
 

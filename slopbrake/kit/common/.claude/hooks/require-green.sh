@@ -1,10 +1,10 @@
 #!/bin/bash
-# Stop hook (rule H6): the gate must be green before the agent stops. Uncommitted code
-# changes need the fast gate; a clean tree with commits no full green run has covered (since
-# refs/slopbrake/last-green/<branch>, or since the branch left the default branch) needs the
-# full gate, which records the new green on success. The full gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and all runs
-# together share one SLOPBRAKE_STOP_TIMEOUT (540) second budget, inside the 600 s hook
-# timeout; running out of it is a red attempt, never a hang.
+# Stop hook (rule H6): the gate must be green before the agent stops. Commits no full green
+# run has covered (see unverified) need the full gate, which records the new green on success
+# when the tree is clean; otherwise uncommitted code changes need the fast gate. The full
+# gate samples at most SLOPBRAKE_STOP_MUTANTS (40) mutants, and all runs together share one
+# SLOPBRAKE_STOP_TIMEOUT (540) second budget, inside the 600 s hook timeout; running out of
+# it is a red attempt, never a hang.
 # Gated: the project, plus the same directory in the worktree the agent is working in
 # (payload cwd) when it belongs to the same repository. On red, exit 2 feeds the failure
 # back so the agent keeps working. After 3 consecutive red stops in one session it lets
@@ -38,33 +38,46 @@ STATE_DIR="$(git rev-parse --absolute-git-dir)/slopbrake"
 mkdir -p "$STATE_DIR"
 COUNT_FILE="$STATE_DIR/stop-red-$SESSION"
 
-# unverified BRANCH: HEAD has commits that no full green run has covered: since the branch's
-# last green run, or, before its first one, since it left the default branch.
+# unverified BRANCH: HEAD has commits that no full green run has covered. With a ratchet
+# (refs/slopbrake/last-green/<branch, "/" as %2F>): commits after it, or any commit once it is no
+# longer an ancestor (amend, rebase, reset). Without one: on the default branch itself (a local
+# base: no remote has its commits) every commit; elsewhere, commits since the default branch.
+# BRANCH is empty on a detached HEAD: never a ratchet, just the default-branch check.
 unverified() {
-  local last base
-  if last=$(git rev-parse -q --verify "refs/slopbrake/last-green/$1"); then
-    [ "$last" != "$(git rev-parse HEAD)" ] && git merge-base --is-ancestor "$last" HEAD
+  local head last base
+  head=$(git rev-parse -q --verify HEAD) || return 1
+  if [ -n "$1" ] && last=$(git rev-parse -q --verify "refs/slopbrake/last-green/${1//\//%2F}"); then
+    git merge-base --is-ancestor "$last" HEAD || return 0
+    [ "$last" != "$head" ]
     return
   fi
   for base in origin/HEAD main master origin/main origin/master; do
     git rev-parse -q --verify "$base^{commit}" >/dev/null || continue
-    [ "$(git merge-base "$base" HEAD 2>/dev/null)" != "$(git rev-parse HEAD)" ]
+    [ -n "$1" ] && [ "$(git rev-parse --symbolic-full-name "$base")" = "refs/heads/$1" ] && return 0
+    [ "$(git merge-base "$base" HEAD 2>/dev/null)" != "$head" ]
     return
   done
-  return 1
+  [ -n "$1" ]  # no base ref at all: this branch is the only history and nothing vouches for it
 }
 
 # gate DIR: runs what DIR needs; on red prints why and the log tail, returns 1.
+# Unverified commits need the full gate even when the tree is also dirty (it then checks both
+# but cannot record); dirty code alone needs the fast gate.
 gate() {
   cd "$1" 2>/dev/null && [ -x scripts/check ] || return 0
-  local log args=() why branch status
+  local log args=() why branch status dirty=
   log="$(git rev-parse --absolute-git-dir)/slopbrake/stop-check.log"
-  # Docs-only changes don't need the gate.
-  if git -c core.quotePath=false status --porcelain --untracked-files=all | awk '{print $NF}' | grep -qvE '\.(md|txt)$'; then
-    args=(--fast) why="uncommitted code changes and scripts/check --fast is red"
-  elif branch=$(git symbolic-ref -q --short HEAD) && unverified "$branch"; then
-    why="commits on $branch that no full green run has covered, and the full scripts/check is red"
+  # Docs-only changes don't need the gate; neither does a nested worktree ("dir/": another checkout).
+  if git -c core.quotePath=false status --porcelain --untracked-files=all | awk '{print $NF}' \
+     | grep -vE '/$' | grep -qvE '\.(md|txt)$'; then
+    dirty=" (and uncommitted code changes)"
+  fi
+  branch=$(git symbolic-ref -q --short HEAD)
+  if unverified "$branch"; then
+    why="commits on ${branch:-a detached HEAD} that no full green run has covered$dirty, and the full scripts/check is red"
     export MUTATION_MAX="${SLOPBRAKE_STOP_MUTANTS:-40}"
+  elif [ -n "$dirty" ]; then
+    args=(--fast) why="uncommitted code changes and scripts/check --fast is red"
   else
     return 0
   fi
