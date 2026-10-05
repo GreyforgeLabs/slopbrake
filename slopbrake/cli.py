@@ -64,6 +64,7 @@ CLAUDE_MD_MAX_LINES = 40
 GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/", "__pycache__/"]}
 LAST_GREEN = "refs/slopbrake/last-green"  # + /<branch, "/" as %2F>; detached HEAD has none
 META = ".claude/slopbrake.json"
+HOOKS_DISABLED = "/dev/null"  # core.hooksPath that turns every git hook off
 TYPES_PLACEHOLDER = "no type checker configured"
 ESLINT_CONFIGS = [f"eslint.config.{ext}" for ext in ("js", "mjs", "cjs", "ts", "mts", "cts")] + [
     f".eslintrc{ext}" for ext in ("", ".js", ".cjs", ".json", ".yml", ".yaml")]
@@ -495,14 +496,18 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     live_hooks = sorted(p.name for p in hooks_dir.glob("*") if not p.name.endswith(".sample")) \
         if not hooks_path and hooks_dir.is_dir() else []
     hooks_note = "core.hooksPath already .githooks"
-    if hooks_path != ".githooks":
+    next_steps = []
+    if hooks_path == HOOKS_DISABLED:  # not hooks to chain into: the repo turned every git hook off
+        hooks_note = f"left alone: git hooks are disabled (core.hooksPath={HOOKS_DISABLED})"
+        next_steps.append(f"hooks are disabled in this repo (core.hooksPath={HOOKS_DISABLED}): enable with git config "
+                          "core.hooksPath .githooks")
+    elif hooks_path != ".githooks":
         if hooks_path or live_hooks:
             hooks_note = f"left alone: existing hooks ({hooks_path or ', '.join(live_hooks)}); chain .githooks by hand"
         else:
             hooks_note = "set core.hooksPath=.githooks"
             if not dry_run:
                 git(repo, "config", "core.hooksPath", ".githooks")
-    next_steps = []
     claude_md = repo / "CLAUDE.md"
     if any(a.path == "CLAUDE.md" and a.action == "kept" for a in actions):
         next_steps.append("CLAUDE.md exists: merge the kit's pointers into it by hand and keep it within "
@@ -569,6 +574,8 @@ def trust_repo(repo: Path) -> list[str]:
 def git_hook_gaps(repo: Path) -> list[str]:
     """Why git would not run the gate's pre-commit and pre-push hooks (core.hooksPath or the hooks dir)."""
     configured = git(repo, "config", "--get", "core.hooksPath", check=False)
+    if configured == HOOKS_DISABLED:
+        return [f"git hooks are disabled (core.hooksPath={HOOKS_DISABLED})"]
     hooks_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
     if configured and not hooks_dir.is_dir():
         return [f"core.hooksPath={configured} does not exist, so no git hook runs"]

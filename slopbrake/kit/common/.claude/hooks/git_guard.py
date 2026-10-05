@@ -10,10 +10,11 @@ Text inside the arguments of other commands (commit messages, grep patterns, her
 written to files) is never matched. A command that does not parse falls back to a
 conservative check of the raw string.
 
-Hook protocol: JSON on stdin (`tool_input.command`, `cwd`); exit 2 with the reason on
-stderr blocks, exit 0 allows. `--scope always` judges every command (the project hook);
-`--scope managed` acts only when the git invocation's effective directory is inside a repo
-whose toplevel has .claude/slopbrake.json (the user-level hook). Importable API:
+Hook protocol: JSON on stdin (`tool_input.command`, or grok's camelCase `toolInput.command`,
+and `cwd`); exit 2 with the reason on stderr blocks, exit 0 allows. `--scope always` judges
+every command (the project hook); `--scope managed` acts only when the git invocation's
+effective directory is inside a repo whose toplevel has .claude/slopbrake.json (the
+user-level hook). Importable API:
 check_command(command, cwd, scope) -> reason or None. Stdlib only.
 
 Known limits (data flow and runners the parser does not model; the guard is a seatbelt, not a
@@ -850,7 +851,7 @@ def main(argv=None):
     scope = parser.parse_args(argv).scope
     try:
         payload = json.loads(sys.stdin.read())
-        command = (payload.get("tool_input") or {}).get("command")
+        command = (payload.get("tool_input") or payload.get("toolInput") or {}).get("command")  # grok: camelCase
         cwd = payload.get("cwd") or os.getcwd()
         reason = check_command(command, str(cwd), scope) if isinstance(command, str) and command.strip() else None
     except Exception as exc:  # noqa: BLE001 - fail closed for the project hook, never break other sessions
