@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Check a PR body has the required shape (rules G1, G2, G4, T3).
+"""Check a PR body has the required shape (rules G1, G2, G3, G4, C3).
 
 Body source, first found: --body-file, $PR_BODY_FILE, the GitHub Actions pull_request
-event. Outside a PR context the check is skipped (exit 0) unless --require is given.
+event. Outside a PR context there is no body: on the default branch an uncommitted
+one-way change fails (it belongs on a feature branch); otherwise the check is skipped
+(exit 78), or fails with --require.
 """
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -15,12 +18,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import base_ref, collect_changes, git, repo_root
-from door_classify import DEFAULT_RULES, classify, load_rules
+from door_classify import DEFAULT_RULES, RulesError, classify, effective_rules, measure
 
+SKIP = 78
 SECTIONS = ("Summary", "Evidence", "Merge Danger", "Review log", "Open questions")
 PLACEHOLDERS = ("<one-way or two-way>", "<one-word description>", "<diagram, diff-sketch, or tree>",
                 "<screenshot/output/failing test run>", "<screenshot/output/passing test run>",
                 "<finding>", "<only things a human must decide>")
+ROLLBACK = re.compile(r"\b(?:roll[ -]?backs?|mitigations?)\b", re.IGNORECASE)
+LABEL_WORDS = {"plan", "strategy"}
+EMPTY_WORDS = {"no", "none", "n/a", "na", "not", "possible", "nothing", "needed", "required", "available",
+               "applicable", "tbd"}
 
 
 def read_body(body_file: str | None) -> str | None:
@@ -35,13 +43,41 @@ def read_body(body_file: str | None) -> str | None:
     return None
 
 
+def strip_hidden(body: str) -> str:
+    return re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+
+
 def strip_code(body: str) -> str:
-    return re.sub(r"^(```|~~~).*?^\1\s*$", "", body, flags=re.DOTALL | re.MULTILINE)
+    """What a reader sees as prose: no HTML comments, fenced blocks or inline code."""
+    body = re.sub(r"^ {0,3}(```+|~~~+).*?^ {0,3}\1\s*$", "", strip_hidden(body), flags=re.DOTALL | re.MULTILINE)
+    return re.sub(r"`+[^`\n]*`+", "", body)
 
 
 def section(body: str, name: str) -> str:
     match = re.search(rf"^##\s+{re.escape(name)}\s*$(.*?)(?=^##\s|\Z)", body, re.MULTILINE | re.DOTALL | re.IGNORECASE)
     return match.group(1) if match else ""
+
+
+def words(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+(?:/[a-z0-9]+)?", text.lower()))
+
+
+def has_rollback_plan(merge_danger: str) -> bool:
+    """A rollback/mitigation line that says something beyond none, n/a or 'no rollback possible'."""
+    lines = merge_danger.splitlines()
+    for i, line in enumerate(lines):
+        if not ROLLBACK.search(line):
+            continue
+        text = ROLLBACK.sub(" ", line)
+        if not words(text) - LABEL_WORDS:  # a bare "Rollback plan:" label: the plan follows
+            text = " ".join(itertools.takewhile(lambda nxt: not nxt.lstrip().startswith("**"), lines[i + 1:]))
+        if words(text) - LABEL_WORDS - EMPTY_WORDS:
+            return True
+    return False
+
+
+def doors(prose: str) -> list[str]:
+    return [door.lower() for door in re.findall(r"\*\*Door:\*\*\s*(one-way|two-way)(?![\w-])", prose, re.IGNORECASE)]
 
 
 def check(body: str, computed_door: str | None) -> list[str]:
@@ -50,24 +86,94 @@ def check(body: str, computed_door: str | None) -> list[str]:
     for name in SECTIONS:
         if not re.search(rf"^##\s+{re.escape(name)}\s*$", prose, re.MULTILINE | re.IGNORECASE):
             problems.append(f"missing section '## {name}' (G4)")
-    doors = re.findall(r"\*\*Door:\*\*\s*(one-way|two-way)\b", prose, re.IGNORECASE)
-    if len(doors) != 1:
+    found = doors(prose)
+    if len(found) != 1:
         problems.append("Merge Danger needs exactly one '**Door:** one-way|two-way' (G1)")
-    radius = re.search(r"\*\*Blast Radius:\*\*[ \t]*(\S.*)?", prose)
-    if not radius or not radius.group(1):
+    if not re.search(r"\*\*Blast Radius:\*\*[ \t]*[A-Za-z]", prose, re.IGNORECASE):
         problems.append("Merge Danger needs '**Blast Radius:** <word>' with a value (G1)")
     for placeholder in PLACEHOLDERS:
         if placeholder in prose:
             problems.append(f"template placeholder left in body: {placeholder} (G4)")
-    evidence = section(body, "Evidence")
+    evidence = section(prose, "Evidence")
     if not (re.search(r"\bbefore\b", evidence, re.IGNORECASE) and re.search(r"\bafter\b", evidence, re.IGNORECASE)):
         problems.append("Evidence must show a before and an after (T3/T5)")
-    declared = doors[0].lower() if len(doors) == 1 else None
+    declared = found[0] if len(found) == 1 else None
     if computed_door == "one-way" and declared == "two-way":
         problems.append("declared two-way, but door-classify computed one-way; a door may be raised, never lowered (G2)")
-    if declared == "one-way" and not re.search(r"rollback|roll back|mitigation", section(body, "Merge Danger"), re.IGNORECASE):
-        problems.append("one-way door needs a rollback or mitigation plan under Merge Danger (G3)")
+    if declared == "one-way" and not has_rollback_plan(section(prose, "Merge Danger")):
+        problems.append("one-way door needs a rollback or mitigation plan under Merge Danger; "
+                        "'none' or 'n/a' is not a plan (G3)")
     return problems
+
+
+def unlogged_reviews(body: str, merge_base: str) -> list[str]:
+    """C3: `review:` commits since the base that the Review log does not mention (by finding or sha)."""
+    log = section(strip_hidden(body), "Review log")
+    flat = " ".join(log.lower().split())
+    shas = re.findall(r"\b[0-9a-f]{7,40}\b", log.lower())
+    missing = []
+    for line in git("log", "--format=%H %s", f"{merge_base}..HEAD").splitlines():
+        sha, _, subject = line.partition(" ")
+        if not subject.lower().startswith("review:"):
+            continue
+        finding = " ".join(subject[len("review:"):].lower().split())
+        if not (finding and finding in flat) and not any(sha.startswith(s) for s in shas):
+            missing.append(subject)
+    return missing
+
+
+def announce_one_way(reason: str) -> None:
+    """Make a one-way PR visible in GitHub Actions (annotation + job summary)."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    message = f"one-way door: a human reviews and merges this PR ({reason})"
+    print(f"::warning::{message}")
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as out:
+            out.write(f"- **{message}**\n")
+
+
+def branch_name() -> str | None:
+    return git("symbolic-ref", "-q", "--short", "HEAD", check=False).strip() or None
+
+
+def default_branch() -> str | None:
+    origin = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD", check=False).strip()
+    if origin:
+        return origin.split("/", 1)[1]
+    for name in ("main", "master"):
+        if git("rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False).strip():
+            return name
+    return git("config", "init.defaultBranch", check=False).strip() or None
+
+
+def no_pr_context() -> int:
+    """C8: block a one-way change about to be committed on the default branch."""
+    branch = branch_name()
+    if branch is None or not git("rev-parse", "--verify", "-q", "HEAD", check=False).strip():
+        print("pr: skipped: no PR context (not on a branch with commits)")
+        return SKIP
+    if branch != default_branch():
+        print(f"pr: skipped: no PR context on {branch}")
+        return SKIP
+    changes = collect_changes("HEAD", working_tree=True)
+    if not changes:
+        print(f"pr: skipped: no PR context and nothing uncommitted on {branch}")
+        return SKIP
+    try:
+        result = classify(changes, effective_rules("HEAD", repo_root() / DEFAULT_RULES))
+    except RulesError as exc:
+        print(f"pr: door rules: {exc}")
+        return 1
+    if result["door"] == "one-way":
+        print(f"pr: one-way door on {branch}: commit it on a feature branch for operator review "
+              "(a human may override with git commit --no-verify)")
+        for reason in result["reasons"]:
+            print(f"  - {reason}")
+        return 1
+    print(f"pr: skipped: no PR context; the uncommitted change on {branch} is two-way")
+    return SKIP
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,30 +181,50 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--body-file")
     parser.add_argument("--base", help="base ref for the computed door floor")
     parser.add_argument("--require", action="store_true", help="fail when no PR body is found")
-    parser.add_argument("--no-door-floor", action="store_true", help="skip comparing with door-classify")
+    parser.add_argument("--no-door-floor", action="store_true",
+                        help="skip the checks against the base (door floor, review traceability)")
     args = parser.parse_args(argv)
 
     body = read_body(args.body_file)
     if body is None:
-        print("pr-body: no PR context; skipped")
-        return 1 if args.require else 0
-    computed = None
+        if args.require:
+            print("pr-body: no PR context; a PR body is required")
+            return 1
+        if git("rev-parse", "--is-inside-work-tree", check=False).strip() != "true":
+            print("pr: skipped: no PR context (not a git repository)")
+            return SKIP
+        return no_pr_context()
+    problems, computed, floor = [], None, "not computed (--no-door-floor)"
     if not args.no_door_floor:
         base = base_ref(args.base)
-        rules_path = repo_root() / DEFAULT_RULES
-        if base and rules_path.is_file():
-            computed = classify(collect_changes(base, working_tree=False), load_rules(rules_path))["door"]
+        if base is None:
+            problems.append("no base ref found, so the door floor cannot be computed; pass --base (G2)")
+        else:
+            try:
+                result, warning = measure(base, working_tree=False)
+                computed = result["door"]
+                floor = f"{computed}, against {base}"
+                if warning:
+                    print(f"pr-body: warning: {warning}")
+                if computed == "one-way":
+                    announce_one_way(result["reasons"][0])
+            except RulesError as exc:
+                problems.append(f"door rules: {exc} (G2)")
+            problems += [f"Review log is missing review: commit '{subject}' (C3)"
+                         for subject in unlogged_reviews(body, git("merge-base", base, "HEAD").strip())]
             body_path = str(Path(args.body_file).resolve()) if args.body_file else ""
             pending = [line[3:] for line in git("status", "--porcelain").splitlines()
                        if str((repo_root() / line[3:]).resolve()) != body_path]
             if pending:
                 print(f"pr-body: note: {len(pending)} uncommitted change(s) are not in the door floor; "
                       "commit first, then check")
-    problems = check(body, computed)
+    if computed != "one-way" and "one-way" in doors(strip_code(body)):
+        announce_one_way("declared one-way in the PR body")
+    problems += check(body, computed)
     for problem in problems:
         print(f"pr-body: {problem}")
     if not problems:
-        print(f"pr-body: ok (computed door floor: {computed or 'n/a'})")
+        print(f"pr-body: ok (computed door floor: {floor})")
     return 1 if problems else 0
 
 

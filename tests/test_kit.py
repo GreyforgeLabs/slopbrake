@@ -218,7 +218,8 @@ class PrBody(Scratch):
     def test_outside_pr_context_is_skipped(self):
         env = {k: v for k, v in os.environ.items() if k not in ("PR_BODY_FILE", "GITHUB_EVENT_PATH")}
         result = script("pr_body_check.py", "--no-door-floor", cwd=self.root, env=env)
-        self.assertEqual((result.returncode, result.stdout.strip()), (0, "pr-body: no PR context; skipped"))
+        self.assertEqual(result.returncode, 78)
+        self.assertTrue(result.stdout.startswith("pr: skipped: no PR context"), result.stdout)
 
 
 class Tautology(Scratch):
