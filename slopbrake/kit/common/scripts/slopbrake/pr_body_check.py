@@ -26,9 +26,12 @@ PLACEHOLDERS = ("<one-way or two-way>", "<one-word description>", "<diagram, dif
                 "<screenshot/output/failing test run>", "<screenshot/output/passing test run>",
                 "<finding>", "<only things a human must decide>")
 ROLLBACK = re.compile(r"\b(?:roll[ -]?backs?|mitigations?)\b", re.IGNORECASE)
-LABEL_WORDS = {"plan", "strategy"}
-EMPTY_WORDS = {"no", "none", "n/a", "na", "not", "possible", "nothing", "needed", "required", "available",
-               "applicable", "tbd"}
+LABELS = re.compile(r"\*\*(?:Door|Blast Radius):\*\*[ \t]*[\w-]*", re.IGNORECASE)
+# A plan names a concrete step; "no backup" or "cannot revert" does not count.
+PLAN_STEP = re.compile(r"(?<!\bno )(?<!\bnot )(?<!\bcannot )(?<!\bcan't )(?<!\bwithout )(?<!\bnever )"
+                       r"\b(?:revert|restor|back ?up|backed up|down(?:grade)?\b|snapshot|dump|flag|disabl|toggl|"
+                       r"undo|redeploy|re-?run|re-?apply|re-?enabl|re-?creat|replay|recover|reinstat|revers|rebuild|"
+                       r"roll(?:ing)? forward|fix forward|kill[ -]?switch|canary|dual[ -]write)", re.IGNORECASE)
 
 
 def read_body(body_file: str | None) -> str | None:
@@ -47,10 +50,24 @@ def strip_hidden(body: str) -> str:
     return re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
 
 
-def strip_code(body: str) -> str:
-    """What a reader sees as prose: no HTML comments, fenced blocks or inline code."""
-    body = re.sub(r"^ {0,3}(```+|~~~+).*?^ {0,3}\1\s*$", "", strip_hidden(body), flags=re.DOTALL | re.MULTILINE)
-    return re.sub(r"`+[^`\n]*`+", "", body)
+def strip_code(body: str, inline: bool = True) -> str:
+    """What a reader sees as prose: no HTML comments, code blocks (fenced, unclosed or indented) or inline code."""
+    body = re.sub(r"^ {0,3}(```+|~~~+).*?(?:^ {0,3}\1\s*$|\Z)", "", strip_hidden(body), flags=re.DOTALL | re.MULTILINE)
+    kept, after_blank, in_list, in_code = [], True, False, False
+    for line in body.splitlines():
+        if not line.strip():
+            kept.append(line)
+            after_blank = True
+            continue
+        indented = line.startswith(("    ", "\t"))
+        in_code = indented and (in_code or (after_blank and not in_list))  # in a list it is a continuation
+        if not in_code:
+            kept.append(line)
+            if not indented and (after_blank or re.match(r" {0,3}(?:[-*+]|\d+[.)])\s", line)):
+                in_list = bool(re.match(r" {0,3}(?:[-*+]|\d+[.)])\s", line))
+        after_blank = False
+    body = "\n".join(kept)
+    return re.sub(r"`+[^`\n]*`+", "", body) if inline else body
 
 
 def section(body: str, name: str) -> str:
@@ -58,20 +75,16 @@ def section(body: str, name: str) -> str:
     return match.group(1) if match else ""
 
 
-def words(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+(?:/[a-z0-9]+)?", text.lower()))
-
-
 def has_rollback_plan(merge_danger: str) -> bool:
-    """A rollback/mitigation line that says something beyond none, n/a or 'no rollback possible'."""
-    lines = merge_danger.splitlines()
+    """A rollback/mitigation line (or the lines under its bare label) that names a concrete step."""
+    lines = [LABELS.sub(" ", line) for line in merge_danger.splitlines()]
     for i, line in enumerate(lines):
         if not ROLLBACK.search(line):
             continue
-        text = ROLLBACK.sub(" ", line)
-        if not words(text) - LABEL_WORDS:  # a bare "Rollback plan:" label: the plan follows
-            text = " ".join(itertools.takewhile(lambda nxt: not nxt.lstrip().startswith("**"), lines[i + 1:]))
-        if words(text) - LABEL_WORDS - EMPTY_WORDS:
+        text = line
+        if not re.sub(r"\b(?:plan|strategy)\b|\W", "", ROLLBACK.sub("", line), flags=re.IGNORECASE):
+            text += " " + " ".join(itertools.takewhile(lambda nxt: not nxt.lstrip().startswith("**"), lines[i + 1:]))
+        if PLAN_STEP.search(" ".join(text.split())):
             return True
     return False
 
@@ -100,9 +113,9 @@ def check(body: str, computed_door: str | None) -> list[str]:
     declared = found[0] if len(found) == 1 else None
     if computed_door == "one-way" and declared == "two-way":
         problems.append("declared two-way, but door-classify computed one-way; a door may be raised, never lowered (G2)")
-    if declared == "one-way" and not has_rollback_plan(section(prose, "Merge Danger")):
-        problems.append("one-way door needs a rollback or mitigation plan under Merge Danger; "
-                        "'none' or 'n/a' is not a plan (G3)")
+    if declared == "one-way" and not has_rollback_plan(section(strip_code(body, inline=False), "Merge Danger")):
+        problems.append("one-way door needs a rollback or mitigation plan under Merge Danger that names a step "
+                        "(revert, restore, backup, down migration, flag, disable...); 'none' or 'n/a' is not a plan (G3)")
     return problems
 
 
@@ -117,7 +130,8 @@ def unlogged_reviews(body: str, merge_base: str) -> list[str]:
         if not subject.lower().startswith("review:"):
             continue
         finding = " ".join(subject[len("review:"):].lower().split())
-        if not (finding and finding in flat) and not any(sha.startswith(s) for s in shas):
+        logged = finding and re.search(rf"(?<!\w){re.escape(finding)}(?!\w)", flat)  # whole words: "on" is not "none"
+        if not logged and not any(sha.startswith(s) for s in shas):
             missing.append(subject)
     return missing
 
@@ -145,7 +159,11 @@ def default_branch() -> str | None:
     for name in ("main", "master"):
         if git("rev-parse", "--verify", "-q", f"refs/heads/{name}", check=False).strip():
             return name
-    return git("config", "init.defaultBranch", check=False).strip() or None
+    configured = git("config", "init.defaultBranch", check=False).strip()
+    if configured:
+        return configured
+    branches = git("for-each-ref", "--format=%(refname:short)", "refs/heads", check=False).split()
+    return branches[0] if len(branches) == 1 else None  # a local-only repo with one branch
 
 
 def no_pr_context() -> int:

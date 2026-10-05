@@ -1,7 +1,8 @@
 # Door floor for scripts/slopbrake/door_classify.py (rule G2).
 # A change matching any rule is a one-way door: human review required, never auto-merged.
 # Agents may raise a door to one-way; they may never lower it. Globs are gitignore-style
-# (`**/` spans directories). content_patterns are regexes matched against added lines
+# (`**/` spans directories); one_way globs ignore case (src/Auth/ matches **/auth/**),
+# ignore lists do not. content_patterns are regexes matched against added lines
 # (`(?i)` makes one case-insensitive); comment-only lines (# or //) are not scanned.
 # Supported syntax: `key: value` and `key:` followed by `- item` lines. Each key appears once:
 # add repo rules to the existing lists. A PR is classified with the union of its own rules
@@ -62,19 +63,26 @@ one_way:
 content_patterns:
   - "(?i)\\bdrop\\s+(table|column|schema|database)\\b"
   - "(?i)\\balter\\s+table\\b.*\\bdrop\\b"
-  - "(?i)\\bdelete\\s+from\\b"
+  - "(?i)\\bdelete\\s+from\\s+(?!(the|a|an|this|that|it|its|our|your|their|memory|cache|disk)\\b)\\w"
   - "(?i)\\btruncate\\s+table\\b"
   - "\\bTRUNCATE\\s+\\w"
+  - "(?i)\\btruncate\\s+[\\w.\"]+\\s*(;|$)"
   - "\\bdrop_all\\("
   - "\\bop\\.drop_\\w+\\("
   - "sendEmail\\("
   # deleting files or directories at runtime (user data paths)
-  - "\\brm\\s+-[a-zA-Z]*([rR][a-zA-Z]*f|f[a-zA-Z]*[rR])"
+  - "\\brm(?=[^;|&\\n]*\\s-([a-zA-Z]*[rR]|-recursive\\b))(?=[^;|&\\n]*\\s-([a-zA-Z]*f|-force\\b))"
   - "[\"']rm[\"']\\s*,\\s*[\"']-[a-zA-Z]*[rRf]"
   - "\\brmtree\\("
   - "os\\.(remove|unlink|rmdir)\\("
   - "\\.(unlink|rmdir)\\("
   - "fs\\.(rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\\("
+
+# Paths that are not classified at all: templates without real values.
+ignore:
+  - "**/.env.example"
+  - "**/.env.sample"
+  - "**/.env.template"
 
 # Paths whose added lines are not content-scanned (fixtures quoting SQL, for example).
 content_ignore:

@@ -99,7 +99,7 @@ def measure(base: str, working_tree: bool, rules_path: Path | None = None):
 
 
 def classify(changes, rules) -> dict[str, object]:
-    path_rules = [(glob, glob_to_regex(glob)) for glob in rules["one_way"]]
+    path_rules = [(glob, re.compile(glob_to_regex(glob).pattern, re.IGNORECASE)) for glob in rules["one_way"]]
     ignore = [glob_to_regex(glob) for glob in rules["ignore"]]
     content_ignore = [glob_to_regex(glob) for glob in rules["content_ignore"]]
     content = [(pattern, re.compile(pattern)) for pattern in rules["content_patterns"]]

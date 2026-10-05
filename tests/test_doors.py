@@ -166,6 +166,13 @@ class PreCommitOneWay(Scratch):
         self.assertEqual(result.returncode, 1)
         self.assertIn("one-way door on master", result.stdout)
 
+    def test_the_only_local_branch_is_the_default_branch(self):
+        self.git_repo(branch="trunk")
+        self.write("x.sql", "DROP TABLE users;\n")
+        no_config = clean_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        result = script("pr_body_check.py", cwd=self.root, env=no_config)
+        self.assertEqual(result.returncode, 1, result.stdout)
+
     def test_outside_a_repository_is_skipped(self):
         result = self.pr_stage()
         self.assertEqual(result.returncode, 78)
@@ -183,7 +190,7 @@ class BaseRules(Scratch):
         self.feature()
         weak = "\n".join(line for line in RULES.read_text().splitlines()
                          if "migrations" not in line and "sql" not in line.lower() and "drop" not in line.lower())
-        self.write(".claude/door-rules.yml", weak + '\nignore:\n  - "**"\n')
+        self.write(".claude/door-rules.yml", weak.replace("\nignore:\n", '\nignore:\n  - "**"\n'))
         self.write("migrations/002.sql", "DROP TABLE users;\n")
         self.commit("sneak")
         out = self.classify_json("--base", "main")
@@ -296,7 +303,7 @@ class KitRules(Scratch):
                      "charts/helm/values.yaml", "CLAUDE.md", "CODING_STANDARDS.md", ".claude/agents/reviewer.md",
                      ".claude/skills/implement-ticket/SKILL.md", "stryker.config.json", "eslint-rules/slopbrake.mjs",
                      ".dependency-cruiser.cjs", "eslint.config.mjs", "prisma/schema.prisma", "db/schema.rb",
-                     "app/db/schema.ts", "schema.sql"):
+                     "app/db/schema.ts", "schema.sql", "src/Auth/x.ts", "src/Payments/charge.py"):
             with self.subTest(path=path):
                 self.assertEqual(self.door(new_file_diff(path, "x = 1")), "one-way")
 
@@ -304,7 +311,8 @@ class KitRules(Scratch):
         for line in ("drop table users;", "ALTER TABLE t DROP COLUMN c;", "alter table t drop constraint k;",
                      "Delete From users", "metadata.drop_all(engine)", "subprocess.run('rm -fr /data')",
                      "from shutil import rmtree; rmtree(p)", "op.drop_column('t', 'c')",
-                     "subprocess.run([\"rm\", \"-rf\", path])"):
+                     "subprocess.run([\"rm\", \"-rf\", path])", "rm -r -f build", "rm --recursive --force /srv",
+                     "rm -R -f x", "truncate users;", "db.execute('truncate table users')"):
             with self.subTest(line=line):
                 self.assertEqual(self.door(new_file_diff("src/x.py", line)), "one-way")
 
@@ -315,7 +323,10 @@ class KitRules(Scratch):
                            ("src/x/tests/conftest.py", "db.run('DELETE FROM users')"),
                            ("pkg/conftest.py", "db.run('DROP TABLE users')"),
                            ("src/x.py", "    # we never DELETE FROM users here"),
-                           ("src/x.ts", "  // DROP TABLE is forbidden")):
+                           ("src/x.ts", "  // DROP TABLE is forbidden"),
+                           ("src/x.py", '    """Delete from the cache."""'),
+                           ("src/x.py", "rm -r build"), ("src/x.py", "label = truncate(name, 10)"),
+                           (".env.example", "API_KEY=changeme")):
             with self.subTest(path=path):
                 self.assertEqual(self.door(new_file_diff(path, line)), "two-way")
 
@@ -362,6 +373,15 @@ class BodyShape(Scratch):
         extra = "   ```\n   **Door:** one-way\n   ```"
         self.assertEqual(self.check(body(extra=extra)).returncode, 0, self.check(body(extra=extra)).stdout)
 
+    def test_door_in_an_unclosed_fence_does_not_count(self):
+        self.assert_fails(body().replace("**Door:** two-way", "```\n**Door:** two-way"), "exactly one '**Door:**")
+
+    def test_an_indented_code_block_is_not_a_second_door(self):
+        result = self.check(body(extra="Example:\n\n    **Door:** one-way"))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        result = self.check(body(extra="- step one\n\n    **Door:** one-way"))
+        self.assertEqual(result.returncode, 1, result.stdout)
+
     def test_door_must_be_exactly_one_way_or_two_way(self):
         self.assert_fails(body(door="two-way-ish"), "exactly one '**Door:**")
 
@@ -373,13 +393,23 @@ class BodyShape(Scratch):
         self.assertEqual(self.check(body().replace("**Blast Radius:**", "**Blast radius:**")).returncode, 0)
 
     def test_rollback_plans_that_say_nothing_fail(self):
-        for extra in ("No rollback possible.", "Mitigation: none.", "**Rollback:** n/a", "Rollback plan: N/A", "Mitigations: none"):
+        for extra in ("No rollback possible.", "Mitigation: none.", "**Rollback:** n/a", "Rollback plan: N/A", "Mitigations: none",
+                      "Rollback: not applicable here", "There is no rollback for this.", "Rollback: impossible.",
+                      "Rollback: no backup exists."):
             with self.subTest(extra=extra):
                 self.assert_fails(body(door="one-way", extra=extra), "rollback")
 
+    def test_door_and_blast_radius_words_are_not_a_plan(self):
+        for text in (body(door="one-way. No rollback possible."), body(door="one-way (no rollback)"),
+                     body(door="one-way", radius="high, no rollback")):
+            with self.subTest(text=text):
+                self.assert_fails(text, "rollback")
+
     def test_real_rollback_plans_pass(self):
         for extra in ("Rollback: restore from backup.", "**Rollback plan:**\n- revert the merge and run 0002 down",
-                      "Mitigation: feature flag `new_billing` stays off until verified."):
+                      "Mitigation: feature flag `new_billing` stays off until verified.",
+                      "No rollback for the data; mitigation: snapshot the table first and restore it.",
+                      "Rollback: `alembic downgrade -1`"):
             with self.subTest(extra=extra):
                 result = self.check(body(door="one-way", extra=extra))
                 self.assertEqual(result.returncode, 0, result.stdout)
@@ -407,6 +437,13 @@ class ReviewTraceability(Scratch):
     def test_review_commit_logged_by_finding_passes(self):
         result = self.check("- rename total (naming) → pending")
         self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_a_short_finding_needs_a_whole_word_match(self):
+        self.write("src/x.py", "grand_total = 2\n")
+        self.commit("review: on")
+        result = self.check("- rename total (naming) → pending\n- none")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("review: on", result.stdout)
 
     def test_review_commit_logged_by_sha_passes(self):
         sha = self.git("rev-parse", "--short=9", "HEAD")
