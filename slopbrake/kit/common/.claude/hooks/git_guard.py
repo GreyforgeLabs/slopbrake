@@ -2,8 +2,9 @@
 """PreToolUse guard (rule H5): block destructive git commands in agent sessions.
 
 The Bash command is parsed like a shell would (quotes, control operators, substitutions,
-heredocs, env prefixes, wrappers such as env/sudo/xargs, nested `bash -c` and `eval`
-payloads), then every git invocation is judged on its argv after git's global options.
+heredocs, env prefixes and exports, wrappers such as env/sudo/xargs, nested `bash -c` and
+`eval` payloads, scripts fed to a shell from echo/printf/cat or a process substitution), then
+every git invocation is judged on its argv after git's global options and `-c` config.
 Text inside the arguments of other commands (commit messages, grep patterns, heredocs
 written to files) is never matched. A command that does not parse falls back to a
 conservative check of the raw string.
@@ -28,9 +29,10 @@ MAX_DEPTH = 12
 CONTROL = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")", "\n")
 REDIRECTS = ("<<<", "<<-", "&>>", "<<", ">>", "&>", ">&", "<&", ">|", "<>", "<", ">")
 OPERATORS = sorted(CONTROL + REDIRECTS, key=len, reverse=True)
-RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "time"}
+RESERVED = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until", "time", "coproc"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+FALSE = ("false", "no", "off", "0", "")
 VARIABLE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])?")
 FALLBACK = re.compile(
     r"\bgit\b.*?(--force|--mirror|--delete|--prune|--no-verify|--hard|--merge|--discard-changes|hookspath"
@@ -241,6 +243,49 @@ def expansions(text):
     return found
 
 
+def here_texts(items):
+    """Heredoc bodies and here-strings among a simple command's items."""
+    texts = []
+    for i, item in enumerate(items):
+        if isinstance(item, Heredoc):
+            texts.append(item.body)
+        elif item == "<<<" and i + 1 < len(items) and isinstance(items[i + 1], Word):
+            texts.append(items[i + 1].text)
+    return texts
+
+
+def outputs(items):
+    """What a simple command writes to stdout, when that is knowable: echo/printf args, cat's heredoc."""
+    words, i = [], 0
+    while i < len(items):
+        if items[i] in REDIRECTS:
+            i += 1  # skip the redirect target
+        elif isinstance(items[i], Word):
+            words.append(items[i].text)
+        i += 1
+    name = basename(words[0]) if words else ""
+    if name in ("echo", "printf"):
+        text = [w for w in words[1:] if not re.fullmatch(r"-[neE]+", w)]
+        return [" ".join(text), *text]
+    return here_texts(items) if name == "cat" else []
+
+
+def emitted(command):
+    """Everything the simple commands of command (a process substitution) knowably print."""
+    try:
+        toks = Lexer(command).tokens()
+    except Unparseable:
+        return []
+    found, current = [], []
+    for tok in [*toks, "\n"]:
+        if isinstance(tok, str) and tok not in REDIRECTS:
+            found += outputs(current) if current else []
+            current = []
+        else:
+            current.append(tok)
+    return found
+
+
 def split_words(text):
     """shlex word splitting for env -S strings and alias values; whitespace when quotes don't balance."""
     try:
@@ -334,12 +379,12 @@ def whole_tree(spec):
 
 
 class Judge:
-    def __init__(self, cwd, scope, depth=0):
-        self.dir, self.scope, self.depth = cwd, scope, depth
+    def __init__(self, cwd, scope, depth=0, env=None):
+        self.dir, self.scope, self.depth, self.env, self.procsubs = cwd, scope, depth, env or {}, {}
 
     def string(self, text, cwd=False):
         if cwd is not False:
-            return Judge(cwd, self.scope, self.depth + 1).string(text)
+            return Judge(cwd, self.scope, self.depth + 1, dict(self.env)).string(text)
         if self.depth > MAX_DEPTH:
             return "the command nests shells too deeply to check"
         try:
@@ -386,14 +431,18 @@ class Judge:
                 subs += items[i].subs
                 if item == "<<<":
                     stdin.append(items[i].text)
+                elif item == "<" and items[i].text.startswith("<("):
+                    stdin += [text for sub in items[i].subs for text in emitted(sub)]
             i += 1
         for sub in subs:
             reason = self.nested(sub)
             if reason:
                 return reason
         env = {}
+        self.procsubs = {w.text: w.subs for w in words if w.text.startswith("<(")}
         while words and words[0].text in RESERVED - {"time"}:
-            words.pop(0)
+            if words.pop(0).text == "coproc" and len(words) > 1 and words[1].text == "{":
+                words.pop(0)  # coproc NAME { ...; }
         while words and ASSIGNMENT.match(words[0].text) and (
                 words[0].quote_at is None or words[0].quote_at >= ASSIGNMENT.match(words[0].text).end()):
             name, _, value = words.pop(0).text.partition("=")
@@ -416,8 +465,10 @@ class Judge:
                     argv = argv[1:]
             elif name == "exec":
                 argv = skip_options(argv[1:], takes_value=("-a",))
-            elif name == "nohup":
-                argv = argv[1:]
+            elif name in ("nohup", "setsid"):
+                argv = skip_options(argv[1:])
+            elif name == "stdbuf":
+                argv = skip_options(argv[1:], takes_value=("-i", "-o", "-e"))
             elif name in ("sudo", "doas"):
                 argv, chdir = sudo_options(argv[1:])
                 cwd = resolve(cwd, chdir) if chdir else cwd
@@ -442,45 +493,53 @@ class Judge:
             self.dir = None if target == "-" else resolve(self.dir, target)
         elif name == "popd":
             self.dir = None
+        elif name == "export" or (name in ("declare", "typeset", "local") and any(
+                a.startswith("-") and "x" in a for a in argv[1:])):
+            self.env.update(a.split("=", 1) for a in argv[1:] if ASSIGNMENT.match(a))
         elif name == "eval":
             return self.string(" ".join(argv[1:]), cwd=cwd)
+        elif name in ("source", "."):
+            return self.scripts(self.substituted(argv[1:2]), cwd)
         elif name in SHELLS:
             return self.shell(argv[1:], stdin, piped_from, cwd)
         elif name == "git":
-            return Git(self, cwd, env).run(argv[1:])
+            return Git(self, cwd, {**self.env, **env}).run(argv[1:])
         return None
 
-    def shell(self, args, stdin, piped_from, cwd):
-        i, reads_stdin = 0, False
-        while i < len(args):
-            a = args[i]
-            if a == "--":
-                i += 1
-                break
-            if a in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-                i += 2
-            elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
-                if "c" in a:
-                    return self.string(args[i + 1], cwd=cwd) if i + 1 < len(args) else None
-                reads_stdin = reads_stdin or "s" in a
-                i += 1
-            elif a.startswith(("--", "+")):
-                i += 1
-            else:
-                break
-        if i < len(args) and not reads_stdin:
-            return None  # runs a script file
-        scripts = list(stdin)
-        if piped_from:
-            words = [w.text for w in piped_from if isinstance(w, Word)]
-            if words and basename(words[0]) in ("echo", "printf"):
-                text = [w for w in words[1:] if not re.fullmatch(r"-[neE]+", w)]
-                scripts += [" ".join(text), *text]
+    def substituted(self, args):
+        """The scripts printed by process-substitution arguments such as <(echo ...)."""
+        return [text for a in args for sub in self.procsubs.get(a, ()) for text in emitted(sub)]
+
+    def scripts(self, scripts, cwd):
         for script in scripts:
             reason = self.string(script.replace("\\n", "\n"), cwd=cwd)
             if reason:
                 return reason
         return None
+
+    def shell(self, args, stdin, piped_from, cwd):
+        # Like bash/sh, options (and -o/-O values) keep being read after -c; the first operand is the payload.
+        i, reads_stdin, command = 0, False, False
+        while i < len(args):
+            a = args[i]
+            if a == "--":
+                i += 1
+                break
+            if a in ("--rcfile", "--init-file"):
+                i += 2
+            elif a[:1] in "-+" and not a.startswith("--") and len(a) > 1:
+                command = command or (a[0] == "-" and "c" in a)
+                reads_stdin = reads_stdin or "s" in a
+                i += 1 + a.count("o") + a.count("O")
+            elif a.startswith("--"):
+                i += 1
+            else:
+                break
+        if command:
+            return self.string(args[i], cwd=cwd) if i < len(args) else None
+        if i < len(args) and not reads_stdin and args[i] != "-":
+            return self.scripts(self.substituted(args[i:i + 1]), cwd)  # a script file: checkable only as <(...)
+        return self.scripts([*stdin, *(outputs(piped_from) if piped_from else [])], cwd)
 
 
 def skip_options(argv, takes_value=()):
@@ -539,7 +598,7 @@ class Git:
     """One git invocation: global options, then the subcommand's rule."""
 
     def __init__(self, judge, cwd, env):
-        self.judge, self.cwd, self.env, self.config = judge, cwd, env, []
+        self.judge, self.cwd, self.env, self.config, self.nested = judge, cwd, env, [], False
         self.git_dir, self.work_tree = env.get("GIT_DIR"), env.get("GIT_WORK_TREE")
 
     def run(self, args):
@@ -563,7 +622,7 @@ class Git:
         if i >= len(args):
             return None
         reason = self.config_reason() or self.subcommand(args[i], args[i + 1:])
-        if reason and self.judge.scope == "managed" and not managed(self.effective_dir()):
+        if reason and not self.nested and self.judge.scope == "managed" and not managed(self.effective_dir()):
             return None
         return reason
 
@@ -574,6 +633,21 @@ class Git:
             git_dir = resolve(self.cwd, self.git_dir)
             return os.path.dirname(git_dir) if git_dir and basename(git_dir) == ".git" else git_dir
         return self.cwd
+
+    def inner(self, command):
+        """Judge a command git itself runs; its reason already carries its own managed-scope verdict."""
+        reason = self.judge.string(command, cwd=self.cwd)
+        self.nested = self.nested or bool(reason)
+        return reason
+
+    def setting(self, pattern):
+        """True/False for the last -c entry whose key matches pattern, None when unset."""
+        found = None
+        for entry in self.config:
+            key, eq, value = entry.partition("=")
+            if re.fullmatch(pattern, key.lower()):
+                found = value.lower() not in FALSE if eq else True
+        return found
 
     def config_reason(self):
         keys = [entry.partition("=")[0].lower() for entry in self.config]
@@ -588,7 +662,7 @@ class Git:
             if key.lower() == f"alias.{sub.lower()}" and value:
                 self.config.remove(entry)
                 if value.startswith("!"):
-                    return self.judge.string(" ".join([value[1:], *map(shlex.quote, rest)]), cwd=self.cwd)
+                    return self.inner(" ".join([value[1:], *map(shlex.quote, rest)]))
                 words = split_words(value)
                 return self.subcommand(words[0], words[1:] + rest) if words else None
         rule = getattr(self, "rule_" + sub.replace("-", "_"), None)
@@ -599,7 +673,7 @@ class Git:
         opts, pos = parse(rest, short_arg="o", long_arg=("--repo", "--receive-pack", "--exec", "--push-option"))
         if has(opts, "-f", "--force", "--force-with-lease", "--force-if-includes"):
             return "force push rewrites remote history"
-        if has(opts, "--mirror", "-d", "--delete", "--prune"):
+        if has(opts, "--mirror", "-d", "--delete", "--prune") or self.setting(r"remote\..+\.mirror"):
             return "this push deletes or overwrites remote refs"
         if has(opts, "--no-verify"):
             return "--no-verify skips the pre-push gate"
@@ -614,7 +688,8 @@ class Git:
 
     def rule_clean(self, rest):
         opts, _ = parse(rest, short_arg="e", long_arg=("--exclude",))
-        if has(opts, "-f", "--force") and not has(opts, "-n", "--dry-run"):
+        if (has(opts, "-f", "--force") or self.setting("clean.requireforce") is False) and not has(
+                opts, "-n", "--dry-run"):
             return "clean -f deletes untracked files"
         return None
 
@@ -628,9 +703,11 @@ class Git:
         return None
 
     def rule_checkout(self, rest):
-        opts, pos = parse(rest, short_arg="bB", long_arg=("--orphan",))
+        opts, pos = parse(rest, short_arg="bB", long_arg=("--orphan", "--pathspec-from-file"))
         if has(opts, "-f", "--force"):
             return "checkout --force discards uncommitted changes"
+        if has(opts, "--pathspec-from-file"):
+            return "pathspecs read from a file can't be checked and may cover the whole tree"
         if any(whole_tree(p) for p in pos):
             return "checking out the whole tree discards uncommitted changes"
         return None
@@ -641,8 +718,10 @@ class Git:
             opts, "-f", "--force", "--discard-changes") else None
 
     def rule_restore(self, rest):
-        opts, pos = parse(rest, short_arg="s", long_arg=("--source",))
+        opts, pos = parse(rest, short_arg="s", long_arg=("--source", "--pathspec-from-file"))
         worktree = has(opts, "-W", "--worktree") or not has(opts, "-S", "--staged")
+        if worktree and has(opts, "--pathspec-from-file"):
+            return "pathspecs read from a file can't be checked and may cover the whole tree"
         if worktree and any(whole_tree(p) for p in pos):
             return "restoring the whole working tree discards uncommitted changes"
         return None
@@ -663,6 +742,9 @@ class Git:
     def rule_merge(self, rest):
         return self.no_verify(parse(rest, short_arg="mFsX", long_arg=("--message", "--file", "--strategy"))[0])
 
+    def rule_pull(self, rest):
+        return self.no_verify(parse(rest, short_arg="sXo", long_arg=("--strategy", "--strategy-option"))[0])
+
     def rule_am(self, rest):
         return self.no_verify(parse(rest)[0])
 
@@ -670,7 +752,7 @@ class Git:
         opts, _ = parse(rest, short_arg="sXx", long_arg=("--exec", "--onto", "--strategy", "--strategy-option"))
         for name, value in opts:
             if name in ("-x", "--exec"):
-                reason = self.judge.string(value, cwd=self.cwd)
+                reason = self.inner(value)
                 if reason:
                     return f"rebase --exec runs it: {reason}"
         return self.no_verify(opts)
@@ -681,7 +763,7 @@ class Git:
         command = rest[rest.index("foreach") + 1:]
         while command and command[0].startswith("-"):
             command = command[1:]
-        reason = self.judge.string(" ".join(command), cwd=self.cwd)
+        reason = self.inner(" ".join(command))
         return f"submodule foreach runs it: {reason}" if reason else None
 
     def rule_config(self, rest):
@@ -697,6 +779,12 @@ class Git:
                 action in ("set", "unset") or has(opts, "--unset", "--unset-all", "--replace-all", "--add")
                 or (action is None and len(pos) > 1 and not has(opts, "--get", "--get-all", "--get-regexp"))):
             return "changing core.hooksPath switches off the repo's git hooks"
+        if key.startswith("alias.") and len(pos) > 1 and not has(opts, "--get", "--get-all", "--get-regexp"):
+            value = pos[1]
+            words = split_words(value)
+            reason = self.inner(value[1:]) if value.startswith("!") else (
+                Git(self.judge, self.cwd, self.env).subcommand(words[0], words[1:]) if words else None)
+            return f"the alias would run a blocked command: {reason}" if reason else None
         return None
 
     def rule_update_ref(self, rest):

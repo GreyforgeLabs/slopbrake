@@ -111,6 +111,30 @@ BLOCK = {
     "unparseable commands fall back to the raw-string check": [
         'git push -f "', "git reset --hard\necho 'unterminated", 'echo "$(git clean -fd', "git commit --no-verify 'x",
     ],
+    "options between a shell's -c and its payload": [
+        "bash -c -- 'git push -f'", "bash -c -x 'git push -f'", "bash -c -o pipefail 'git reset --hard'",
+        "sh -c +e 'git push -f'", "bash -co pipefail 'git push -f'", "bash -eo pipefail -c 'git push -f'",
+        "bash --norc -c 'git push -f'", "bash -c -e -- 'git clean -fd'",
+    ],
+    "heredocs and here-strings piped through cat into a shell": [
+        "cat <<'EOF' | bash\ngit push -f\nEOF", "cat <<EOF2 | sh\ngit reset --hard\nEOF2", "cat <<< 'git push -f' | bash",
+        "cat - <<'EOF' | bash -s\ngit clean -fd\nEOF",
+        "echo 'git push -f' | bash -", "cat <<'EOF' | sh -\ngit push -f\nEOF",
+    ],
+    "exported git config": [
+        "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null; git commit -m x",
+        "export GIT_CONFIG_KEY_0=core.hooksPath\ngit commit -m x", "declare -x GIT_CONFIG_KEY_0=core.hooksPath; git commit -m x",
+        "export GIT_CONFIG_KEY_0=core.hooksPath; bash -c 'git commit -m x'",
+    ],
+    "config-driven and indirect equivalents": [
+        "git pull --no-verify", "git pull --rebase --no-verify origin main", "git -c clean.requireForce=false clean -d",
+        "git -c clean.requireforce=0 clean -dx", "git -c remote.origin.mirror=true push origin",
+        "git config alias.nuke '!git reset --hard'", "git config alias.nuke 'reset --hard'",
+        "git config --global alias.p 'push -f'", "git config set alias.c 'commit --no-verify'",
+        "stdbuf -oL git push -f", "stdbuf -o L git push -f", "setsid git push -f", "setsid -f git reset --hard",
+        "coproc git push -f", "source <(echo git push -f)", ". <(echo 'git push -f')", "bash <(echo 'git push -f')",
+        "bash < <(echo 'git push -f')", "git checkout --pathspec-from-file=- <<< .", "git restore --pathspec-from-file=list.txt",
+    ],
 }
 
 ALLOW = {
@@ -139,6 +163,16 @@ ALLOW = {
         "git branch -f x HEAD", "git submodule foreach 'git status'", "git rebase -x 'make test' main",
         "git -c alias.st=status st", "env FOO=1 git status", "bash -c 'git status && git log'", "git update-ref refs/x HEAD",
         "git reflog show", "git checkout -- src", "git tag -d v1", "git push origin v1.0.0", "",
+    ],
+    "near misses of the round-2 forms": [
+        "bash -c -- 'git status'", "bash -c -x 'git log'", "sh -c +e 'git push origin x'", "bash -o pipefail script.sh",
+        "cat <<'EOF' | grep push\ngit push -f\nEOF", "cat <<'EOF' | bash\ngit status\nEOF", "export FOO=1; git status",
+        "export GIT_CONFIG_KEY_0=color.ui; git commit -m x", "git pull --rebase", "git pull --no-verify-signatures",
+        "git -c clean.requireForce=true clean -d", "git -c clean.requireForce=false clean -n",
+        "git -c remote.origin.mirror=false push origin x", "git config alias.st status", "git config alias.lg 'log --oneline'",
+        "git config --get alias.nuke", "stdbuf -oL git log", "setsid git status", "source <(echo export X=1)",
+        "source ./env.sh", ". ./env.sh", "bash <(echo 'git status')", "git restore --staged --pathspec-from-file=list.txt",
+        "diff <(git show HEAD:a) a",
     ],
 }
 
@@ -248,6 +282,12 @@ class Managed(unittest.TestCase):
         for cwd in (self.managed, self.plain, self.loose):
             self.assertIsNotNone(self.check("git reset --hard", cwd, scope="always"))
             self.assertIsNone(self.check('git commit -m "reset --hard"', cwd, scope="always"))
+
+    def test_nested_command_is_judged_against_its_own_directory(self):
+        self.assertIsNotNone(self.check(f"git -C {self.plain} -c alias.x='!git -C {self.managed} push -f' x", self.plain))
+        self.assertIsNotNone(self.check(f"git -c alias.x='!cd {self.managed} && git push -f' x", self.plain))
+        self.assertIsNotNone(self.check(f"git rebase -x 'git -C {self.managed} reset --hard' main", self.plain))
+        self.assertIsNone(self.check(f"git -C {self.managed} -c alias.x='!git -C {self.plain} push -f' x", self.plain))
 
     def test_unbalanced_quotes_in_a_nested_string_do_not_raise(self):
         self.assertIsNotNone(self.check("git -c alias.x='!git push -f \"' x", self.managed))
