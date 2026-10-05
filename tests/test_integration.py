@@ -115,5 +115,37 @@ class UserLevelGuard(Scratch):
         self.assertIn("ask them to run it", result.stderr)
 
 
+class KitWritesNoBytecode(Scratch):
+    def test_no_kit_script_leaves_a_pycache_in_the_repo(self):
+        # The kit lives in scripts/slopbrake/, a one-way path: bytecode written there by a gate run
+        # dirties the tree and trips the default-branch door on the next commit.
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        kit = self.root / "scripts/slopbrake"
+        kit.mkdir(parents=True)
+        for script in GUARDS.glob("*.py"):
+            (kit / script.name).write_text(script.read_text())
+        self.write("tests/test_ok.py", "def test_ok():\n    assert 1 + 1 == 2\n")
+        self.commit("init")
+        env = dict(os.environ)
+        env.pop("PYTHONDONTWRITEBYTECODE", None)
+        for args in (["changed_ranges.py"], ["tautology_py.py", "tests"], ["boundaries_py.py", "."],
+                     ["door_classify.py", "--rules", str(HOME / "slopbrake/kit/common/.claude/door-rules.yml"), "--base", "HEAD"],
+                     ["mutation_py.py", "--base", "HEAD", "--test-cmd", "true"]):
+            sh([sys.executable, str(kit / args[0]), *args[1:]], self.root, env)
+        self.assertEqual(sorted(p.name for p in kit.rglob("*.pyc")), [])
+
+
+class StatusSeesTrackedBytecode(Scratch):
+    def test_tracked_kit_bytecode_is_a_gap(self):
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        self.write("pyproject.toml", "[project]\nname = 'shop'\n")
+        self.commit("init")
+        self.assertEqual(self.slopbrake("init", ".").returncode, 0)
+        self.write("scripts/slopbrake/__pycache__/common.cpython-314.pyc", "x")
+        sh(["git", "add", "-f", "scripts/slopbrake/__pycache__/common.cpython-314.pyc"], self.root)
+        result = self.slopbrake("status", ".")
+        self.assertIn("kit bytecode is tracked in git", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

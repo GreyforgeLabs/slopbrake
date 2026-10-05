@@ -691,6 +691,11 @@ def status(repo: Path) -> dict:
         stale = stale_files(repo, stack)
         if stale:
             gaps.append(f"kit is stale: {len(stale)} managed file(s) differ; run slopbrake init --update")
+    bytecode = [f for f in git(repo, "ls-files", "--", "scripts/slopbrake", ".claude", check=False).splitlines()
+                if f.endswith(".pyc")]
+    if bytecode:
+        gaps.append(f"kit bytecode is tracked in git ({len(bytecode)} .pyc file(s)); every gate run rewrites it: "
+                    f"git rm --cached {' '.join(bytecode)}")
     stages = re.search(r"^STAGES=\(([^)]*)\)", read_text(repo / "scripts/check"), re.MULTILINE)
     if stack and stages:
         gaps += [f"scripts/check does not run the kit's {name} stage" for name in kit_stages(stack)

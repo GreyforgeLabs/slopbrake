@@ -38,6 +38,7 @@ import re
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import python_files
 
