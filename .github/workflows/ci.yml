@@ -22,6 +22,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: git config --global user.name ci && git config --global user.email ci@example.com
       - run: scripts/check
+        env:
+          SLOPBRAKE_OWN_MUTATION: ${{ matrix.python == '3.12' && github.event_name == 'pull_request' }}
   secrets:
     runs-on: ubuntu-latest
     steps:

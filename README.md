@@ -201,7 +201,7 @@ Any mistakes in turning these ideas into checks are ours, not his.
 
 ## Developing
 
-`scripts/check` runs Slopbrake's own gate: pinned ruff, behaviour tests for every Python check (run through their command lines against seeded git repos), Slopbrake's own T1 check over those tests, and RuleTester cases for the ESLint rules. The pre-commit hook and CI run it. The brand art is generated from source: `brand/make_logo.py`, `brand/src/banner.html` and `brand/make_terminal.py`.
+`scripts/check` runs Slopbrake's own gate: pinned ruff, behaviour tests for every Python check (run through their command lines against seeded git repos), Slopbrake's own T1 check over those tests, RuleTester cases for the ESLint rules, and its own T4 floor on the kit's changed lines. The pre-commit hook runs it without mutation, pre-push runs the rest, and CI runs all of it on pull requests (the mutation stage reruns the suite per mutant and takes about an hour; `SLOPBRAKE_OWN_MUTATION=true` runs it locally). The brand art is generated from source: `brand/make_logo.py`, `brand/src/banner.html` and `brand/make_terminal.py`.
 
 ## License
 
