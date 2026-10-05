@@ -30,9 +30,19 @@ class Scratch(unittest.TestCase):
         self.state = self.base / "state"
         self.settings = self.base / "home/.claude/settings.json"
         self.marker = self.base / "stop-ran"
+        # The `slopbrake` Claude Code would run: this checkout, not whatever build is installed.
+        self.good_bin = self.shim("good", f'exec {sys.executable} -m slopbrake "$@"')
+
+    def shim(self, name, body):
+        bindir = self.base / "bin" / name
+        bindir.mkdir(parents=True)
+        (bindir / "slopbrake").write_text(f"#!/bin/sh\n{body}\n")
+        (bindir / "slopbrake").chmod(0o755)
+        return bindir
 
     def env(self, **extra):
         return {**os.environ, "PYTHONPATH": str(HOME), "HOME": str(self.base / "home"),
+                "PATH": f"{self.good_bin}{os.pathsep}{os.environ['PATH']}",
                 "XDG_STATE_HOME": str(self.state), "CLAUDE_PROJECT_DIR": str(self.base), **extra}
 
     def gf(self, *args, stdin=None, **env):
@@ -90,6 +100,25 @@ class UserHooks(Scratch):
         self.assertEqual(result.returncode, 2)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.settings.read_text(), "{ // nope\n")
+
+    def test_install_refuses_a_slopbrake_on_path_that_cannot_run_hook(self):
+        # An older build answers `slopbrake hook` with an argparse error (exit 2), which
+        # Claude Code reads as "block": every Bash call and every Stop would be refused.
+        old = self.shim("old", "echo \"slopbrake: error: argument command: invalid choice: 'hook'\" >&2; exit 2")
+        path = f"{old}{os.pathsep}{os.environ['PATH']}"
+        result = self.gf("user-hooks", "install", "--settings", str(self.settings), PATH=path)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("slopbrake hook", result.stderr)
+        self.assertFalse(self.settings.exists())
+        self.assertEqual(self.gf("user-hooks", "install", "--settings", str(self.settings)).returncode, 0)
+        result = self.gf("user-hooks", "status", "--settings", str(self.settings), "--json", PATH=path)
+        self.assertEqual(result.returncode, 1)
+        status = json.loads(result.stdout)
+        self.assertTrue(status["installed"])
+        self.assertFalse(status["runnable"])
+        self.assertTrue(json.loads(self.gf("user-hooks", "status", "--settings", str(self.settings), "--json")
+                                   .stdout)["runnable"])
 
     def test_install_creates_a_missing_settings_file(self):
         self.assertEqual(self.gf("user-hooks", "install", "--settings", str(self.settings)).returncode, 0)

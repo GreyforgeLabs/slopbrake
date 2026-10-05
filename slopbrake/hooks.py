@@ -33,7 +33,7 @@ OPERATORS = set("();<>|&")
 
 
 class SettingsError(ValueError):
-    """A Claude Code settings file slopbrake must not rewrite."""
+    """A Claude Code settings file slopbrake must not rewrite (or must not wire up yet)."""
 
 
 # ── repos ────────────────────────────────────────────────────────────────────
@@ -265,12 +265,27 @@ def ours(command: str) -> bool:
     return command.startswith(PREFIX)
 
 
+def runnable() -> tuple[str | None, bool]:
+    """The `slopbrake` Claude Code would run, and whether it answers a no-op hook event with exit 0.
+    An older build has no `hook` command: its argparse exit 2 would block every Bash call and Stop."""
+    binary = shutil.which("slopbrake")
+    if not binary:
+        return None, False
+    try:
+        result = subprocess.run([binary, "hook", "pre-tool-use"], input="{}", capture_output=True, text=True,
+                                timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return binary, False
+    return binary, result.returncode == 0
+
+
 def user_status(path: Path) -> dict:
     data = load_settings(path)
     events = {event: any(ours(c) for entry in hook_entries(data, event) for c in commands(entry))
               for event in USER_ENTRIES}
+    binary, ready = runnable()
     return {"settings": str(path), "events": events, "installed": all(events.values()),
-            "on_path": shutil.which("slopbrake") is not None}
+            "on_path": binary is not None, "binary": binary, "runnable": ready}
 
 
 def write_settings(path: Path, data: dict) -> None:
@@ -283,6 +298,11 @@ def write_settings(path: Path, data: dict) -> None:
 
 def install(path: Path) -> dict:
     data = load_settings(path)
+    binary, ready = runnable()
+    if not ready:
+        raise SettingsError(f"{binary or 'slopbrake'} cannot run `{PREFIX} pre-tool-use`"
+                            f"{'' if binary else ' (not on PATH)'}; install this slopbrake version first, "
+                            "or every session's Bash calls and Stops would be blocked")
     present = user_status(path)["events"]
     if not all(present.values()):
         hooks = data["hooks"] = data.get("hooks") or {}

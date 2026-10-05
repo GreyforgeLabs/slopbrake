@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,7 +30,7 @@ import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from slopbrake import hooks
+from slopbrake import __version__, hooks
 
 HOME = Path(__file__).resolve().parent  # the package: kit/ and vendor/ ship inside it
 KIT = HOME / "kit"
@@ -57,7 +58,7 @@ SPEC_FILES = ["CLAUDE.md", "CODING_STANDARDS.md", ".claude/agents/reviewer.md",
               "docs/agents/retro-log.md", "docs/agents/issue-tracker.md"]
 CLAUDE_MD_MAX_LINES = 40
 GITIGNORE = {"python": ["__pycache__/", ".ruff_cache/", ".mypy_cache/"], "typescript": [".stryker-tmp/", "reports/"]}
-LAST_GREEN = "refs/slopbrake/last-green"
+LAST_GREEN = "refs/slopbrake/last-green"  # + /<branch>; detached HEAD has none
 META = ".claude/slopbrake.json"
 TYPES_PLACEHOLDER = "no type checker configured"
 ESLINT_CONFIGS = [f"eslint.config.{ext}" for ext in ("js", "mjs", "cjs", "ts", "mts", "cts")] + [
@@ -88,13 +89,21 @@ def last_line(result: subprocess.CompletedProcess) -> str:
     return lines[-1] if lines else f"exit {result.returncode}"
 
 
+def cause_line(result: subprocess.CompletedProcess) -> str:
+    """The first line that says why a tool failed (npm leads with codes and ends with a log path)."""
+    for line in (result.stderr.strip() or result.stdout.strip()).splitlines():
+        text = re.sub(r"^(npm (error|ERR!)|error)\s*", "", line.strip())
+        if text and not re.match(r"code \S+$|A complete log", text):
+            return line.strip()
+    return last_line(result)
+
+
 def git(repo: Path, *args: str, check=True) -> str:
     return run(["git", *args], repo, check=check).stdout.strip()
 
 
 def kit_version() -> str:
     """Package version, plus the commit when running from a git checkout of the kit."""
-    from slopbrake import __version__
     sha = git(HOME, "rev-parse", "--short", "HEAD", check=False) if (HOME.parent / ".git").exists() else ""
     return f"{__version__}+{sha}" if sha else __version__
 
@@ -136,6 +145,31 @@ def default_branch(repo: Path) -> str:
         if run(["git", "rev-parse", "--verify", "-q", name], repo).returncode == 0:
             return name
     return git(repo, "branch", "--show-current", check=False) or "main"
+
+
+def last_green_ref(repo: Path) -> str | None:
+    """The current branch's last-green ratchet; None on a detached HEAD (never recorded or used)."""
+    branch = git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False)
+    return f"{LAST_GREEN}/{branch}" if branch else None
+
+
+def commit_paths(repo: Path, paths: list[str], pending: list[str]) -> list[str]:
+    """Kit paths with uncommitted (or, in a dry run, `pending`) changes, kit-owned directories
+    collapsed, for a `git add` that sweeps in nothing else."""
+    prefix = git(repo, "rev-parse", "--show-prefix", check=False)  # porcelain paths are toplevel-relative
+    dirty = run(["git", "status", "--porcelain", "-z", "--untracked-files=all", "--", *paths], repo).stdout
+    found = {entry[3:].removeprefix(prefix) for entry in dirty.split("\0") if len(entry) > 3} | set(pending)
+    out: dict[str, None] = {}
+    for rel in paths:
+        if rel not in found:
+            continue
+        for owned in ("scripts/slopbrake/", ".claude/hooks/", ".githooks/"):
+            if rel.startswith(owned):
+                rel = owned.rstrip("/")
+        if rel.startswith(".claude/skills/"):
+            rel = "/".join(rel.split("/")[:3])
+        out[rel] = None
+    return sorted(out)
 
 
 def package_manager(repo: Path) -> str:
@@ -355,11 +389,14 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
             prefix = "" if not ignored or ignore_file.read_text(encoding="utf-8").endswith("\n") else "\n"
             with ignore_file.open("a", encoding="utf-8") as handle:
                 handle.write(prefix + "".join(entry + "\n" for entry in missing))
-    if git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False) and \
-            not git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False):
-        actions.append(Action(LAST_GREEN, "create", "the last-green ratchet starts at HEAD"))
+    ratchet = last_green_ref(repo)
+    if ratchet and git(repo, "rev-parse", "-q", "--verify", "HEAD^{commit}", check=False) and \
+            not git(repo, "rev-parse", "-q", "--verify", ratchet, check=False):
+        actions.append(Action(ratchet, "create", "the last-green ratchet starts at HEAD"))
         if not dry_run:
-            git(repo, "update-ref", LAST_GREEN, "HEAD")
+            if git(repo, "rev-parse", "-q", "--verify", LAST_GREEN, check=False):
+                git(repo, "update-ref", "-d", LAST_GREEN)  # a pre-A1 flat ref blocks the per-branch namespace
+            git(repo, "update-ref", ratchet, "HEAD")
     hooks_path = git(repo, "config", "--get", "core.hooksPath", check=False)
     hooks_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-path", "hooks"))
     live_hooks = sorted(p.name for p in hooks_dir.glob("*") if not p.name.endswith(".sample")) \
@@ -391,8 +428,18 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     check_text = read_text(repo / "scripts/check") or files.get("scripts/check", "")  # a dry run wrote nothing
     if stack == "python" and TYPES_PLACEHOLDER in check_text:
         next_steps.append("choose a type checker for the types stage in scripts/check (it skips until then)")
-    next_steps.append(f"commit the kit (verify proves the committed HEAD): cd {repo} && git add -A . && "
-                      "git commit -m 'Add slopbrake guardrails'")
+    written = [a.path for a in actions if a.action in ("create", "update", "merge") and a.path != ratchet]
+    paths = commit_paths(repo, [*files, ".gitignore"], written if dry_run else [])
+    if paths:
+        cd, add = f"cd {shlex.quote(str(repo))}", f"git add -- {' '.join(map(shlex.quote, paths))}"
+        commit = "git commit -m 'Add slopbrake guardrails'"
+        branch = git(repo, "branch", "--show-current", check=False)
+        if branch == default_branch(repo):  # the pr stage blocks one-way doors, such as the kit itself, here
+            next_steps.append(f"commit the kit on a feature branch (the gate blocks one-way doors on {branch}): "
+                              f"{cd} && git switch -c add-slopbrake && {add} && {commit}  "
+                              f"(or a human commits it on {branch} with --no-verify)")
+        else:
+            next_steps.append(f"commit the kit (verify proves the committed HEAD): {cd} && {add} && {commit}")
     next_steps.append(f"prove it: slopbrake verify {repo}")
     return {"repo": str(repo), "stack": stack, "dry_run": dry_run, "hooks": hooks_note,
             "actions": [asdict(a) for a in actions], "next_steps": next_steps}
@@ -436,7 +483,6 @@ def status(repo: Path) -> dict:
     gaps += wiring_gaps(repo)
     stack, stale = recorded_stack(repo), []
     if stack:
-        from slopbrake import __version__
         installed = str(json.loads((repo / META).read_text(encoding="utf-8")).get("kit_version", "unknown"))
         if installed.split("+")[0] != __version__:
             gaps.append(f"kit is stale: installed {installed}, running slopbrake {__version__}; run slopbrake init --update")
@@ -580,7 +626,7 @@ class Verifier:
         self.scratch = Path(tempfile.mkdtemp(prefix="slopbrake-verify-"))
         git(self.top, "worktree", "add", "--detach", str(self.scratch / "wt"), self.head)
         self.wt = self.scratch / "wt" / self.repo.relative_to(self.top)
-        self.stack = recorded_stack(self.wt) or detect_stack(self.repo)  # the committed record first
+        self.stack = recorded_stack(self.wt) or detect_stack(self.wt)  # as committed
         if self.stack == "typescript" and (self.wt / "package.json").is_file():
             # A real install from the package manager's store; package managers reject a
             # symlinked node_modules and try to reinstall mid-check.
@@ -589,7 +635,7 @@ class Verifier:
                        "bun": "bun install --frozen-lockfile", "npm": "npm ci --prefer-offline"}[package_manager(self.wt)]
             result = run(install, self.wt)
             if result.returncode != 0:
-                raise UsageError(f"{install} failed in the verify worktree: {last_line(result)}")
+                raise UsageError(f"{install} failed in the verify worktree: {cause_line(result)}")
 
     def cleanup(self) -> None:
         if self.keep or self.scratch is None:
@@ -775,6 +821,9 @@ def print_human(command: str, result) -> None:
         print(f"slopbrake user hooks in {result['settings']}: {on}")
         if not result["on_path"]:
             print("note: `slopbrake` is not on PATH, so Claude Code cannot run these hooks")
+        elif not result["runnable"]:
+            print(f"WARNING: {result['binary']} cannot run `slopbrake hook`: installed hooks block every session; "
+                  "install this slopbrake version or run slopbrake user-hooks uninstall")
     else:
         for p in result["proofs"]:
             print(f"{'ok  ' if p['ok'] else 'FAIL'}  [{p.get('rule', '')}] {p['proof']}")
@@ -830,6 +879,7 @@ def main(argv: list[str] | None = None) -> int:
             action = {"install": hooks.install, "uninstall": hooks.uninstall, "status": hooks.user_status}[args.action]
             result = action(args.settings or hooks.default_settings())
             ok = result["installed"] != (args.action == "uninstall")
+            ok = ok and (args.action != "status" or result["runnable"])
     except (UsageError, hooks.SettingsError, RuntimeError) as exc:
         message = " ".join(str(exc).split())
         if args.json:

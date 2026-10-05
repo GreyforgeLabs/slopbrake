@@ -91,7 +91,7 @@ class Init(Scratch):
         self.assertIn("choose a type checker", result.stdout)
         self.assertFalse((self.root / "scripts/check").exists())
         self.assertEqual(sh(["git", "config", "--get", "core.hooksPath"], self.root).stdout, "")
-        self.assertEqual(sh(["git", "rev-parse", "-q", "--verify", "refs/slopbrake/last-green"], self.root).stdout, "")
+        self.assertEqual(sh(["git", "for-each-ref", "refs/slopbrake"], self.root).stdout, "")
 
     def test_environment_errors_exit_2_with_one_line(self):
         self.write("pyproject.toml", "[project]\nname = 'x'\n")  # not a git repo
@@ -127,16 +127,53 @@ class Init(Scratch):
                                     json.loads((cli.KIT / "common/.claude/settings.json").read_text()))
         self.assertEqual([e["matcher"] for e in merged["hooks"]["PreToolUse"]], ["Edit", "Bash"])
 
-    def test_init_starts_the_last_green_ratchet_and_says_to_commit_before_verify(self):
+    def next_steps(self, result):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line for line in result.stdout.splitlines() if line.strip().startswith("next")]
+
+    def test_init_starts_the_branch_last_green_ratchet_and_says_to_commit_before_verify(self):
         self.python_repo()
         head = sh(["git", "rev-parse", "HEAD"], self.root).stdout.strip()
-        result = self.gf("init", str(self.root))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sh(["git", "rev-parse", "refs/slopbrake/last-green"], self.root).stdout.strip(), head)
-        steps = [line for line in result.stdout.splitlines() if line.strip().startswith("next")]
+        steps = self.next_steps(self.gf("init", str(self.root)))
+        refs = sh(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/slopbrake"], self.root).stdout
+        self.assertEqual(refs.split(), ["refs/slopbrake/last-green/main", head])
+        # The per-branch namespace stays open for the other branches (A1).
+        self.assertEqual(sh(["git", "update-ref", "refs/slopbrake/last-green/feature", "HEAD"], self.root).returncode, 0)
         commit = next(i for i, s in enumerate(steps) if "git commit" in s)
         verify = next(i for i, s in enumerate(steps) if "slopbrake verify" in s)
         self.assertLess(commit, verify)
+
+    def test_detached_head_gets_no_ratchet(self):
+        self.python_repo()
+        sh(["git", "checkout", "-q", "--detach"], self.root)
+        self.assertEqual(self.gf("init", str(self.root)).returncode, 0)
+        self.assertEqual(sh(["git", "for-each-ref", "refs/slopbrake"], self.root).stdout, "")
+
+    def test_an_old_flat_ratchet_ref_is_replaced_by_the_branch_ref(self):
+        self.python_repo()
+        sh(["git", "update-ref", "refs/slopbrake/last-green", "HEAD"], self.root)
+        self.assertEqual(self.gf("init", str(self.root)).returncode, 0)
+        refs = sh(["git", "for-each-ref", "--format=%(refname)", "refs/slopbrake"], self.root).stdout.split()
+        self.assertEqual(refs, ["refs/slopbrake/last-green/main"])
+
+    def test_commit_step_avoids_the_one_way_block_on_the_default_branch(self):
+        self.python_repo()
+        self.write("notes.txt", "unrelated work in progress\n")
+        step = next(s for s in self.next_steps(self.gf("init", str(self.root))) if "git commit" in s)
+        self.assertIn("git switch -c", step)  # the pr stage blocks the kit (one-way) on main
+        self.assertIn("--no-verify", step)  # ...unless a human overrides it
+        self.assertNotIn("-A", step)
+        self.assertNotIn("notes.txt", step)
+        self.assertIn("scripts/check", step)
+        self.commit("kit")
+        sh(["git", "switch", "-q", "-c", "work"], self.root)
+        steps = self.next_steps(self.gf("init", str(self.root), "--update"))
+        self.assertFalse(any("git commit" in s for s in steps), steps)
+        (self.root / "scripts/slopbrake/common.py").write_text("# an older kit\n")
+        self.commit("older kit")
+        step = next(s for s in self.next_steps(self.gf("init", str(self.root), "--update")) if "git commit" in s)
+        self.assertNotIn("git switch", step)
+        self.assertIn("scripts/slopbrake", step)
 
     def test_monorepo_subdir_never_takes_over_the_parent_hooks(self):
         self.git_repo()
@@ -396,7 +433,7 @@ class Verify(Scratch):
         self.assertFalse(marker.exists())
         self.assertTrue(self.proof(result, "CLAUDE.md is at most")["ok"])
 
-    def test_verify_works_from_a_monorepo_subdir(self):
+    def test_verify_runs_the_gate_from_a_monorepo_subdir(self):
         self.git_repo()
         app = self.root / "packages/app"
         self.write("packages/app/pyproject.toml", "[project]\nname = 'app'\n")
@@ -423,6 +460,18 @@ class Verify(Scratch):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("failed in the verify worktree", json.loads(result.stdout)["error"])
         self.assert_nothing_leaked()
+
+    def test_failed_install_error_names_the_cause_not_the_log_file(self):
+        self.git_repo()
+        self.write("package.json", '{"name": "t"}')
+        self.write("tsconfig.json", "{}")
+        self.gf("init", str(self.root))
+        self.commit("install slopbrake")
+        npm = ("echo 'npm error code EUSAGE' >&2; echo 'npm error' >&2; "
+               "echo 'npm error The npm ci command can only install with an existing package-lock.json' >&2; "
+               "echo 'npm error A complete log of this run can be found in: /x/debug.log' >&2; exit 1")
+        result = self.gf("verify", str(self.root), "--json", path_prefix=str(self.fake_bin("npm", npm)))
+        self.assertIn("existing package-lock.json", json.loads(result.stdout)["error"])
 
     def test_failure_output_shows_the_failing_stage_summary(self):
         self.noop_repo()
