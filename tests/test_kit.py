@@ -210,6 +210,7 @@ class PrBody(Scratch):
         self.git_repo()
         self.write(".claude/door-rules.yml", RULES.read_text())
         self.commit("rules")
+        sh(["git", "checkout", "-q", "-b", "feature"], self.root)  # on main, C8 blocks it outright (B10)
         self.write("migrations/0002_drop.sql", "DROP TABLE users;\n")
         self.write("body.md", BODY.format(door="two-way", extra="", radius="db"))
         result = script("pr_body_check.py", "--body-file", "body.md", "--base", "HEAD", cwd=self.root)

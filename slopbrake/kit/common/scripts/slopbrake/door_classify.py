@@ -98,6 +98,13 @@ def working_changes(base: str) -> dict:
     return changes
 
 
+def staged_changes() -> dict:
+    """What the next commit adds: the index against HEAD (honours GIT_INDEX_FILE, e.g. `commit -a`)."""
+    return parse_unified_diff(git("diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "--text",
+                                  "--unified=0", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", "HEAD",
+                                  cwd=repo_root()))
+
+
 def measure(base: str, working_tree: bool, rules_path: Path | None = None):
     """Classify the change since `base`. Returns (result, warning or None)."""
     merge_base = git("merge-base", base, "HEAD").strip()
