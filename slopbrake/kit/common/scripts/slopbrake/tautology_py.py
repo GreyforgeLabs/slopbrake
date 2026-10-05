@@ -21,9 +21,11 @@ Suppress one assertion with a reason on the line or the line above:
     # slopbrake: allow-tautology: <why the expected value is independent>
 
 A test (``test_*`` function, ``test*`` method of a test class) with no assertion only fails
-by crashing. Assertions are ``assert``, calls named ``assert*``/``expect*``, pytest
-raises/warns/fail and ``self.fail``, directly or in a helper of the same file that asserts
-(one level). Skipped tests are ignored. Suppress with a reason on the def line or above:
+by crashing. Assertions are ``assert``, ``raise AssertionError``, calls named ``assert*`` or
+``expect*`` (not ``expected_*``), pytest raises/warns/fail and ``self.fail``, directly or in a
+helper of the same file that asserts (one level; a test class inherits its in-file bases'
+helpers). Skipped tests are ignored; conditionally skipped ones (skipif) are not, since they
+run elsewhere. Suppress with a reason on the def line or above:
     # slopbrake: allow-no-assert: <why crashing is the only failure>
 """
 from __future__ import annotations
@@ -49,6 +51,7 @@ BUILTINS = set(dir(builtins))
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "build", "dist", "__pycache__", ".tox", "site-packages"}
 ALLOW = re.compile(r"#\s*slopbrake:\s*allow-tautology:\s*\S")
 ALLOW_NO_ASSERT = re.compile(r"#\s*slopbrake:\s*allow-no-assert:\s*\S")
+ASSERT_CALL = re.compile(r"(assert|expect)($|[A-Z_])")  # assertEqual, expect_that; not expected_total
 LITERALS = "compares a literal with a literal; nothing is under test"
 
 
@@ -241,10 +244,13 @@ def judge(tf: TestFile, actual: ast.AST, expected: ast.AST, raw_pair, identity: 
         for arg in [*call.args, *(k.value for k in call.keywords)]:
             inputs |= names_in(arg)
     used = names_in(expected)
-    # Property checks built from the result (`frames == sorted(frames)`) are fine; an
-    # expected value rebuilt from the *inputs* the code received is the tautology.
+    # Property checks built from the result (`frames == sorted(frames)`, or a second run:
+    # `sort_all(xs) == sorted(sort_all(xs))`) are fine; an expected value rebuilt from the
+    # *inputs* the code received is the tautology.
     result_names = names_in(raw_pair[0]) | names_in(raw_pair[1])
-    from_inputs = bool(used & inputs) and not (used & result_names - inputs)
+    tested = {ast.dump(c.func) for c in calls_code_under_test(actual)}
+    reruns = any(ast.dump(c.func) in tested for c in calls_code_under_test(expected))
+    from_inputs = bool(used & inputs) and not (used & result_names - inputs) and not reruns
     aggregate = aggregate_in(expected)
     if aggregate and from_inputs:
         return f"expected value is computed with {aggregate}() from the test inputs; use a literal or worked example"
@@ -285,10 +291,13 @@ def asserts(func: ast.AST, helpers: set[str] = frozenset(), methods: set[str] = 
     for node in body_nodes(func):
         if isinstance(node, ast.Assert):
             return True
+        if isinstance(node, ast.Raise) and isinstance(exc := getattr(node.exc, "func", node.exc), ast.Name) \
+                and exc.id == "AssertionError":
+            return True
         if not isinstance(node, ast.Call):
             continue
         name, owner = call_name(node), node.func.value if isinstance(node.func, ast.Attribute) else None
-        if name.startswith(("assert", "expect")):
+        if ASSERT_CALL.match(name):
             return True
         if owner is None and (name in helpers or name in PYTEST_ASSERTS):
             return True
@@ -311,15 +320,19 @@ def returns_value(func: ast.AST) -> bool:
 def unasserted_tests(tree: ast.Module):
     """Tests with no assertion: module `test_*` functions and `test*` methods of test classes."""
     helpers = {f.name for f in tree.body if isinstance(f, FUNCS) and asserts(f)}
+    inherited: dict[str, set[str]] = {}  # class name -> asserting methods, with bases from this file
     for node in tree.body:
         if isinstance(node, FUNCS) and (node.name == "test" or node.name.startswith("test_")):
             if not skipped(node) and not returns_value(node) and not asserts(node, helpers):
                 yield node
-        elif isinstance(node, ast.ClassDef) and (node.name.startswith("Test") or node.bases) and not skipped(node):
+        elif isinstance(node, ast.ClassDef):
             methods = [m for m in node.body if isinstance(m, FUNCS)]
             mine = {m.name for m in methods if asserts(m, helpers)}
-            yield from (m for m in methods if m.name.startswith("test") and not skipped(m)
-                        and not returns_value(m) and not asserts(m, helpers, mine))
+            mine |= {name for b in node.bases if isinstance(b, ast.Name) for name in inherited.get(b.id, ())}
+            inherited[node.name] = mine
+            if (node.name.startswith("Test") or node.bases) and not skipped(node):
+                    yield from (m for m in methods if m.name.startswith("test") and not skipped(m)
+                            and not returns_value(m) and not asserts(m, helpers, mine))
 
 
 def scan(path: Path) -> list[tuple[str, int, int, str]]:

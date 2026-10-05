@@ -267,5 +267,57 @@ class NoAssertion(Scratch):
         self.assertEqual([line.split(":")[1] for line in result.stdout.splitlines() if ": no assertion" in line], ["4"])
 
 
+class PropertyFromSecondCall(Scratch):
+    def test_expected_value_that_reruns_the_code_under_test_is_a_property(self):
+        self.assertEqual(self.flagged("""\
+            from calc import dedupe, sort_all
+            def test_a():
+                xs = [3, 1, 2]
+                assert sort_all(xs) == sorted(sort_all(xs))
+                assert dedupe(xs) == sorted(set(dedupe(xs)))
+            """), [])
+
+    def test_a_different_helper_in_the_expected_value_is_still_from_the_inputs(self):
+        self.assertEqual(self.flagged("""\
+            from calc import price, total
+            def test_a():
+                items = [1, 2]
+                assert total(items) == sum(items)
+                assert total(items) == sum(price(i) for i in items)
+            """), [4, 5])
+
+
+class NoAssertionShapes(Scratch):
+    def test_inherited_helpers_and_raised_assertion_errors_count(self):
+        self.assertEqual(self.flagged("""\
+            import unittest
+            from shop import add
+            class Base(unittest.TestCase):
+                def check(self, x):
+                    self.assertEqual(x, 3)
+            class T(Base):
+                def test_a(self):
+                    self.check(add(1, 2))
+            def test_b():
+                if add(1, 2) != 3:
+                    raise AssertionError("bad sum")
+            def test_c():
+                if add(1, 2) != 3:
+                    raise AssertionError
+            """, kind="no assertion"), [])
+
+    def test_value_builders_named_expected_are_not_assertions(self):
+        self.assertEqual(self.flagged("""\
+            from shop import add
+            def expected_total(xs):
+                return sum(xs)
+            def test_a():
+                add(1, expected_total([1]))
+            def test_b():
+                add(1, 2)
+                expectation = add(1, 2)
+            """, kind="no assertion"), [4, 6])
+
+
 if __name__ == "__main__":
     unittest.main()
