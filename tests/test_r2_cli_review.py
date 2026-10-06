@@ -32,6 +32,7 @@ class NestedLayoutGaps(Scratch):
         self.write("packages/a/tests/a.test.ts", "export const t = 1;\n")  # outside TEST_GLOBS: no T1
         self.write("packages/c/lib/index.ts", "export const c = 1;\n")  # outside --include: no T4
         self.write("packages/c/lib/deep/more.ts", "export const d = 1;\n")
+        sh(["git", "add", "-A"], self.root)  # coverage counts tracked sources only
         gaps = outside(self.status())
         self.assertEqual(len(gaps), 1, gaps)
         self.assertIn("packages/a/tests/, packages/c/lib/;", gaps[0])

@@ -235,5 +235,33 @@ class WorktreeGateTestsItsOwnTree(Scratch):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class StatusTsCoverage(Scratch):
+    def setUp(self):
+        super().setUp()
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        self.write("package.json", '{"name": "t", "scripts": {"typecheck": "tsc"}}\n')
+        self.write("tsconfig.json", "{}\n")
+        self.write("src/app.ts", "export const a = 1;\n")
+        self.commit("init")
+        env = dict(os.environ, PYTHONPATH=str(HOME), XDG_CONFIG_HOME=str(self.root / "xdg"))
+        self.assertEqual(sh([sys.executable, "-m", "slopbrake", "init", ".", "--stack", "typescript"], self.root, env).returncode, 0)
+        self.env = env
+
+    def status(self):
+        return sh([sys.executable, "-m", "slopbrake", "status", "."], self.root, self.env).stdout
+
+    def test_untracked_scratch_is_not_a_coverage_gap(self):
+        self.write("scratch/tool.ts", "export const t = 1;\n")
+        self.assertNotIn("outside every scripts/check glob", self.status())
+
+    def test_tracked_sources_outside_the_globs_are_a_gap_unless_declared_uncovered(self):
+        self.write("vendor/lib/x.ts", "export const x = 1;\n")
+        self.commit("vendored")
+        self.assertIn("vendor/lib/", self.status())
+        check = self.root / "scripts/check"
+        check.write_text(check.read_text().replace("STAGES=(", "UNCOVERED=(vendor/lib)  # vendored upstream code\nSTAGES=(", 1))
+        self.assertNotIn("outside every scripts/check glob", self.status())
+
+
 if __name__ == "__main__":
     unittest.main()

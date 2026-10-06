@@ -659,12 +659,18 @@ def ts_layout_gaps(repo: Path, check_text: str) -> list[str]:
     """Dirs holding TypeScript sources below no TEST_GLOBS or --include glob's base dir in scripts/check (B7)."""
     globs = re.findall(r"(?<!--exclude )'([^'\s]*\*\*[^'\s]*)'", check_text)
     bases = re.compile("|".join(re.escape(glob.split("**", 1)[0]).replace(r"\*", "[^/]*") for glob in globs) or "(?!)")
-    files = run(["git", "ls-files", "-co", "--exclude-standard", "--", "*.ts", "*.tsx", "*.mts", "*.cts"], repo).stdout
+    # Tracked files only: untracked scratch is not the repo's code. UNCOVERED=(dir ...) in scripts/check
+    # declares sources left out on purpose (vendored upstream code, say).
+    declared = re.search(r"^UNCOVERED=\(([^)]*)\)", check_text, re.MULTILINE)
+    uncovered = tuple(d.rstrip("/") + "/" for d in (declared.group(1).split() if declared else []))
+    files = run(["git", "ls-files", "--", "*.ts", "*.tsx", "*.mts", "*.cts"], repo).stdout
     dirs = sorted({f.rsplit("/", 1)[0] + "/" for f in files.splitlines() if "/" in f and not f.endswith(".d.ts")
-                   and not bases.match(f) and not any(d.startswith(".") or d in SKIP_DIRS for d in f.split("/")[:-1])})
+                   and not bases.match(f) and not f.startswith(uncovered)
+                   and not any(d.startswith(".") or d in SKIP_DIRS for d in f.split("/")[:-1])})
     outside = [d for i, d in enumerate(dirs) if not any(d.startswith(parent) for parent in dirs[:i])]
     return [(f"TypeScript sources outside every scripts/check glob (no T1 or T4 there): {', '.join(outside)}; "
-             "add them to TEST_GLOBS and the mutation --include list")] if outside else []
+             "add them to TEST_GLOBS and the mutation --include list, or list them in UNCOVERED=(...) "
+             "in scripts/check")] if outside else []
 
 
 def user_hook_findings() -> tuple[list[str], list[str]]:

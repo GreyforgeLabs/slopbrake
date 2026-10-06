@@ -11,6 +11,7 @@ G=scripts/slopbrake
 source "$G/run-stages.sh"
 PM="@PM@"
 
+# UNCOVERED=(dir ...)  TypeScript sources left out of T1/T4 on purpose (vendored code): status stops flagging them.
 STAGES=(lint types boundaries tests smoke test-quality mutation pr)
 SLOW_STAGES=(mutation)
 

@@ -210,6 +210,7 @@ class TypescriptLayouts(Scratch):
         self.assertFalse(any("outside" in gap for gap in self.status()["gaps"]), self.status()["gaps"])
         self.write("app/main.ts", "export const app = 1;\n")
         self.write("types/env.d.ts", "declare const x: number;\n")
+        sh(["git", "add", "-A"], self.root)  # coverage counts tracked sources only
         gaps = [gap for gap in self.status()["gaps"] if "outside" in gap]
         self.assertEqual(len(gaps), 1, self.status()["gaps"])
         self.assertIn("app/", gaps[0])
