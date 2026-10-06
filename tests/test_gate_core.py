@@ -265,9 +265,15 @@ class StageRunner(Scratch):
             with self.subTest(name):
                 self.check(*args, **env)
                 self.assertEqual(self.last_green(), "")
-        self.write("scratch.py", "x = 1\n")
+        self.write("README.md", "# changed but not committed\n")  # a tracked edit: HEAD is not what ran
         self.check()
         self.assertEqual(self.last_green(), "")
+
+    def test_untracked_files_do_not_stop_the_ratchet(self):
+        # The ratchet records HEAD; a permanent untracked folder (release notes, scratch) must not freeze it.
+        self.write("scratch/notes.md", "draft\n")
+        self.check()
+        self.assertEqual(self.last_green(), self.head)
 
     def test_an_explicit_base_that_skips_unverified_commits_does_not_record(self):
         self.git("update-ref", GREEN + "main", "HEAD")

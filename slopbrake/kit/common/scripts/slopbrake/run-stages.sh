@@ -59,7 +59,7 @@ _record_last_green() {
   branch=$(git symbolic-ref -q --short HEAD) || return  # per branch: green elsewhere vouches for nothing here
   ref=refs/slopbrake/last-green/${branch//\//%2F}  # %2F: feature and feature/x never collide
   head=$(git rev-parse -q --verify HEAD) || return
-  [ -z "$(git status --porcelain)" ] || return
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || return  # HEAD is what gets recorded: tracked edits only
   # A base that skips commits after the last green run did not check them: don't vouch for them.
   # (The empty tree skips nothing: every line was new.)
   if [ -n "${SLOPBRAKE_BASE:-}" ] && git rev-parse -q --verify "$ref" >/dev/null \
