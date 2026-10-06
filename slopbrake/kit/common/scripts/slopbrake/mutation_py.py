@@ -6,9 +6,10 @@ the tracked tree: the working tree is never modified, so an editable install tha
 live service imports stays untouched. A mutant is killed when the test command fails
 or times out. Below the floor the check fails and lists the surviving mutants; they
 are evidence for the reviewer. Nothing to mutate exits 78 (a skip, not a pass).
-When only tests changed, the first-party modules those tests import (a deleted test file is
-read from the base) are mutated whole, sampled to at most TESTS_ONLY_MAX mutants, so a
-weakened or deleted test is still caught.
+When only tests changed, the functions and classes that the changed test functions call
+(compared with the base, so a deleted assertion counts) are mutated in the first-party
+modules those tests import, sampled to at most TESTS_ONLY_MAX mutants, so a weakened or
+deleted test is still caught without mutating every module a test file happens to import.
 A line ending in `# slopbrake: no-mutate` is never mutated (for equivalent mutants); every
 changed line with mutation sites marked so fails the stage.
 """
@@ -233,6 +234,43 @@ def imported_modules(root: Path, source: str) -> set[str]:
     return found
 
 
+def changed_test_calls(old: str, new: str) -> set[str]:
+    """Names called by test functions that were added, changed or removed between two versions of a file."""
+    def functions(source: str) -> dict[str, str]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return {}
+        found = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    owner = node.name if isinstance(node, ast.ClassDef) else ""
+                    found[f"{owner}.{child.name}"] = child
+        return found
+
+    before, after = functions(old), functions(new)
+    changed = [after[k] for k in after if k not in before or ast.dump(after[k]) != ast.dump(before[k])]
+    changed += [before[k] for k in before if k not in after or ast.dump(after[k]) != ast.dump(before[k])]
+    names = set()
+    for function in changed:
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call):
+                func = node.func
+                names.add(func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else "")
+    return names - {""}
+
+
+def defined_lines(path: Path, names: set[str]) -> dict[str, set[int]]:
+    """Line spans of the module-level functions and classes (and their methods) named in `names`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    spans: dict[str, set[int]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
+            spans.setdefault(node.name, set()).update(range(node.lineno, node.end_lineno + 1))
+    return spans
+
+
 def mutable_lines(path: Path, lines: set[int]) -> set[int]:
     source = split_lines(path.read_text(encoding="utf-8"))
     return {n for n in lines if n <= len(source) and not NO_MUTATE.search(source[n - 1])}
@@ -270,22 +308,32 @@ def main(argv: list[str] | None = None) -> int:
     # Visible to the reviewer in every outcome: each excluded line claims its mutants are equivalent.
     print(f"mutation: {pragmas} changed line{'s' if pragmas != 1 else ''} excluded by no-mutate")
     tests_only = not targets
-    if tests_only:  # weakened (even deleted) assertions change only tests: mutate what they import, whole
-        def test_source(change) -> str:  # a deleted test file is read from the base
-            if not change.deleted:
-                return (root / change.path).read_text(encoding="utf-8", errors="replace")
-            return git("show", f"{merge_base(base)}:{change.old_path or change.path}", check=False)
+    if tests_only:  # weakened (even deleted) assertions change only tests: mutate what the changed tests call
+        fork = merge_base(base)
+
+        def base_source(change) -> str:
+            return git("show", f"{fork}:{change.old_path or change.path}", check=False)
+
+        def head_source(change) -> str:
+            return "" if change.deleted else (root / change.path).read_text(encoding="utf-8", errors="replace")
 
         tests = [c for c in changes.values()
                  if is_test_path(c.path) and (wanted(c.path) or c.deleted and first_party(c.path))]
-        modules = {m for c in tests for m in imported_modules(root, test_source(c))
+        modules = {m for c in tests for m in imported_modules(root, head_source(c) or base_source(c))
                    if wanted(m) and not is_test_path(m)}
         if not modules:
             print(f"mutation: skipped: no changed Python source lines since {described}")
             return SKIP
-        print(f"mutation: only tests changed since {described}; mutating the modules they import: "
-              + ", ".join(sorted(modules)))
-        targets = {m: set(range(1, len(split_lines((root / m).read_text(encoding="utf-8"))) + 1)) for m in modules}
+        called = set().union(*(changed_test_calls(base_source(c), head_source(c)) for c in tests))
+        spans = {m: defined_lines(root / m, called) for m in sorted(modules)}
+        spans = {m: found for m, found in spans.items() if found}
+        if not spans:
+            print(f"mutation: skipped: only tests changed since {described}, and the changed tests "
+                  "call no first-party function")
+            return SKIP
+        print(f"mutation: only tests changed since {described}; mutating what the changed tests call: "
+              + "; ".join(f"{m} ({', '.join(sorted(found))})" for m, found in spans.items()))
+        targets = {m: set().union(*found.values()) for m, found in spans.items()}
         marked = {path: lines - mutable_lines(root / path, lines) for path, lines in targets.items()}
         args.max_mutants = min(args.max_mutants, TESTS_ONLY_MAX)
     targets = {path: lines - marked[path] for path, lines in targets.items()}

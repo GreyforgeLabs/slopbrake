@@ -416,6 +416,36 @@ class TestsOnlyChanges(Scratch):
         self.assertIn("only tests changed", result.stdout)
         self.assertIn("below floor", result.stdout)
 
+    def test_a_deleted_assertion_line_is_still_a_changed_test(self):
+        self.write("tests/test_core.py", "import unittest\nfrom calc.core import one, two\n\n\n"
+                                         "class T(unittest.TestCase):\n    def test_it(self):\n"
+                                         "        self.assertEqual(one(), 1)\n")
+        self.commit("delete an assertion line")
+        result = self.floor()
+        self.assertIn("only tests changed", result.stdout)
+        self.assertIn("below floor", result.stdout)
+
+    def test_only_the_functions_the_changed_tests_call_are_mutated(self):
+        # A big module the changed test merely imports must not be mutated whole (it made the gate unbounded).
+        self.write("calc/big.py", "".join(f"def g{i}(x):\n    return x * {i}\n\n\n" for i in range(80)))
+        self.write("tests/test_big.py", "import unittest\nfrom calc import big\nfrom calc.core import one\n\n\n"
+                                        "class B(unittest.TestCase):\n    def test_b(self):\n        self.assertEqual(one(), 1)\n")
+        self.commit("big module")
+        self.git("update-ref", "refs/heads/main", "HEAD")
+        self.write("tests/test_big.py", (self.root / "tests/test_big.py").read_text().replace(
+            "self.assertEqual(one(), 1)", "self.assertIsNotNone(one())"))
+        result = self.floor()
+        self.assertIn("mutating what the changed tests call: calc/core.py (one)", result.stdout)
+        self.assertNotIn("calc/big.py", result.stdout)
+
+    def test_a_test_edit_that_calls_nothing_first_party_is_a_skip(self):
+        self.write("tests/test_core.py", (self.root / "tests/test_core.py").read_text()
+                   + "\n\nALLOWED = ['check', 'setup.sh']\n")
+        self.commit("allowlist")
+        result = self.floor()
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn("call no first-party function", result.stdout)
+
     def test_strong_tests_still_pass_and_mutants_are_capped(self):
         body = "".join(f"def f{i}(x):\n    return x + {i}\n\n\n" for i in range(60))
         self.write("calc/many.py", body)
@@ -432,7 +462,8 @@ class TestsOnlyChanges(Scratch):
                                           "        self.assertEqual(many.f3(2), 5)\n")
         result = self.floor()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"mutation: (\d+)/40 mutants killed")
+        self.assertRegex(result.stdout, r"mutation: (\d+)/(\d+) mutants killed")
+        self.assertIn("calc/many.py (f3)", result.stdout)
 
 
 # ── B6: the interpreter is resolved at run time ──────────────────────────────
