@@ -256,8 +256,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("root", nargs="?", default=".")
     parser.add_argument("--baseline", help="accepted legacy violations; new ones still fail (a ratchet)")
     parser.add_argument("--write-baseline", action="store_true", help="record current violations as the baseline")
+    parser.add_argument("--skip-rule", action="append", default=[], metavar="RULE",
+                        choices=["entrypoint-boundary", "tests-through-entrypoints", "no-circular"],
+                        help="leave out a rule that does not fit this repo's architecture (repeatable)")
     args = parser.parse_args(argv)
-    found = violations(Path(args.root).resolve())
+    skipped = tuple(f"{rule}:" for rule in args.skip_rule)
+    found = [(message, key) for message, key in violations(Path(args.root).resolve())
+             if not any(f" {rule}" in message or message.startswith(rule) for rule in skipped)]
     problems = [message for message, _ in found]
     if args.baseline:
         # Keys drop the line number, so unrelated edits don't churn the baseline, but keep the

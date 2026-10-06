@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** the user-level Stop gate held a session red for another session's uncommitted work in the same repo (and spent its whole budget mutating it). It now records the files each session changed and the HEAD it started from, skips repos where nothing of the session's is left, and gates HEAD plus the session's own files in a clean temporary worktree when other uncommitted work is present.
+- **New:** `boundaries_py.py --skip-rule RULE` lets a repo keep only the D1 rules that fit its architecture (for example, cycles only).
+
 ## 0.2.1 (2026-10-05)
 
 Found by putting 0.2.0 to work on two more repos and three more harnesses.

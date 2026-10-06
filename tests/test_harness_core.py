@@ -49,6 +49,7 @@ class Scratch(unittest.TestCase):
             stub.chmod(0o755)
         sh(["git", "add", "-A"], root)
         sh(["git", *GIT_ID, "commit", "-q", "-m", "init"], root)
+        (root / "src/a.py").write_text("x = 2\n")  # an uncommitted edit for the session to own
         return root
 
     def trust(self, repo):
@@ -107,7 +108,7 @@ class Grok(Scratch):
         stop = grok("Stop", cwd=str(self.base), stopHookActive=False, reason="end_turn")
         result = self.hook(["--harness", "grok", "stop"], stop, CLAUDE_PROJECT_DIR=str(shop))
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(f"red in {shop}", result.stderr)
+        self.assertIn(f"{shop}:\nred in ", result.stderr)
         # The gate reads Claude's keys: it gets the normalized payload.
         seen = [json.loads(line) for line in self.marker.read_text().splitlines() if line]
         self.assertEqual({p["session_id"] for p in seen}, {"g1"})
@@ -220,7 +221,7 @@ class Stop(Scratch):
             result = self.hook(["--harness", harness, "stop"], {"session_id": "s1", "sessionId": "s1"},
                                CLAUDE_PROJECT_DIR=str(shop))
             self.assertEqual(result.returncode, 2, harness)
-            self.assertIn(f"red in {shop}", result.stderr)
+            self.assertIn(f"{shop}:\nred in ", result.stderr)
             self.assertEqual(result.stdout, "")  # Codex: Stop stdout is JSON or nothing
 
     def test_a_green_stop_prints_nothing_on_stdout(self):

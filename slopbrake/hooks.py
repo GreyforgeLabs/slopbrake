@@ -269,8 +269,30 @@ def touched(session_id) -> list[str]:
         return []
 
 
-def record(session_id, repos: set[str]) -> None:
-    update_json(state_path(session_id), lambda data: data.update(repos=sorted({*string_list(data.get("repos")), *repos})))
+def record(session_id, repos: set[str], paths: dict[str, set[str]] | None = None,
+           heads: dict[str, str] | None = None) -> None:
+    """Add repos this session changed, the paths it changed in each, and the HEAD each had when first changed."""
+    def change(data):
+        data["repos"] = sorted({*string_list(data.get("repos")), *repos})
+        own = data.get("paths") if isinstance(data.get("paths"), dict) else {}
+        for repo, items in (paths or {}).items():
+            own[repo] = sorted({*string_list(own.get(repo)), *items})
+        data["paths"] = own
+        first = data.get("heads") if isinstance(data.get("heads"), dict) else {}
+        for repo, head in (heads or {}).items():
+            first.setdefault(repo, head)
+        data["heads"] = first
+    update_json(state_path(session_id), change)
+
+
+def session_record(session_id) -> tuple[dict, dict]:
+    """(paths, heads) this session recorded per repo; empty for a state written before attribution existed."""
+    try:
+        data = json.loads(state_path(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, {}
+    paths, heads = data.get("paths"), data.get("heads")
+    return (paths if isinstance(paths, dict) else {}), (heads if isinstance(heads, dict) else {})
 
 
 def expand(base: Path, word: str) -> Path | None:
@@ -306,12 +328,11 @@ def bash_dirs(command: str, cwd: Path) -> list[Path]:
     return list(dict.fromkeys(dirs))
 
 
-def snapshot(repo: Path) -> str | None:
-    """A digest of HEAD and every changed path with its size and mtime; None when git fails.
-    Equal digests before and after a tool call mean the call left the repo alone."""
+def repo_state(repo: Path) -> tuple[str, dict[str, str]] | None:
+    """(HEAD, {uncommitted path: "size:mtime"}) from git status; None when git fails."""
     try:
         head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=repo, capture_output=True,
-                              timeout=30, check=False).stdout
+                              text=True, timeout=30, check=False).stdout.strip()
         # --no-optional-locks: never take index.lock or rewrite .git/index in a repo the hook only observes
         status = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z",
                                  "--untracked-files=all"], cwd=repo, capture_output=True, timeout=30, check=False)
@@ -319,18 +340,30 @@ def snapshot(repo: Path) -> str | None:
         return None
     if status.returncode:
         return None
-    digest = hashlib.sha256(head)
-    for item in status.stdout.split(b"\0"):
+    files, items = {}, status.stdout.split(b"\0")
+    while items:
+        item = items.pop(0)
+        if len(item) < 4:
+            continue
+        if item[:1] in (b"R", b"C") and items:
+            items.pop(0)  # a rename's old path follows it
+        path = os.fsdecode(item[3:])
         try:
-            info = os.lstat(repo / os.fsdecode(item[3:]))
-            stamp = f"{info.st_size}:{info.st_mtime_ns}"
+            info = os.lstat(repo / path)
+            files[path] = f"{info.st_size}:{info.st_mtime_ns}"
         except (OSError, ValueError):
-            stamp = "-"
-        digest.update(item + b"\0" + stamp.encode() + b"\0")
-    return digest.hexdigest()
+            files[path] = "-"
+    return head, files
 
 
-def snapshots(command: str, cwd: Path) -> dict[str, str | None]:
+def snapshot(repo: Path) -> dict | None:
+    """HEAD and every uncommitted path with its size and mtime; None when git fails. Equal snapshots before
+    and after a tool call mean the call left the repo alone; the paths that differ are what it changed."""
+    state = repo_state(repo)
+    return None if state is None else {"head": state[0], "files": state[1]}
+
+
+def snapshots(command: str, cwd: Path) -> dict[str, dict | None]:
     roots = {managed_root(d) for d in bash_dirs(command, cwd)} - {None}
     return {str(root): snapshot(root) for root in sorted(roots)}
 
@@ -380,27 +413,97 @@ def post_tool_use(payload: dict) -> int:
     is a direct edit of every file it names."""
     cwd = Path(payload.get("cwd") or os.getcwd())
     args = payload.get("tool_input") or {}
-    repos = set()
     if payload.get("tool_name") in EDIT_TOOLS:
         target = args.get("file_path") or args.get("notebook_path") or args.get("path")  # path: grok's hashline_edit?
         root = managed_root(cwd / Path(target).expanduser()) if target else None
-        repos = {str(root)} if root else set()
+        targets = [cwd / Path(target).expanduser()] if root else []
     elif payload.get("tool_name") in PATCH_TOOLS:
-        repos = {str(root) for target in patch_targets(payload) if (root := managed_root(cwd / Path(target).expanduser()))}
+        targets = [cwd / Path(target).expanduser() for target in patch_targets(payload)]
     elif payload.get("tool_name") == "Bash":
         command = str(args.get("command", ""))
         taken = recall(payload, command) if state_path(payload.get("session_id")).is_file() else None
-        before, missing = (taken or {}).get("repos", {}), object()
-        repos = {repo for repo, digest in snapshots(command, Path(taken["cwd"])).items()
-                 if digest is None or before.get(repo, missing) != digest} if taken else set()
-    if repos:
-        record(payload.get("session_id"), repos)
+        if not taken:
+            return 0
+        before, missing = taken.get("repos", {}), object()
+        paths, heads = {}, {}
+        for repo, after in snapshots(command, Path(taken["cwd"])).items():
+            old = before.get(repo, missing)
+            if after is not None and old == after:
+                continue
+            old_files = old.get("files", {}) if isinstance(old, dict) else {}
+            new_files = after.get("files", {}) if after else {}
+            paths[repo] = {p for p in {*old_files, *new_files} if old_files.get(p) != new_files.get(p)}
+            if isinstance(old, dict) and old.get("head"):
+                heads[repo] = old["head"]
+        if paths:
+            record(payload.get("session_id"), set(paths), paths, heads)
+        return 0
+    else:
+        targets = []
+    paths, heads = {}, {}
+    for target in targets:
+        if root := managed_root(target):
+            paths.setdefault(str(root), set()).add(os.path.relpath(os.path.normpath(target), root))
+            if str(root) not in heads and (state := repo_state(root)):
+                heads[str(root)] = state[0]
+    if paths:
+        record(payload.get("session_id"), set(paths), paths, heads)
     return 0
 
 
-def run_gate(hook: Path, repo: Path, text: str, left: float) -> tuple[int, str]:
+def gate_scope(repo: Path, paths: dict, heads: dict) -> dict | None:
+    """What this session left in `repo`: None when nothing (no uncommitted file of ours, HEAD not moved by us);
+    else {"mine", "foreign", "branch"}. A session recorded before attribution existed gates the whole tree."""
+    key = str(repo)
+    state = repo_state(repo)
+    if state is None or key not in heads:
+        return {"mine": set(), "foreign": set(), "branch": ""}
+    head, files = state
+    mine = set(string_list(paths.get(key))) & set(files)
+    if not mine and head == heads[key]:
+        return None
+    branch = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], cwd=repo, capture_output=True,
+                            text=True, check=False).stdout.strip()
+    return {"mine": mine, "foreign": set(files) - mine, "branch": branch}
+
+
+@contextlib.contextmanager
+def clean_copy(repo: Path, mine: set[str]):
+    """A detached worktree of HEAD carrying only this session's uncommitted files (and the repo's
+    node_modules, linked), removed afterwards. The repo's own tree is never touched."""
+    scratch = Path(tempfile.mkdtemp(prefix="slopbrake-stop-"))
+    clean = scratch / "wt"
+    try:
+        subprocess.run(["git", "worktree", "add", "-q", "--detach", str(clean), "HEAD"], cwd=repo,
+                       capture_output=True, check=True, timeout=120)
+        for rel in sorted(mine):
+            source, target = repo / rel, clean / rel
+            if source.is_file() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+            else:
+                target.unlink(missing_ok=True)
+        if (repo / "node_modules").is_dir() and not (clean / "node_modules").exists():
+            (clean / "node_modules").symlink_to(repo / "node_modules")
+        yield clean
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(clean)], cwd=repo, capture_output=True, check=False)
+        subprocess.run(["git", "worktree", "prune"], cwd=repo, capture_output=True, check=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def retarget(text: str, cwd: Path) -> str:
+    """The hook payload with its cwd moved into the clean copy, so the gate never looks at the real tree."""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text
+    return json.dumps({**payload, "cwd": str(cwd)}) if isinstance(payload, dict) else text
+
+
+def run_gate(hook: Path, repo: Path, text: str, left: float, **extra: str) -> tuple[int, str]:
     """Run one repo's require-green.sh in its own process group; kill the group at left + STOP_GRACE."""
-    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo), SLOPBRAKE_STOP_TIMEOUT=str(max(1, int(left))))
+    env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo), SLOPBRAKE_STOP_TIMEOUT=str(max(1, int(left))), **extra)
     proc = subprocess.Popen([str(hook)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd=repo, env=env, text=True, encoding="utf-8", errors="replace", start_new_session=True)
     try:
@@ -427,13 +530,24 @@ def stop(payload: dict, text: str, harness: str = "claude") -> int:
             continue
         if repo == project_root and not settings_gaps(repo):
             continue  # the project's own Stop hook already gates it ("$CLAUDE_PROJECT_DIR"/.claude/hooks resolves)
+        scope = gate_scope(repo, *session_record(payload.get("session_id")))
+        if scope is None:
+            continue  # nothing of this session's is left in the repo: another session's work is not ours to gate
         left = deadline - time.monotonic()
         if left <= 0:
             problems.append(f"{repo}:\nrequire-green: the {STOP_BUDGET}s Stop budget was used up before this repo's "
                             "gate ran")
             continue
         try:
-            code, err = run_gate(hook, repo, text, left)
+            if scope.get("foreign"):  # other uncommitted work in the tree: gate HEAD plus our edits in a clean copy
+                with clean_copy(repo, scope["mine"]) as clean:
+                    code, err = run_gate(clean / ".claude/hooks/require-green.sh", clean, retarget(text, clean), left,
+                                         SLOPBRAKE_STOP_BRANCH=scope["branch"])
+                if code == 2:
+                    err += (f"\n(checked HEAD plus this session's {len(scope['mine'])} uncommitted file(s) in a clean copy; "
+                            f"{len(scope['foreign'])} uncommitted file(s) from other work were left out)")
+            else:
+                code, err = run_gate(hook, repo, text, left)
         except TimeoutError as exc:
             problems.append(f"{repo}: {exc}")
             continue

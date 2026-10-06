@@ -65,6 +65,7 @@ class Scratch(unittest.TestCase):
             stub.chmod(0o755)
         sh(["git", "add", "-A"], root)
         sh(["git", *GIT_ID, "commit", "-q", "-m", "init"], root)
+        (root / "src/a.py").write_text("x = 2\n")  # an uncommitted edit for the session to own
         return root
 
     def touched(self, session="s1"):

@@ -186,3 +186,24 @@ class Baseline(Scratch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SkipRules(unittest.TestCase):
+    def test_a_repo_can_keep_only_the_rules_that_fit_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, text in (("app/__init__.py", ""), ("app/core/__init__.py", ""), ("app/core/x.py", "v = 1\n"),
+                              ("app/core/_impl.py", "w = 1\n"), ("app/ui.py", "from app.core._impl import w\n"), ("tests/test_x.py", "from app.core.x import v\n"),
+                              ("app/a.py", "import app.b\n"), ("app/b.py", "import app.a\n")):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(text)
+            script = Path(__file__).resolve().parents[1] / "slopbrake/kit/common/scripts/slopbrake/boundaries_py.py"
+            run = lambda *a: subprocess.run([sys.executable, str(script), str(root), *a], capture_output=True, text=True,
+                                             check=False)
+            full = run().stdout
+            self.assertIn("entrypoint-boundary", full)
+            self.assertIn("tests-through-entrypoints", full)
+            cycles_only = run("--skip-rule", "entrypoint-boundary", "--skip-rule", "tests-through-entrypoints").stdout
+            self.assertNotIn("entrypoint-boundary", cycles_only)
+            self.assertNotIn("tests-through-entrypoints", cycles_only)
+            self.assertIn("no-circular", cycles_only)

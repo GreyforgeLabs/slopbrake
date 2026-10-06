@@ -106,6 +106,7 @@ class Trust(R2):
         sh(["git", "clone", "-q", str(upstream), "cloned"], self.base)
         cloned = self.base / "cloned"
         self.bash(f"cd {cloned} && ls && git log --oneline -1", self.base)
+        (cloned / "src/a.py").write_text("x = 3\n")
         self.edit(cloned / "src/a.py")  # even an edit does not make a stranger's repo trusted
         self.assertEqual(self.hook("stop", {}).returncode, 0)
         self.assertFalse(self.marker.exists())
@@ -211,6 +212,9 @@ class StopBudget(R2):
     def test_an_unrunnable_gate_does_not_skip_the_other_repos(self):
         broken, red = self.repo("a-broken"), self.repo("b-red")
         (broken / ".claude/hooks/require-green.sh").chmod(0o644)
+        sh(["git", "add", "-A"], broken)  # committed: an uncommitted mode change would be someone else's work
+        sh(["git", *GIT_ID, "commit", "-q", "-m", "break the gate"], broken)
+        (broken / "src/a.py").write_text("x = 3\n")
         for repo in (broken, red):
             self.trust(repo)
             self.edit(repo / "src/a.py")

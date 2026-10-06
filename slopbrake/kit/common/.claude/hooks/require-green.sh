@@ -66,14 +66,18 @@ unverified() {
 # but cannot record); dirty code alone needs the fast gate.
 gate() {
   cd "$1" 2>/dev/null && [ -x scripts/check ] || return 0
-  local log args=() why branch status dirty=
+  local log args=() why branch status dirty= last
   log="$(git rev-parse --absolute-git-dir)/slopbrake/stop-check.log"
   # Docs-only changes don't need the gate; neither does a nested worktree ("dir/": another checkout).
   if git -c core.quotePath=false status --porcelain --untracked-files=all | awk '{print $NF}' \
      | grep -vE '/$' | grep -qvE '\.(md|txt)$'; then
     dirty=" (and uncommitted code changes)"
   fi
-  branch=$(git symbolic-ref -q --short HEAD)
+  # The user-level gate may run this in a clean copy (a detached worktree) and name the real branch.
+  branch=${SLOPBRAKE_STOP_BRANCH:-$(git symbolic-ref -q --short HEAD)}
+  if [ -n "${SLOPBRAKE_STOP_BRANCH:-}" ] && last=$(git rev-parse -q --verify "refs/slopbrake/last-green/${branch//\//%2F}"); then
+    export SLOPBRAKE_BASE=$last  # measure the copy from the real branch's ratchet
+  fi
   if unverified "$branch"; then
     why="commits on ${branch:-a detached HEAD} that no full green run has covered$dirty, and the full scripts/check is red"
     export MUTATION_MAX="${SLOPBRAKE_STOP_MUTANTS:-40}"
