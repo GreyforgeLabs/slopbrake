@@ -263,5 +263,38 @@ class StatusTsCoverage(Scratch):
         self.assertNotIn("outside every scripts/check glob", self.status())
 
 
+class DefaultBranchDoorIgnoresUntracked(Scratch):
+    def setUp(self):
+        super().setUp()
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        kit = self.root / "scripts/slopbrake"
+        kit.mkdir(parents=True)
+        for f in GUARDS.glob("*.py"):
+            (kit / f.name).write_text(f.read_text())
+        (self.root / ".claude").mkdir()
+        (self.root / ".claude/door-rules.yml").write_text((HOME / "slopbrake/kit/common/.claude/door-rules.yml").read_text())
+        self.write("app.py", "x = 1\n")
+        self.commit("init")
+
+    def pr(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("GIT_INDEX_FILE", "PR_BODY_FILE", "GITHUB_EVENT_PATH")}
+        return sh([sys.executable, "scripts/slopbrake/pr_body_check.py"], self.root, env)
+
+    def test_untracked_scratch_on_main_is_not_a_one_way_commit(self):
+        # A permanent untracked folder (release scratch with rm -rf in its scripts) is not about to be committed.
+        self.write("release-prep/render.sh", 'rm -rf "$work"\n')
+        result = self.pr()
+        self.assertEqual(result.returncode, 78, result.stdout)
+
+    def test_a_staged_one_way_file_on_main_still_blocks(self):
+        self.write("release-prep/render.sh", 'rm -rf "$work"\n')
+        sh(["git", "add", "release-prep/render.sh"], self.root)
+        self.assertEqual(self.pr().returncode, 1)
+
+    def test_a_tracked_one_way_edit_on_main_still_blocks(self):
+        self.write("app.py", "import shutil\nshutil.rmtree(path)\n")
+        self.assertEqual(self.pr().returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

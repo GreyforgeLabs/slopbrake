@@ -27,7 +27,6 @@ from door_classify import (
     measure,
     staged_changes,
     tracked_changes,
-    working_changes,
 )
 
 SKIP = 78
@@ -189,7 +188,8 @@ def no_pr_context(quiet: bool = False) -> int:
 
     A hook's GIT_INDEX_FILE is exactly what the commit adds. scripts/check unsets it, so a non-empty index is
     judged together with tracked edits on disk (`commit -a` and `commit -- <path>` add them); an empty index
-    means the whole uncommitted working tree. quiet: print only a block or an error.
+    means the tracked edits on disk. Untracked files are not about to be committed until they are staged.
+    quiet: print only a block or an error.
     """
     say = (lambda _message: None) if quiet else print
     branch = branch_name()
@@ -205,7 +205,7 @@ def no_pr_context(quiet: bool = False) -> int:
             views.append(tracked_changes())
             what = "staged change (with tracked edits on disk)"
         else:
-            views, what, empty = [working_changes("HEAD")], "uncommitted change", "nothing uncommitted"
+            views, what, empty = [tracked_changes()], "uncommitted change", "nothing uncommitted"
     if not any(views):
         say(f"pr: skipped: no PR context and {empty} on {branch}")
         return SKIP

@@ -187,8 +187,10 @@ class C8JudgesTheCommit(R2Scratch):
         self.assertEqual(result.returncode, 78, result.stdout)
         self.assertIn("staged change", result.stdout)
 
-    def test_without_anything_staged_the_working_tree_is_judged(self):
+    def test_without_anything_staged_tracked_edits_are_judged(self):
         self.git_repo()
+        self.write("db/migrations/011_drop.sql", "-- placeholder\n")
+        self.commit("migration")
         self.write("db/migrations/011_drop.sql", "DROP TABLE users;\n")
         self.assertEqual(self.pr_stage().returncode, 1)
 
@@ -292,6 +294,7 @@ class B16DefaultBranch(R2Scratch):
         self.git("branch", "feat")
         self.configure("trunk")
         self.write("migrations/001.sql", "DROP TABLE accounts;\n")
+        self.git("add", "-A")
         result = self.pr_stage()
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("one-way door on trunk", result.stdout)

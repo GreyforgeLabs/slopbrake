@@ -132,6 +132,7 @@ class PreCommitOneWay(Scratch):
     def test_uncommitted_one_way_change_on_main_fails(self):
         self.git_repo()
         self.write("migrations/0002_drop.sql", "DROP TABLE users;\n")
+        self.git("add", "-A")  # untracked files are not about to be committed until staged
         result = self.pr_stage()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(ON_MAIN, result.stdout)
@@ -164,6 +165,7 @@ class PreCommitOneWay(Scratch):
     def test_master_without_main_is_the_default_branch(self):
         self.git_repo(branch="master")
         self.write("infra/main.tf", "resource {}\n")
+        self.git("add", "-A")
         result = self.pr_stage()
         self.assertEqual(result.returncode, 1)
         self.assertIn("one-way door on master", result.stdout)
@@ -171,6 +173,7 @@ class PreCommitOneWay(Scratch):
     def test_the_configured_init_default_branch_is_the_default_branch(self):  # B16: no single-branch guess
         self.git_repo(branch="trunk")
         self.write("x.sql", "DROP TABLE users;\n")
+        self.git("add", "-A")
         config = self.write("../gitconfig", "[init]\n\tdefaultBranch = trunk\n")
         result = script("pr_body_check.py", cwd=self.root, env=clean_env(GIT_CONFIG_GLOBAL=str(config)))
         self.assertEqual(result.returncode, 1, result.stdout)
