@@ -173,6 +173,66 @@ class InitInALinkedWorktree(Scratch):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sh(["git", "config", "--get", "core.hooksPath"], main).stdout.strip(), "")
         self.assertIn("linked worktree", result.stdout)
+        self.assertEqual((stage / "CLAUDE.md").read_text().splitlines()[0], "# main")
+
+    def test_init_no_trust_leaves_the_trust_store_alone(self):
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        self.write("pyproject.toml", "[project]\nname = 'shop'\n")
+        self.commit("init")
+        config = self.root / "xdg"
+        env = dict(os.environ, PYTHONPATH=str(HOME), XDG_CONFIG_HOME=str(config))
+        result = sh([sys.executable, "-m", "slopbrake", "init", ".", "--no-trust"], self.root, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((config / "slopbrake/trusted.json").exists())
+
+
+class WorktreeGateTestsItsOwnTree(Scratch):
+    """A staged branch lives in a linked worktree and borrows the main checkout's .venv, whose editable
+    install points at the main tree: the tests stage must import the worktree's code and see the venv's tools."""
+
+    def setUp(self):
+        super().setUp()
+        self.main = self.root / "main"
+        (self.main / "src/pkg").mkdir(parents=True)
+        (self.main / "src/pkg/__init__.py").write_text("VALUE = 'main'\n")
+        sh(["git", "init", "-q", "-b", "main"], self.main)
+        sh(["git", "add", "-A"], self.main)
+        sh(["git", *GIT_ID, "commit", "-q", "--no-verify", "-m", "init"], self.main)
+        venv = self.main / ".venv/bin"
+        venv.mkdir(parents=True)
+        # Like an editable install: the main tree's src is appended after PYTHONPATH.
+        (venv / "python").write_text(f'#!/bin/sh\nexport PYTHONPATH="${{PYTHONPATH:+$PYTHONPATH:}}{self.main}/src"\n'
+                                     f'exec {sys.executable} "$@"\n')
+        (venv / "venvtool").write_text("#!/bin/sh\nexit 0\n")
+        for f in venv.iterdir():
+            f.chmod(0o755)
+        self.wt = self.root / "wt"
+        sh(["git", "worktree", "add", "-q", "-b", "feat", str(self.wt)], self.main)
+        (self.wt / "src/pkg/__init__.py").write_text("VALUE = 'wt'\n")
+
+    def gate(self, test_args):
+        template = (HOME / "slopbrake/kit/python/scripts/check").read_text()
+        for key, value in (("LINT_CMD", "true"), ("TYPES_CMD", "true"), ("TEST_ARGS", test_args)):
+            template = template.replace(f"@{key}@", value)
+        kit = self.wt / "scripts/slopbrake"
+        kit.mkdir(parents=True)
+        for f in GUARDS.iterdir():
+            if f.is_file():
+                (kit / f.name).write_text(f.read_text())
+        check = self.wt / "scripts/check"
+        check.write_text(template)
+        check.chmod(0o755)
+        return sh([str(check), "tests"], self.wt)
+
+    def test_the_worktrees_own_code_is_imported(self):
+        (self.wt / "probe.py").write_text("import sys, pkg\nsys.exit(0 if pkg.VALUE == 'wt' else 1)\n")
+        result = self.gate("probe.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_venvs_tools_are_on_path(self):
+        (self.wt / "probe.py").write_text("import shutil, sys\nsys.exit(0 if shutil.which('venvtool') else 1)\n")
+        result = self.gate("probe.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

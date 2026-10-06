@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """slopbrake: put brakes on coding agents: install the checks into a repo and prove they bite.
 
-  slopbrake init REPO [--stack auto|python|typescript] [--update] [--dry-run] [--json]
+  slopbrake init REPO [--stack auto|python|typescript] [--update] [--dry-run] [--no-trust] [--json]
   slopbrake status REPO... [--json]
   slopbrake verify REPO [--json] [--keep]
   slopbrake user-hooks install|uninstall|status [--harness claude|codex|opencode] [--settings PATH] [--json]
@@ -379,7 +379,7 @@ def planned_files(repo: Path, stack: str) -> dict[str, str]:
     pointer = (f"\n- Packages are deep modules: see [{subs['PACKAGES_ROOT']}/README.md]({subs['PACKAGES_ROOT']}/README.md)."
                if (repo / subs.get("PACKAGES_ROOT", "-") / "README.md").is_file() else "")
     files["CLAUDE.md"] = (KIT / "common" / "CLAUDE.md.tmpl").read_text(encoding="utf-8").replace(
-        "@REPO@", repo.name).replace("@PACKAGES_POINTER@", pointer)
+        "@REPO@", repo_name(repo)).replace("@PACKAGES_POINTER@", pointer)
     return files
 
 
@@ -387,6 +387,12 @@ def render(text: str, subs: dict[str, str]) -> str:
     for key, value in subs.items():
         text = text.replace(f"@{key}@", value)
     return text
+
+
+def repo_name(repo: Path) -> str:
+    """The repository's name: a linked worktree is named after its main checkout, not its own directory."""
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False) or repo / ".git")
+    return common.parent.name if common.name == ".git" else repo.name
 
 
 def substitutions(repo: Path, stack: str) -> dict[str, str]:
@@ -435,7 +441,7 @@ def merge_settings(existing: dict, kit: dict) -> dict:
     return merged
 
 
-def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
+def init(repo: Path, stack: str, update: bool, dry_run: bool, trust: bool = True) -> dict:
     repo = repo_root(repo)
     existing_settings = hooks.load_settings(repo / ".claude/settings.json")  # refuse before writing anything
     files = planned_files(repo, stack)
@@ -538,7 +544,7 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
         next_steps.append("scripts/check runs pytest with python3 when there is no .venv: create one with pytest "
                           "(python3 -m venv .venv && .venv/bin/python -m pip install -e . pytest) or make sure "
                           "python3 has pytest")
-    if not dry_run:
+    if not dry_run and trust:
         next_steps += trust_repo(repo)
     written = [a.path for a in actions if a.action in ("create", "update", "merge") and a.path != ratchet]
     paths = commit_paths(repo, [*files, ".gitignore"], written if dry_run else [])
@@ -1110,6 +1116,8 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--stack", choices=["auto", "python", "typescript"], default="auto")
     p_init.add_argument("--update", action="store_true", help="refresh kit-managed files that differ")
     p_init.add_argument("--dry-run", action="store_true")
+    p_init.add_argument("--no-trust", action="store_true",
+                        help="do not add the repo to the user-level Stop gate's trusted list (for staging a branch)")
     p_status = sub.add_parser("status", help="which spec files and guardrails a repo has")
     p_status.add_argument("repos", type=Path, nargs="+")
     p_verify = sub.add_parser("verify", help="prove the checks bite, in a throwaway worktree")
@@ -1132,7 +1140,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             repo = repo_root(args.repo)
             stack = args.stack if args.stack != "auto" else recorded_stack(repo) or detect_stack(repo)
-            result, ok = init(repo, stack, args.update, args.dry_run), True
+            result, ok = init(repo, stack, args.update, args.dry_run, not args.no_trust), True
         elif args.command == "status":
             repos = [repo_root(r) for r in args.repos]
             result = [status(r) for r in repos]

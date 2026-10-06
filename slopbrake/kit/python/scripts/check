@@ -21,6 +21,10 @@ for candidate in "$PWD/.venv/bin/python" "${common:+${common%/*}/.venv/bin/pytho
   if [ -x "$candidate" ]; then PY=$candidate; break; fi
 done
 TEST_CMD="'${PY//\'/\'\\\'\'}' @TEST_ARGS@"  # single-quoted: POSIX sh reads it too
+# The venv's tools on PATH (as `uv run` does), and this tree's code first on the import path: a linked
+# worktree borrows the main checkout's venv, whose editable install points at the main tree.
+case "$PY" in */bin/python) export PATH="${PY%/python}:$PATH" ;; esac
+export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 STAGES=(lint types boundaries tests smoke test-quality mutation pr)
 SLOW_STAGES=(mutation)
