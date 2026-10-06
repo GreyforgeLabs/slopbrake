@@ -1,12 +1,30 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-10-05)
+
+Found by putting 0.2.0 to work on two more repos and three more harnesses.
 
 ### Codex and OpenCode (H5, H6, H7)
 
 - **New:** `slopbrake user-hooks install|uninstall|status --harness codex` merges `slopbrake-hook --harness codex pre-tool-use|post-tool-use|stop` into `~/.codex/hooks.json`, keeping other tools' entries. It refuses while `~/.codex/config.toml` lacks `[features] hooks = true` and never edits that file; `status` reminds you to trust the entries in Codex's `/hooks` screen and reports which ones `[hooks.state]` already trusts.
 - **New:** `--harness opencode` installs the OpenCode plugin `~/.config/opencode/plugins/slopbrake.js` (one dependency-free module; it refuses to overwrite a file that is not its own). It guards `bash` before it runs, records `bash`, `edit`, `multiedit`, `write` and `apply_patch` changes, and on `session.idle` runs the Stop gate for root sessions, sending a red report back as a new prompt at most 3 times in a row. It does nothing when `slopbrake-hook` is not on `PATH`.
 - Both installers refuse, and `status` is not ok, unless the `slopbrake-hook` on `PATH` answers `--harness codex|opencode pre-tool-use`: an older build that rejects `--harness` would make every hook a silent no-op. Codex entries count as installed only when matcher and timeout match too; install rewrites one that differs. Codex keys its trust by entry position, so removing or replacing slopbrake's entries can renumber a later entry in the same event, which then needs trusting again (`status` says so).
+
+- **Fixed:** Grok runs a repo's `.claude` hooks with camelCase JSON (`toolInput`, `sessionId`), so the git guard saw no command and allowed everything while looking wired. The kit's hooks and `slopbrake-hook --harness grok` now read both shapes; Grok's `write` and `hashline_edit` edits are recorded.
+- **Fixed:** a `CLAUDE_PROJECT_DIR` leaked into another harness made the user-level Stop gate skip the project repo; it is honoured only for Claude Code. `slopbrake hook --harness ...` (the alias) no longer dies in argparse with exit 2, which every harness reads as a block.
+
+### The gate
+
+- **Fixed:** when only tests changed, mutation mutated every module the changed test files imported, whole; on a large repo one changed allowlist made the Stop gate time out on every stop. It now mutates only the functions the changed test functions call (compared with the base, so a deleted assertion counts), and skips when they call nothing first-party.
+- **Fixed:** the last-green ratchet and the default-branch door (C8) counted untracked files, so a permanent untracked folder froze the ratchet and kept the `pr` stage red on main. Both now look at tracked files; an untracked file counts for C8 once it is staged.
+- **Fixed:** the Python `scripts/check` in a linked worktree tested the main checkout's code (the borrowed `.venv` holds an editable install of the main tree) and lacked the venv's tools on `PATH`. The template now puts this tree first on `PYTHONPATH` and the venv's `bin` on `PATH`. (Repo-owned: hand-merge into an existing `scripts/check`.)
+- **Fixed:** the kit scripts wrote `__pycache__` next to themselves, and `status` did not notice bytecode an older install had committed.
+
+### init and status
+
+- **Fixed:** `init` in a linked worktree set the shared `core.hooksPath`, switching the main checkout's hooks before the kit was merged; it now leaves it alone and says to set it after the merge. `init --no-trust` skips the trusted-repo list, for staging a branch. `CLAUDE.md` is named after the repository, not the worktree directory.
+- **Fixed:** `core.hooksPath=/dev/null` is reported as disabled hooks, not as existing hooks to chain into.
+- **Changed:** `status` counts only tracked TypeScript sources for its coverage gap, and `UNCOVERED=(dir ...)` in `scripts/check` declares sources left out on purpose (vendored code).
 
 ## 0.2.0 (2026-10-05)
 

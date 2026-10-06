@@ -515,9 +515,9 @@ class VerifyProofHelpers(unittest.TestCase):
 
 
 class Version(unittest.TestCase):
-    def test_version_is_0_2_0_everywhere(self):
-        self.assertEqual(__version__, "0.2.0")
-        self.assertIn('version = "0.2.0"', (HOME / "pyproject.toml").read_text())
+    def test_the_version_agrees_everywhere(self):
+        self.assertIn(f'version = "{__version__}"', (HOME / "pyproject.toml").read_text())
+        self.assertIn(f"## {__version__} (", (HOME / "CHANGELOG.md").read_text())
 
 
 if __name__ == "__main__":
