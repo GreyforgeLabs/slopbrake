@@ -21,7 +21,7 @@ echo "── test quality ──"; python3 slopbrake/kit/common/scripts/slopbrak
 echo "── eslint rule ──"
 ( cd tests/eslint && { [ -d node_modules ] || npm install --silent --no-audit --no-fund; } && npm test --silent ) || status=1
 echo "── opencode plugin ──"
-if command -v node >/dev/null; then node --test tests/opencode/ || status=1; else echo "skip: node is not installed"; fi
+if command -v node >/dev/null; then node --test tests/opencode/*.test.mjs || status=1; else echo "skip: node is not installed"; fi
 if [ "$fast" -eq 0 ] && [ "${SLOPBRAKE_OWN_MUTATION:-}" = true ]; then
   # T4 on the kit (what repos install); cli.py and hooks.py are not measured yet. Each mutant
   # reruns the ~2 min suite (stopping at the first failure), so this stage takes about an hour:
