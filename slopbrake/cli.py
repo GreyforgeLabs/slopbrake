@@ -504,6 +504,11 @@ def init(repo: Path, stack: str, update: bool, dry_run: bool) -> dict:
     elif hooks_path != ".githooks":
         if hooks_path or live_hooks:
             hooks_note = f"left alone: existing hooks ({hooks_path or ', '.join(live_hooks)}); chain .githooks by hand"
+        elif git(repo, "rev-parse", "--git-dir") != git(repo, "rev-parse", "--git-common-dir"):
+            # core.hooksPath is shared by every worktree: set here, it would switch the main checkout's hooks too.
+            hooks_note = "left alone: this is a linked worktree; core.hooksPath is shared with the main checkout"
+            next_steps.append("after merging the kit, turn its git hooks on in the main checkout: "
+                              "git config core.hooksPath .githooks")
         else:
             hooks_note = "set core.hooksPath=.githooks"
             if not dry_run:

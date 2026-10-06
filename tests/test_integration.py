@@ -156,5 +156,24 @@ class IsolatedFromTheOperator(unittest.TestCase):
                             "run the tests through scripts/check (or set XDG_CONFIG_HOME to a scratch dir)")
 
 
+class InitInALinkedWorktree(Scratch):
+    def test_init_in_a_linked_worktree_leaves_the_shared_hooks_setting_alone(self):
+        # A staged branch is built in a linked worktree; core.hooksPath lives in the shared config, so setting
+        # it there would switch hooks for the main checkout before anyone merged the kit.
+        main = self.root / "main"
+        main.mkdir()
+        sh(["git", "init", "-q", "-b", "main"], main)
+        (main / "pyproject.toml").write_text("[project]\nname = 'shop'\n")
+        sh(["git", "add", "-A"], main)
+        sh(["git", *GIT_ID, "commit", "-q", "--no-verify", "-m", "init"], main)
+        stage = self.root / "stage"
+        sh(["git", "worktree", "add", "-q", "-b", "slopbrake", str(stage)], main)
+        env = dict(os.environ, PYTHONPATH=str(HOME))
+        result = sh([sys.executable, "-m", "slopbrake", "init", str(stage)], self.root, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sh(["git", "config", "--get", "core.hooksPath"], main).stdout.strip(), "")
+        self.assertIn("linked worktree", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
