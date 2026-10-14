@@ -13,21 +13,16 @@ The Stop gate runs a repo's own scripts only when the operator trusts the repo
 """
 from __future__ import annotations
 
+# Every agent tool call starts this module, so it imports only what the common path needs: the git guard,
+# a state file and filesystem walks. Modules for git, the Stop gate and the installer are imported where
+# they are used (subprocess, tempfile, shutil and hashlib alone were most of the hook's startup).
 import contextlib
-import copy
 import fcntl
-import hashlib
-import importlib.util
 import json
 import os
 import re
 import shlex
-import shutil
-import signal
-import stat
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -64,15 +59,28 @@ class SettingsError(ValueError):
 
 # ── repos ────────────────────────────────────────────────────────────────────
 
+def git(cwd, *args: str, timeout: float | None = None) -> bytes | None:
+    """git's stdout in cwd, or None when it fails, cannot start or times out."""
+    import subprocess
+    try:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def git_path(cwd, *args: str) -> Path | None:
+    out = git(cwd, *args)
+    return Path(os.fsdecode(out.strip())).resolve() if out is not None else None
+
+
 def toplevel(path) -> Path | None:
     path = Path(path).expanduser()
     while not path.is_dir():  # a file, or one about to be created
         if path.parent == path:
             return None
         path = path.parent
-    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=path, capture_output=True, text=True,
-                            check=False)
-    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+    return git_path(path, "rev-parse", "--show-toplevel")
 
 
 def managed_toplevel(path) -> Path | None:
@@ -134,9 +142,7 @@ def main_checkout(path) -> Path | None:
     path = Path(path).expanduser()
     if not path.is_dir():
         return None
-    result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=path,
-                            capture_output=True, text=True, check=False)
-    common = Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+    common = git_path(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return common.parent if common and common.name == ".git" else toplevel(path)
 
 
@@ -328,32 +334,48 @@ def bash_dirs(command: str, cwd: Path) -> list[Path]:
     return list(dict.fromkeys(dirs))
 
 
+def head_commit(repo: Path) -> str:
+    """HEAD's commit, or "" before the first commit (or when git fails)."""
+    return os.fsdecode(git(repo, "rev-parse", "-q", "--verify", "HEAD", timeout=30) or b"").strip()
+
+
+# Space-separated fields before the path in `git status --porcelain=v2` entries: changed, renamed or copied
+# (its original path follows as the next entry), unmerged, untracked.
+STATUS_FIELDS = {b"1": 8, b"2": 9, b"u": 10, b"?": 1}
+
+
 def repo_state(repo: Path) -> tuple[str, dict[str, str]] | None:
-    """(HEAD, {uncommitted path: "size:mtime"}) from git status; None when git fails."""
+    """(HEAD, {uncommitted path: "size:mtime"}) from one git status; None when git fails. HEAD is "" before the
+    first commit. --no-optional-locks: never take index.lock or rewrite .git/index in a repo the hook only
+    observes; --no-ahead-behind: --branch is only here for HEAD's commit, never worth a history walk."""
+    out = git(repo, "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--no-ahead-behind", "-z",
+              "--untracked-files=all", timeout=30)
+    if out is None:
+        return None
+    oid, files = "", {}
     try:
-        head = subprocess.run(["git", "rev-parse", "-q", "--verify", "HEAD"], cwd=repo, capture_output=True,
-                              text=True, timeout=30, check=False).stdout.strip()
-        # --no-optional-locks: never take index.lock or rewrite .git/index in a repo the hook only observes
-        status = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain=v1", "-z",
-                                 "--untracked-files=all"], cwd=repo, capture_output=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+        top = os.open(repo, os.O_RDONLY | os.O_DIRECTORY)  # stat paths relative to it: no Path per file
+    except OSError:
         return None
-    if status.returncode:
-        return None
-    files, items = {}, status.stdout.split(b"\0")
-    while items:
-        item = items.pop(0)
-        if len(item) < 4:
-            continue
-        if item[:1] in (b"R", b"C") and items:
-            items.pop(0)  # a rename's old path follows it
-        path = os.fsdecode(item[3:])
-        try:
-            info = os.lstat(repo / path)
-            files[path] = f"{info.st_size}:{info.st_mtime_ns}"
-        except (OSError, ValueError):
-            files[path] = "-"
-    return head, files
+    try:
+        entries = iter(out.split(b"\0"))
+        for entry in entries:
+            if entry.startswith(b"# branch.oid "):
+                oid = os.fsdecode(entry[len(b"# branch.oid "):])
+            fields = STATUS_FIELDS.get(entry[:1])
+            parts = entry.split(b" ", fields) if fields else ()
+            if len(parts) != (fields or 0) + 1:
+                continue  # a header, or the empty tail
+            if entry[:1] == b"2":
+                next(entries, None)
+            try:
+                info = os.stat(parts[-1], dir_fd=top, follow_symlinks=False)
+                files[os.fsdecode(parts[-1])] = f"{info.st_size}:{info.st_mtime_ns}"
+            except (OSError, ValueError):
+                files[os.fsdecode(parts[-1])] = "-"
+    finally:
+        os.close(top)
+    return ("" if oid == "(initial)" else oid), files
 
 
 def snapshot(repo: Path) -> dict | None:
@@ -370,7 +392,10 @@ def snapshots(command: str, cwd: Path) -> dict[str, dict | None]:
 
 def pending_key(payload: dict, command: str) -> str:
     key = payload.get("tool_use_id")
-    return str(key) if key else hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()  # cwd may move
+    if key:
+        return str(key)
+    import hashlib
+    return hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()  # cwd may move
 
 
 def remember(payload: dict, command: str) -> None:
@@ -410,15 +435,14 @@ def post_tool_use(payload: dict) -> int:
     whose snapshot differs from PreToolUse's (or that had none, such as a fresh clone). A Bash call is judged
     from the cwd PreToolUse saw: after a `cd` the payload's cwd is already inside the repo it moved to, which
     PreToolUse may never have snapshotted. Without a PreToolUse snapshot nothing is recorded. An apply_patch
-    is a direct edit of every file it names."""
+    is a direct edit of every file it names. A repo's HEAD is read only the first time the session changes it."""
     cwd = Path(payload.get("cwd") or os.getcwd())
     args = payload.get("tool_input") or {}
     if payload.get("tool_name") in EDIT_TOOLS:
         target = args.get("file_path") or args.get("notebook_path") or args.get("path")  # path: grok's hashline_edit?
-        root = managed_root(cwd / Path(target).expanduser()) if target else None
-        targets = [cwd / Path(target).expanduser()] if root else []
+        targets = [target] if target else []
     elif payload.get("tool_name") in PATCH_TOOLS:
-        targets = [cwd / Path(target).expanduser() for target in patch_targets(payload)]
+        targets = patch_targets(payload)
     elif payload.get("tool_name") == "Bash":
         command = str(args.get("command", ""))
         taken = recall(payload, command) if state_path(payload.get("session_id")).is_file() else None
@@ -439,14 +463,17 @@ def post_tool_use(payload: dict) -> int:
             record(payload.get("session_id"), set(paths), paths, heads)
         return 0
     else:
-        targets = []
-    paths, heads = {}, {}
+        return 0
+    paths = {}
     for target in targets:
-        if root := managed_root(target):
-            paths.setdefault(str(root), set()).add(os.path.relpath(os.path.normpath(target), root))
-            if str(root) not in heads and (state := repo_state(root)):
-                heads[str(root)] = state[0]
+        # Resolved like managed_root resolves the repo, so a path through a symlinked directory is still the
+        # repo's own file (git status names it relative to the real toplevel).
+        path = (cwd / Path(target).expanduser()).resolve()
+        if root := managed_root(path):
+            paths.setdefault(str(root), set()).add(os.path.relpath(path, root))
     if paths:
+        known = session_record(payload.get("session_id"))[1]  # record keeps the first HEAD: never re-read it
+        heads = {repo: head_commit(Path(repo)) for repo in paths if repo not in known}
         record(payload.get("session_id"), set(paths), paths, heads)
     return 0
 
@@ -462,8 +489,7 @@ def gate_scope(repo: Path, paths: dict, heads: dict) -> dict | None:
     mine = set(string_list(paths.get(key))) & set(files)
     if not mine and head == heads[key]:
         return None
-    branch = subprocess.run(["git", "symbolic-ref", "-q", "--short", "HEAD"], cwd=repo, capture_output=True,
-                            text=True, check=False).stdout.strip()
+    branch = os.fsdecode(git(repo, "symbolic-ref", "-q", "--short", "HEAD") or b"").strip()
     return {"mine": mine, "foreign": set(files) - mine, "branch": branch}
 
 
@@ -471,6 +497,9 @@ def gate_scope(repo: Path, paths: dict, heads: dict) -> dict | None:
 def clean_copy(repo: Path, mine: set[str]):
     """A detached worktree of HEAD carrying only this session's uncommitted files (and the repo's
     node_modules, linked), removed afterwards. The repo's own tree is never touched."""
+    import shutil
+    import subprocess
+    import tempfile
     scratch = Path(tempfile.mkdtemp(prefix="slopbrake-stop-"))
     clean = scratch / "wt"
     try:
@@ -503,6 +532,8 @@ def retarget(text: str, cwd: Path) -> str:
 
 def run_gate(hook: Path, repo: Path, text: str, left: float, **extra: str) -> tuple[int, str]:
     """Run one repo's require-green.sh in its own process group; kill the group at left + STOP_GRACE."""
+    import signal
+    import subprocess
     env = dict(os.environ, CLAUDE_PROJECT_DIR=str(repo), SLOPBRAKE_STOP_TIMEOUT=str(max(1, int(left))), **extra)
     proc = subprocess.Popen([str(hook)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd=repo, env=env, text=True, encoding="utf-8", errors="replace", start_new_session=True)
@@ -568,6 +599,7 @@ def pre_tool_use(payload: dict, guard: Path = KIT_GUARD) -> int:
     command = (payload.get("tool_input") or {}).get("command")
     if payload.get("tool_name") not in (None, "Bash") or not isinstance(command, str) or not command.strip():
         return 0
+    import importlib.util
     spec = importlib.util.spec_from_file_location("slopbrake_git_guard", guard)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -656,6 +688,8 @@ def ours(command: str) -> bool:
 
 def runnable() -> tuple[str | None, bool]:
     """The `slopbrake-hook` Claude Code would run, and whether it answers a no-op hook event with exit 0."""
+    import shutil
+    import subprocess
     binary = shutil.which(PROGRAM)
     if not binary:
         return None, False
@@ -724,10 +758,11 @@ def user_lines(result: dict) -> list[str]:
 
 def write_settings(path: Path, data: dict) -> None:
     """Replace the file atomically, keeping its mode (settings can hold secrets) and a symlink a symlink."""
+    import tempfile
     target = path.resolve()  # keep a symlinked settings file (dotfiles) a symlink
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
-        mode = stat.S_IMODE(target.stat().st_mode)
+        mode = target.stat().st_mode & 0o7777
     except FileNotFoundError:
         umask = os.umask(0)
         os.umask(umask)
@@ -767,6 +802,7 @@ def strip_ours(data: dict) -> bool:
 
 
 def install(path: Path) -> dict:
+    import copy
     binary, ready = runnable()
     data = load_settings(path)
     if not ready:

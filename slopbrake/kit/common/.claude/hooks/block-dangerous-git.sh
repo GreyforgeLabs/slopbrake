@@ -9,4 +9,11 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "BLOCKED: the destructive-git guard (H5) needs python3, which is not on PATH; install python3 or ask the operator to run this command." >&2
   exit 2
 fi
-exec python3 "$(dirname "$0")/git_guard.py" --scope always
+# git_guard.py is imported, not run as a script, so Python reuses its compiled bytecode instead of compiling
+# 900 lines on every Bash call. Its bytecode goes under the user's cache directory, never into the repo; the
+# standard library keeps its own. -I keeps the session's cwd and PYTHON* variables out of the import path.
+exec python3 -I -c 'import __future__, json, re, shlex, sys
+sys.pycache_prefix = sys.argv.pop(1)
+sys.path.insert(0, sys.argv.pop(1))
+import git_guard
+sys.exit(git_guard.main(sys.argv[1:]))' "${XDG_CACHE_HOME:-$HOME/.cache}/slopbrake/pycache" "$(dirname "$0")" --scope always

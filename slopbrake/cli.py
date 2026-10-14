@@ -1023,9 +1023,10 @@ class Verifier:
 
         # H5: destructive git commands are blocked; branch pushes are not.
         guard = self.wt / ".claude/hooks/block-dangerous-git.sh"
-        wrong = []
+        wrong, cache = [], {"XDG_CACHE_HOME": str(self.scratch / "cache")}  # the guard's bytecode: gone with the worktree
         for command, expected in GIT_GUARD_CASES:
-            result = run([str(guard)], self.wt, stdin=json.dumps({"tool_input": {"command": command}, "cwd": str(self.wt)}))
+            result = run([str(guard)], self.wt, env=self.env(**cache),
+                         stdin=json.dumps({"tool_input": {"command": command}, "cwd": str(self.wt)}))
             if result.returncode != expected:
                 wrong.append(f"{command}: exit {result.returncode}, expected {expected}")
         self.prove("git guard blocks destructive commands only", True,

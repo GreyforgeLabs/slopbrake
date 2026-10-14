@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.3 (2026-10-14)
+
+Faster hooks on every agent tool call, and two recording fixes for the user-level Stop gate (H6, H7).
+
+- **Faster:** `slopbrake-hook` imports only what the common path needs; `subprocess`, `tempfile`, `shutil`, `hashlib` and `argparse` load only where git, the Stop gate or the installer use them. Median wall time per call on a busy 12-core host, Python 3.13: a Bash call outside managed repos 48 → 35 ms, an Edit outside 44 → 32 ms, an untouched Stop 44 → 31 ms. Peak RSS 18.7 → 14.8 MB.
+- **Faster:** a snapshot of a managed repo is one `git status --porcelain=v2 --branch` instead of `rev-parse` plus `status`, and stats each path relative to the repo's directory. PreToolUse in a managed repo 67 → 56 ms; on a repo with 30,000 untracked files a snapshot takes 2.7x less time (546 → 202 ms; the status parser is now linear).
+- **Faster:** an Edit in a managed repo reads HEAD only the first time the session changes that repo, with `rev-parse`, never a full `git status`: 64 → 32 ms per Edit.
+- **Faster:** the project guard (`.claude/hooks/block-dangerous-git.sh`) imports `git_guard.py` instead of running it as a script, so Python reuses its bytecode instead of compiling 900 lines per Bash call, and parses its one option by hand (argparse alone pulled in a dozen modules on Python 3.14): 67 → 31 ms per call with Python 3.14, 17.9 → 12.9 MB. The bytecode lives under `${XDG_CACHE_HOME:-~/.cache}/slopbrake/pycache`, never in the repo, and the guard runs with `python3 -I`, so the session's cwd and `PYTHON*` variables stay out of its imports. It reads the hook JSON as UTF-8 whatever the locale.
+- **Fixed:** an edit made through a symlinked directory was recorded as `../link/...` instead of the repo's own path, so the user-level Stop gate skipped a repo whose only change came that way. Edit and `apply_patch` targets are now resolved like the repo itself.
+- **Fixed:** a worktree rename (`git add -N` on the new name) made the snapshot record a garbage path (porcelain v1 puts the `R` in the second column); the v2 parser reads renames by entry type.
+- `slopbrake verify` and Slopbrake's own gate keep the guard's bytecode in their scratch directories.
+
 ## 0.2.2 (2026-10-06)
 
 - **Fixed:** the user-level Stop gate held a session red for another session's uncommitted work in the same repo (and spent its whole budget mutating it). It now records the files each session changed and the HEAD it started from, skips repos where nothing of the session's is left, and gates HEAD plus the session's own files in a clean temporary worktree when other uncommitted work is present.

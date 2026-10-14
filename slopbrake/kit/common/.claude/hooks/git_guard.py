@@ -24,7 +24,6 @@ run; wrappers it does not know, such as watch, ionice, chrt, taskset, flock, unb
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import posixpath
@@ -845,12 +844,24 @@ def check_command(command: str, cwd: str, scope: str) -> str | None:
     return Judge(os.path.abspath(cwd or os.getcwd()), scope).string(command)
 
 
+USAGE = "usage: git_guard.py [--scope always|managed]  (the hook JSON on stdin)"
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--scope", choices=("always", "managed"), default="always")
-    scope = parser.parse_args(argv).scope
+    """The hook. Its one option is parsed by hand: argparse costs more than the check itself on every Bash call.
+    Bad usage exits 2 (blocks), like the guard's other failures in always scope."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args in (["-h"], ["--help"]):
+        print(f"{USAGE}\n\n{__doc__.splitlines()[0]}")
+        return 0
+    if len(args) == 1 and args[0].startswith("--scope="):
+        args = ["--scope", args[0].partition("=")[2]]
+    scope = "always" if not args else args[1] if len(args) == 2 and args[0] == "--scope" else None
+    if scope not in ("always", "managed"):
+        print(USAGE, file=sys.stderr)
+        return 2
     try:
-        payload = json.loads(sys.stdin.read())
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace"))  # UTF-8 whatever the locale
         command = (payload.get("tool_input") or payload.get("toolInput") or {}).get("command")  # grok: camelCase
         cwd = payload.get("cwd") or os.getcwd()
         reason = check_command(command, str(cwd), scope) if isinstance(command, str) and command.strip() else None
