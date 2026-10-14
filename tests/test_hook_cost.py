@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from test_cli_hooks import GIT_ID, HOME, sh
-from test_git_guard import GUARD, HOOKS
+from test_git_guard import GUARD, HOOKS, load_guard
 from test_r2_hooks import R2
 
 from slopbrake import hooks
@@ -121,6 +121,23 @@ class GuardCommandLine(R2):
         self.assertEqual(bad.returncode, 2)  # bad usage blocks, like argparse did
         self.assertIn("usage: git_guard.py", bad.stderr)
         self.assertEqual(self.guard("--help").returncode, 0)
+
+    def test_the_hand_written_option_parser_matches_its_usage(self):
+        allowed = '{"tool_input": {"command": "git status"}, "cwd": "/"}'
+        self.assertEqual(self.guard(stdin=allowed).returncode, 0)  # no option: scope always, an allowed command
+        self.assertEqual(self.guard().returncode, 2)
+        self.assertEqual(self.guard("--scope=managed").returncode, 0)  # "/" is no managed repo
+        for bad in (["--scope"], ["--scope=managed", "extra"], ["--bogus", "managed"], ["--scope", "managed", "x"]):
+            result = self.guard(*bad)
+            self.assertEqual(result.returncode, 2, bad)
+            self.assertIn("usage: git_guard.py [--scope always|managed]", result.stderr, bad)
+        for flag in ("-h", "--help"):
+            result = self.guard(flag)
+            self.assertEqual(result.returncode, 0, flag)
+            self.assertIn("usage: git_guard.py [--scope always|managed]", result.stdout)
+        self.assertIn("block destructive git commands in agent sessions", self.guard("-h").stdout)
+        with mock.patch("sys.stdout"):
+            self.assertEqual(load_guard().main(["-h"]), 0)  # an exit code, not None
 
     def test_the_project_hook_caches_bytecode_outside_the_repo_and_ignores_the_cwd(self):
         hooks_dir = self.base / "repo/.claude/hooks"
