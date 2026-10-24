@@ -348,8 +348,8 @@ def scan(path: Path) -> list[tuple[str, int, int, str]]:
         return [(str(path), exc.lineno or 0, exc.lineno or 0, f"cannot parse: {exc.msg}")]
     except UnicodeDecodeError as exc:
         line = exc.object[:exc.start].count(b"\n") + 1
-        return [(str(path), line, line, f"cannot parse: not valid {exc.encoding} ({exc.reason}); "
-                                        "save it as UTF-8 or declare its encoding")]
+        message = f"cannot parse: not valid {exc.encoding} ({exc.reason}); save it as UTF-8 or declare its encoding"
+        return [(str(path), line, line, message)]
     tf = TestFile(path, tree, split_lines(source))  # numbered as ast numbers them: only "\n" ends a line
     problems = []
     functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
