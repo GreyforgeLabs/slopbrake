@@ -40,7 +40,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import python_files
+from common import python_files, split_lines
 
 EQUALITY_ASSERTS = {"assertEqual", "assertEquals", "assertIs", "assertListEqual", "assertDictEqual",
                     "assertTupleEqual", "assertSetEqual", "assertCountEqual", "assertAlmostEqual",
@@ -346,7 +346,7 @@ def scan(path: Path) -> list[tuple[str, int, int, str]]:
         tree = ast.parse(source, str(path))
     except SyntaxError as exc:
         return [(str(path), exc.lineno or 0, exc.lineno or 0, f"cannot parse: {exc.msg}")]
-    tf = TestFile(path, tree, source.splitlines())
+    tf = TestFile(path, tree, split_lines(source))  # numbered as ast numbers them: only "\n" ends a line
     problems = []
     functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     for func in functions:

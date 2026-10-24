@@ -319,5 +319,25 @@ class NoAssertionShapes(Scratch):
             """, kind="no assertion"), [4, 6])
 
 
+class SourceEncoding(Scratch):
+    """Test files are read the way Python reads them, and their lines numbered the way ast numbers them."""
+
+    def flagged_bytes(self, data, kind="tautological"):
+        path = self.root / "tests/test_seed.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        result = self.check("tests")
+        self.assertNotIn("Traceback", result.stderr)
+        return result, sorted(int(line.split(":")[1]) for line in result.stdout.splitlines() if f": {kind}" in line)
+
+    def test_a_form_feed_or_line_separator_does_not_shift_the_allow_comment(self):
+        # str.splitlines() also ends a line at \f and U+2028; Python's tokenizer and git do not.
+        result, lines = self.flagged_bytes(
+            "from shop import MAX, label\n\x0c\ndef test_a():\n    assert MAX == 281\n"
+            "    assert label() == 'a\u2028b'\n"
+            "    assert MAX == 280  # slopbrake: allow-tautology: the published API limit\n".encode("utf-8"))
+        self.assertEqual(lines, [4], result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
