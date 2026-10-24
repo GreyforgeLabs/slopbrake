@@ -519,6 +519,11 @@ class Version(unittest.TestCase):
         self.assertIn(f'version = "{__version__}"', (HOME / "pyproject.toml").read_text())
         self.assertIn(f"## {__version__} (", (HOME / "CHANGELOG.md").read_text())
 
+    def test_version_flag_prints_the_version(self):
+        result = subprocess.run([sys.executable, "-m", "slopbrake", "--version"], cwd=HOME, capture_output=True,
+                                text=True, check=False)
+        self.assertEqual((result.returncode, result.stdout), (0, f"slopbrake {__version__}\n"), result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1117,6 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
         return hooks.main(argv[1:])
     parser = argparse.ArgumentParser(prog="slopbrake", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     p_init = sub.add_parser("init", help="install or refresh the kit in a repo")
     p_init.add_argument("repo", type=Path)
