@@ -436,6 +436,23 @@ class Mutation(Scratch):
         self.assertIn("survived: shop.py:5 [return None] return 3", result.stdout)
         self.assertNotIn("shop.py:4", result.stdout)
 
+    def test_sources_with_a_bom_or_a_coding_cookie_are_mutated_like_python_reads_them(self):
+        self.git_repo()
+        self.seed("", "self.assertEqual(greet(2), 'caf\u00e9s')\nself.assertEqual(greet(1), 'caf\u00e9')\n"
+                  "self.assertEqual(Fee.rate(), 3)\n", "Fee, greet")
+        # Every greet mutant is killed and every unused() mutant survives. A mutant restored as UTF-8 under
+        # the latin-1 cookie would break the baseline, so every later mutant would count as killed.
+        (self.root / "shop.py").write_bytes(
+            b"# -*- coding: latin-1 -*-\nfrom fee import Fee\n\n\ndef greet(n):\n    if n > 1:\n"
+            b"        return 'caf\xe9s'\n    return 'caf\xe9'\n\n\ndef unused(x):\n    return x + 1\n")
+        (self.root / "fee.py").write_bytes(b"\xef\xbb\xbfclass Fee:\n    @staticmethod\n    def rate():\n"
+                                           b"        return 3\n")
+        result = self.floor("--base", "main")
+        self.assertNotIn("cannot parse", result.stdout + result.stderr)
+        self.assertIn("9/12 mutants killed", result.stdout, result.stdout + result.stderr)
+        self.assertEqual(sorted(line.split(" [")[0] for line in result.stdout.splitlines() if line.startswith("survived")),
+                         ["survived: shop.py:12"] * 3)
+
     def test_non_ascii_paths_are_checked(self):
         self.git_repo()
         self.git("checkout", "-q", "-b", "feat")

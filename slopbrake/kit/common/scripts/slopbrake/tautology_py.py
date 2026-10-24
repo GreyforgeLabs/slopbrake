@@ -40,7 +40,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import python_files, split_lines
+from common import python_files, read_python, split_lines
 
 EQUALITY_ASSERTS = {"assertEqual", "assertEquals", "assertIs", "assertListEqual", "assertDictEqual",
                     "assertTupleEqual", "assertSetEqual", "assertCountEqual", "assertAlmostEqual",
@@ -135,7 +135,7 @@ class TestFile:
         for base in bases:
             for path in (base.joinpath(*parts[:-1], parts[-1] + ".py"), base.joinpath(*parts, "__init__.py")):
                 try:
-                    tree = ast.parse(path.read_text(encoding="utf-8"))
+                    tree = ast.parse(read_python(path))
                 except (OSError, SyntaxError, UnicodeDecodeError):
                     continue
                 return next((f for f in tree.body if isinstance(f, FUNCS) and f.name == name), None)
@@ -341,11 +341,15 @@ def unasserted_tests(tree: ast.Module):
 
 def scan(path: Path) -> list[tuple[str, int, int, str]]:
     """Problems as (path, line, last line of the span it covers, message)."""
-    source = path.read_text(encoding="utf-8")
     try:
+        source = read_python(path)
         tree = ast.parse(source, str(path))
     except SyntaxError as exc:
         return [(str(path), exc.lineno or 0, exc.lineno or 0, f"cannot parse: {exc.msg}")]
+    except UnicodeDecodeError as exc:
+        line = exc.object[:exc.start].count(b"\n") + 1
+        return [(str(path), line, line, f"cannot parse: not valid {exc.encoding} ({exc.reason}); "
+                                        "save it as UTF-8 or declare its encoding")]
     tf = TestFile(path, tree, split_lines(source))  # numbered as ast numbers them: only "\n" ends a line
     problems = []
     functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]

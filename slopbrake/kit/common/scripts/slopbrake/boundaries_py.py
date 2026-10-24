@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True  # a __pycache__ under scripts/slopbrake/ would itself be a one-way change
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import python_files
+from common import python_files, read_python
 
 SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "build", "dist", "__pycache__", ".tox",
              "site-packages", ".mypy_cache", ".pytest_cache", "runtime"}
@@ -182,7 +182,7 @@ def violations(root: Path) -> list[tuple[str, str]]:
         if SKIP_DIRS & set(rel.parts):
             continue
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            tree = ast.parse(read_python(path), str(path))
         except (SyntaxError, UnicodeDecodeError):
             continue
         testing = is_test_path(rel)

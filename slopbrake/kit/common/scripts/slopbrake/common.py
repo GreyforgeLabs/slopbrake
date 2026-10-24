@@ -213,6 +213,17 @@ def split_lines(text: str) -> list[str]:
     return lines[:-1] if lines[-1] == "" else lines
 
 
+def read_python(path: Path) -> str:
+    """A Python file decoded the way the interpreter reads it: a UTF-8 BOM or a PEP 263 coding cookie, else
+    UTF-8; newlines translated as read_text does. Raises SyntaxError for an unknown or conflicting cookie, and
+    UnicodeDecodeError over the whole file (so .start locates the bad byte) for bytes that do not decode."""
+    import io
+    import tokenize
+    data = path.read_bytes()
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)  # "utf-8-sig" strips a BOM
+    return data.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
+
+
 def untracked_files() -> list[str]:
     """Untracked, not-ignored files, as paths from the repo root (whatever the cwd)."""
     out = git("ls-files", "--others", "--exclude-standard", "-z", cwd=repo_root())
@@ -253,9 +264,9 @@ def collect_changes(base: str | None, working_tree: bool) -> dict[str, FileChang
     if working_tree:
         root = repo_root()
         for path in untracked_files():
-            try:
-                lines = split_lines((root / path).read_text(encoding="utf-8"))
-            except (UnicodeDecodeError, OSError):
+            try:  # errors="replace", as git() reads tracked diffs: a latin-1 file's lines still count as added
+                lines = split_lines((root / path).read_text(encoding="utf-8", errors="replace"))
+            except OSError:
                 lines = []
             changes[path] = FileChange(path=path, added={i + 1: t for i, t in enumerate(lines)})
     return changes

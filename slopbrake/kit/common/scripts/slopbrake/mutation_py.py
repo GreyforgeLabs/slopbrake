@@ -36,6 +36,7 @@ from common import (
     describe_base,
     git,
     merge_base,
+    read_python,
     repo_root,
     split_lines,
 )
@@ -263,7 +264,10 @@ def changed_test_calls(old: str, new: str) -> set[str]:
 
 def defined_lines(path: Path, names: set[str]) -> dict[str, set[int]]:
     """Line spans of the module-level functions and classes (and their methods) named in `names`."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    try:
+        tree = ast.parse(read_python(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return {}
     spans: dict[str, set[int]] = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
@@ -272,7 +276,10 @@ def defined_lines(path: Path, names: set[str]) -> dict[str, set[int]]:
 
 
 def mutable_lines(path: Path, lines: set[int]) -> set[int]:
-    source = split_lines(path.read_text(encoding="utf-8"))
+    try:
+        source = split_lines(read_python(path))
+    except (SyntaxError, UnicodeDecodeError):
+        return lines  # main() reports the file as unparsable
     return {n for n in lines if n <= len(source) and not NO_MUTATE.search(source[n - 1])}
 
 
@@ -311,11 +318,12 @@ def main(argv: list[str] | None = None) -> int:
     if tests_only:  # weakened (even deleted) assertions change only tests: mutate what the changed tests call
         fork = merge_base(base)
 
-        def base_source(change) -> str:
-            return git("show", f"{fork}:{change.old_path or change.path}", check=False)
+        def base_source(change) -> str:  # without a BOM, which ast rejects in a str
+            return git("show", f"{fork}:{change.old_path or change.path}", check=False).removeprefix("\ufeff")
 
         def head_source(change) -> str:
-            return "" if change.deleted else (root / change.path).read_text(encoding="utf-8", errors="replace")
+            text = "" if change.deleted else (root / change.path).read_text(encoding="utf-8", errors="replace")
+            return text.removeprefix("\ufeff")
 
         tests = [c for c in changes.values()
                  if is_test_path(c.path) and (wanted(c.path) or c.deleted and first_party(c.path))]
@@ -340,8 +348,8 @@ def main(argv: list[str] | None = None) -> int:
     plan, hidden = [], 0
     for path, lines in sorted(targets.items()):
         try:
-            tree = ast.parse((root / path).read_text(encoding="utf-8"))
-        except SyntaxError as exc:
+            tree = ast.parse(read_python(root / path))
+        except (SyntaxError, UnicodeDecodeError) as exc:
             print(f"mutation: cannot parse {path}: {exc}")
             return 1
         plan += [(path, index) for index in range(len(sites(tree, lines)))]
@@ -373,8 +381,8 @@ def main(argv: list[str] | None = None) -> int:
 
         killed, survivors = 0, []
         for path, index in plan:
-            original = (work / path).read_text(encoding="utf-8")
-            tree = ast.parse(original)
+            original = (work / path).read_bytes()  # restored byte for byte: a coding cookie stays true
+            tree = ast.parse(read_python(work / path))
             node, kind, detail = sites(tree, targets[path])[index]
             line = node.lineno
             description = apply(node, kind, detail)
@@ -382,9 +390,9 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 ok, _timed_out = run_tests(args.test_cmd, work, env, timeout)
             finally:
-                (work / path).write_text(original, encoding="utf-8")
+                (work / path).write_bytes(original)
             if ok:
-                source = split_lines(original)[line - 1].strip()
+                source = split_lines(read_python(work / path))[line - 1].strip()
                 survivors.append({"path": path, "line": line, "mutation": description, "source": source})
             else:
                 killed += 1

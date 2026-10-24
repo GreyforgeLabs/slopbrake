@@ -407,6 +407,18 @@ class TestsOnlyChanges(Scratch):
         self.assertIn("calc/core.py", result.stdout)
         self.assertIn("below floor", result.stdout)
 
+    def test_a_weakened_test_saved_with_a_bom_is_mutation_checked(self):
+        # A BOM made the changed test unparsable as a str, so mutation skipped it as calling nothing.
+        (self.root / "tests/test_core.py").write_bytes(
+            b"\xef\xbb\xbfimport unittest\nfrom calc.core import one, two\n\n\n"
+            b"class T(unittest.TestCase):\n    def test_it(self):\n"
+            b"        self.assertIsNotNone(one())\n        self.assertIsNotNone(two())\n")
+        self.commit("weaken, in an editor that writes a BOM")
+        result = self.floor()
+        self.assertIn("mutating what the changed tests call: calc/core.py (one, two)", result.stdout,
+                      result.stdout + result.stderr)
+        self.assertIn("below floor", result.stdout)
+
     def test_a_deleted_assertion_is_mutation_checked(self):
         self.write("tests/test_core.py", "import unittest\nfrom calc.core import one, two\n\n\n"
                                          "class T(unittest.TestCase):\n    def test_it(self):\n"

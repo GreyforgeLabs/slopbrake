@@ -81,6 +81,18 @@ class FlatLayout(Scratch):
             "tests/test_probe.py:1: tests-through-entrypoints: imports private name gf_skills._slopbrake_probe; use gf_skills's entry points",
         ])
 
+    def test_a_file_saved_with_a_bom_or_a_coding_cookie_is_still_checked(self):
+        # Python runs both; skipping them as unparsable would hide their imports from D1 and the cycle check.
+        self.write("gf_skills.py", "def load():\n    pass\n")
+        (self.root / "tests").mkdir()
+        (self.root / "tests/test_bom.py").write_bytes(b"\xef\xbb\xbffrom gf_skills._slopbrake_probe import value\n")
+        (self.root / "tests/test_latin.py").write_bytes(
+            b"# -*- coding: latin-1 -*-\nNAME = '\xe9'\nfrom gf_skills._slopbrake_probe import value\n")
+        self.assertEqual(self.violations(), [
+            "tests/test_bom.py:1: tests-through-entrypoints: imports private name gf_skills._slopbrake_probe; use gf_skills's entry points",
+            "tests/test_latin.py:3: tests-through-entrypoints: imports private name gf_skills._slopbrake_probe; use gf_skills's entry points",
+        ])
+
 
 class DynamicAndNamespace(Scratch):
     def test_literal_dynamic_imports_and_namespace_folders_are_checked(self):

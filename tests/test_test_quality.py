@@ -338,6 +338,20 @@ class SourceEncoding(Scratch):
             "    assert MAX == 280  # slopbrake: allow-tautology: the published API limit\n".encode("utf-8"))
         self.assertEqual(lines, [4], result.stdout)
 
+    def test_a_utf8_bom_or_coding_cookie_is_read_like_python(self):
+        result, lines = self.flagged_bytes(b"\xef\xbb\xbffrom shop import MAX\ndef test_a():\n    assert MAX == 280\n")
+        self.assertEqual((result.returncode, lines), (1, [3]), result.stdout)
+        result, lines = self.flagged_bytes(
+            b"# -*- coding: latin-1 -*-\nfrom shop import MAX, name\ndef test_a():\n"
+            b"    assert name() == '\xe9t\xe9'\n    assert MAX == 280\n")
+        self.assertEqual((result.returncode, lines), (1, [5]), result.stdout)
+
+    def test_undecodable_bytes_are_reported_not_a_crash(self):
+        result, lines = self.flagged_bytes(b"from shop import f\n\ndef test_a():\n    assert f('\xe9') == 1\n",
+                                           kind="cannot parse")
+        self.assertEqual((result.returncode, lines), (1, [4]), result.stdout)
+        self.assertIn("utf-8", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
