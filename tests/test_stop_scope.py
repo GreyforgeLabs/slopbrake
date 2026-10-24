@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -95,6 +96,34 @@ class StopScope(unittest.TestCase):
         self.hook("stop", {})
         self.assertEqual(sh(["git", "status", "--porcelain"], self.repo).stdout, before)
         self.assertEqual(sh(["git", "worktree", "list"], self.repo).stdout.count("\n"), 1)
+
+
+class SessionStateRetention(unittest.TestCase):
+    """Every session that runs a Bash command leaves a state file; idle ones must not pile up forever."""
+
+    def test_a_new_session_prunes_state_files_idle_for_over_30_days(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp) / "state/slopbrake/sessions"
+            sessions.mkdir(parents=True)
+            month = 31 * 86400
+            for name, age in (("stale.json", month), ("recent.json", 86400), ("notes.txt", month)):
+                (sessions / name).write_text("{}")
+                os.utime(sessions / name, (time.time() - age,) * 2)
+            env = dict(os.environ, PYTHONPATH=str(HOME), XDG_STATE_HOME=str(Path(tmp) / "state"),
+                       XDG_CONFIG_HOME=str(Path(tmp) / "config"))
+
+            def bash(session):
+                payload = {"session_id": session, "cwd": tmp, "tool_name": "Bash", "tool_input": {"command": "ls"}}
+                result = sh([sys.executable, "-m", "slopbrake.hooks", "pre-tool-use"], tmp, env, json.dumps(payload))
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            (sessions / "old-but-live.json").write_text("{}")
+            os.utime(sessions / "old-but-live.json", (time.time() - month,) * 2)
+            bash("old-but-live")  # a session that already has a state file does not scan the directory
+            self.assertTrue((sessions / "stale.json").exists())
+            bash("fresh")
+            self.assertEqual(sorted(p.name for p in sessions.iterdir()),
+                             ["fresh.json", "notes.txt", "old-but-live.json", "recent.json"])
 
 
 if __name__ == "__main__":

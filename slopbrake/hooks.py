@@ -51,6 +51,7 @@ OPERATORS = set("();<>|&")
 STOP_BUDGET = 540  # seconds for every touched repo together, inside the 600 s hook timeout
 STOP_GRACE = 10  # on top of a gate's share of the budget before it is killed
 PENDING_MAX = 64  # snapshots of Bash calls still running (or whose PostToolUse never came)
+STATE_MAX_AGE = 30 * 86400  # a session state file untouched this long is deleted when a new session starts
 
 
 class SettingsError(ValueError):
@@ -268,6 +269,21 @@ def state_path(session_id) -> Path:
     return state_dir() / (re.sub(r"[^A-Za-z0-9._-]", "_", str(session_id or "unknown")) + ".json")
 
 
+def session_state(session_id) -> Path:
+    """state_path for writing. A session's first write prunes state files no session has touched for
+    STATE_MAX_AGE (every session that runs a Bash command leaves one): one directory scan per session."""
+    path = state_path(session_id)
+    if not path.exists():
+        cutoff = time.time() - STATE_MAX_AGE
+        with contextlib.suppress(OSError), os.scandir(path.parent) as entries:
+            for entry in entries:
+                with contextlib.suppress(OSError):
+                    if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False) \
+                            and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+    return path
+
+
 def touched(session_id) -> list[str]:
     try:
         return string_list(json.loads(state_path(session_id).read_text(encoding="utf-8")).get("repos"))
@@ -288,7 +304,7 @@ def record(session_id, repos: set[str], paths: dict[str, set[str]] | None = None
         for repo, head in (heads or {}).items():
             first.setdefault(repo, head)
         data["heads"] = first
-    update_json(state_path(session_id), change)
+    update_json(session_state(session_id), change)
 
 
 def session_record(session_id) -> tuple[dict, dict]:
@@ -408,7 +424,7 @@ def remember(payload: dict, command: str) -> None:
         pending = data.get("pending") if isinstance(data.get("pending"), dict) else {}
         pending[pending_key(payload, command)] = taken
         data["pending"] = dict(list(pending.items())[-PENDING_MAX:])
-    update_json(state_path(payload.get("session_id")), change)
+    update_json(session_state(payload.get("session_id")), change)
 
 
 def recall(payload: dict, command: str) -> dict | None:
