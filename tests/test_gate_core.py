@@ -636,7 +636,7 @@ class StopHook(Scratch):
         nojq.mkdir()
         for directory in os.environ["PATH"].split(os.pathsep):
             for tool in Path(directory).glob("*") if Path(directory).is_dir() else ():
-                if tool.name != "jq" and not (nojq / tool.name).exists():
+                if tool.name != "jq" and not os.path.lexists(nojq / tool.name):
                     (nojq / tool.name).symlink_to(tool)
         result, _ = self.stop({"session_id": "s1", "cwd": str(wt)}, env=dict(CLEAN_ENV, PATH=str(nojq)))
         self.assertEqual(result.returncode, 2, result.stderr)
