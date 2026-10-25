@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.4 (2026-10-24)
+
+Encoding-correct Python checks, line-accurate allow comments, `--version`, and pruned session records.
 
 - **Fixed:** the Python checks read a source saved with a UTF-8 BOM or a PEP 263 coding cookie the way Python does. Before, test-quality (T1) reported a BOM test file as unparsable and crashed on a latin-1 one, mutation (T4) failed the gate on a BOM source, crashed on a latin-1 one and skipped a weakened BOM test, and boundaries (D1) silently skipped both. Bytes that do not decode are a reported problem with their line, not a traceback.
 - **Fixed:** an allow-tautology or allow-no-assert comment after a form feed or U+2028 in a test file was looked up on the wrong line.
