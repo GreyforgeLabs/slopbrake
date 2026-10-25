@@ -125,6 +125,21 @@ class SessionStateRetention(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in sessions.iterdir()),
                              ["fresh.json", "notes.txt", "old-but-live.json", "recent.json"])
 
+    def test_a_write_that_changes_nothing_still_marks_the_session_as_live(self):
+        # Re-editing a file the session already recorded rewrites nothing; its record must not age into pruning.
+        with tempfile.TemporaryDirectory() as tmp:
+            code = ("import os, sys, time\n"
+                    "from slopbrake import hooks\n"
+                    "hooks.record('busy', {'/r'}, {'/r': {'a.py'}}, {'/r': 'abc'})\n"
+                    "path = hooks.state_path('busy')\n"
+                    "os.utime(path, (time.time() - 31 * 86400,) * 2)\n"
+                    "hooks.record('busy', {'/r'}, {'/r': {'a.py'}}, {'/r': 'abc'})\n"
+                    "hooks.record('other', {'/q'})\n"
+                    "print(path.exists())\n")
+            env = dict(os.environ, PYTHONPATH=str(HOME), XDG_STATE_HOME=str(Path(tmp) / "state"))
+            result = sh([sys.executable, "-c", code], tmp, env)
+            self.assertEqual(result.stdout, "True\n", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

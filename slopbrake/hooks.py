@@ -271,9 +271,13 @@ def state_path(session_id) -> Path:
 
 def session_state(session_id) -> Path:
     """state_path for writing. A session's first write prunes state files no session has touched for
-    STATE_MAX_AGE (every session that runs a Bash command leaves one): one directory scan per session."""
+    STATE_MAX_AGE (every session that runs a Bash command leaves one): one directory scan per session.
+    Every later write refreshes the file's mtime, so a live session's record never ages into pruning."""
     path = state_path(session_id)
-    if not path.exists():
+    if path.exists():  # a write that changes nothing (a file edited again) leaves mtime alone: mark it live
+        with contextlib.suppress(OSError):
+            os.utime(path)
+    else:
         cutoff = time.time() - STATE_MAX_AGE
         with contextlib.suppress(OSError), os.scandir(path.parent) as entries:
             for entry in entries:
