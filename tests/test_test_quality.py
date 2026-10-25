@@ -351,6 +351,10 @@ class SourceEncoding(Scratch):
                                            kind="cannot parse")
         self.assertEqual((result.returncode, lines), (1, [4]), result.stdout)
         self.assertIn("utf-8", result.stdout)
+        # In the first two lines, where tokenize looks for a coding cookie, the byte's line is still reported.
+        result, lines = self.flagged_bytes(b"NAME = '\xe9'\nfrom shop import f\n\ndef test_a():\n    assert f() == 1\n",
+                                           kind="cannot parse")
+        self.assertEqual((result.returncode, lines), (1, [1]), result.stdout)
 
 
 if __name__ == "__main__":

@@ -220,7 +220,11 @@ def read_python(path: Path) -> str:
     import io
     import tokenize
     data = path.read_bytes()
-    encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)  # "utf-8-sig" strips a BOM
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)  # "utf-8-sig" strips a BOM
+    except SyntaxError:  # it raises this, without a line, for a non-UTF-8 byte in its first two lines too
+        data.decode("utf-8")  # that byte: a UnicodeDecodeError that locates it
+        raise
     return data.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
 
 
