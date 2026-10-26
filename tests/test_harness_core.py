@@ -217,8 +217,9 @@ class Stop(Scratch):
         claude = self.hook(["--harness", "claude", "stop"], {"session_id": "s1"}, CLAUDE_PROJECT_DIR=str(shop))
         self.assertEqual((claude.returncode, claude.stdout), (0, ""))
         self.assertFalse(self.marker.exists())  # the project's own Stop hook gates it under Claude Code
-        for harness in ("codex", "opencode", "grok"):
-            result = self.hook(["--harness", harness, "stop"], {"session_id": "s1", "sessionId": "s1"},
+        for harness in ("codex", "opencode", "grok"):  # one session each: a session is released after 3 red Stops
+            self.edited(shop, harness)
+            result = self.hook(["--harness", harness, "stop"], {"session_id": harness, "sessionId": harness},
                                CLAUDE_PROJECT_DIR=str(shop))
             self.assertEqual(result.returncode, 2, harness)
             self.assertIn(f"{shop}:\nred in ", result.stderr)

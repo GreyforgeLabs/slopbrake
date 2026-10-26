@@ -83,6 +83,26 @@ class StopScope(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("FAIL  tests", result.stderr)
 
+    def test_a_red_clean_copy_releases_the_session_after_three_stops(self):
+        # The clean copy is a throwaway worktree, so require-green.sh's own counter (in that worktree's
+        # git dir) is lost each time: without a counter here every Stop would say "attempt 1/3" forever.
+        (self.repo / "other.py").write_text("y = 1\n")  # foreign, untracked: forces the clean copy
+        self.edit("app.py", "x = 'bad'\n")
+        self.assertEqual([self.hook("stop", {}).returncode for _ in range(2)], [2, 2])
+        third = self.hook("stop", {})
+        self.assertNotEqual(third.returncode, 2, third.stderr)
+        self.assertIn("still red after 3 attempts", third.stderr)
+        self.assertEqual(self.hook("stop", {}).returncode, 2)  # the count starts over after a release
+
+    def test_a_green_stop_resets_the_clean_copy_count(self):
+        (self.repo / "other.py").write_text("y = 1\n")
+        self.edit("app.py", "x = 'bad'\n")
+        self.assertEqual(self.hook("stop", {}).returncode, 2)
+        self.edit("app.py", "x = 3\n")
+        self.assertEqual(self.hook("stop", {}).returncode, 0)
+        self.edit("app.py", "x = 'bad'\n")
+        self.assertEqual([self.hook("stop", {}).returncode for _ in range(2)], [2, 2])
+
     def test_a_bash_change_is_attributed_to_the_session(self):
         (self.repo / "RED").write_text("foreign\n")
         self.bash("sed -i s/1/bad/ app.py", lambda: (self.repo / "app.py").write_text("x = 'bad'\n"))

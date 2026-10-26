@@ -567,6 +567,25 @@ def run_gate(hook: Path, repo: Path, text: str, left: float, **extra: str) -> tu
     return proc.returncode, err
 
 
+CLEAN_COPY_RED_LIMIT = 3  # consecutive red Stops on one repo's clean copy before the session may stop
+
+
+def clean_copy_red_stops(session_id, repo: Path, red: bool) -> int:
+    """Consecutive red Stops of this session's clean-copy gate on `repo`: one more when red, else reset.
+    Reaching CLEAN_COPY_RED_LIMIT releases the session and starts the count over."""
+    def change(data):
+        reds = data.get("clean_copy_reds") if isinstance(data.get("clean_copy_reds"), dict) else {}
+        count = reds.get(str(repo), 0) + 1 if red else 0
+        count = count if isinstance(count, int) else 1
+        if count and count < CLEAN_COPY_RED_LIMIT:
+            reds[str(repo)] = count
+        else:
+            reds.pop(str(repo), None)
+        data["clean_copy_reds"] = reds
+        return count
+    return update_json(session_state(session_id), change)
+
+
 def stop(payload: dict, text: str, harness: str = "claude") -> int:
     """Block (exit 2) when a trusted, changed repo's gate is red. A gate that cannot run, times out or
     misses the budget is reported without blocking (exit 1), so it never traps the session. Nothing goes to
@@ -597,6 +616,13 @@ def stop(payload: dict, text: str, harness: str = "claude") -> int:
                 if code == 2:
                     err += (f"\n(checked HEAD plus this session's {len(scope['mine'])} uncommitted file(s) in a clean copy; "
                             f"{len(scope['foreign'])} uncommitted file(s) from other work were left out)")
+                # require-green.sh counts red stops in the clean copy's git dir, which is deleted with the copy,
+                # so its 3-attempt release (rule C2) never fires there: keep that count in the session state.
+                if clean_copy_red_stops(payload.get("session_id"), repo, red=code == 2) >= CLEAN_COPY_RED_LIMIT:
+                    problems.append(f"{repo}:\n{err.strip()}\nrequire-green: the gate is still red after "
+                                    f"{CLEAN_COPY_RED_LIMIT} attempts; stopping is allowed, but report the failure "
+                                    "to the operator.")
+                    continue
             else:
                 code, err = run_gate(hook, repo, text, left)
         except TimeoutError as exc:

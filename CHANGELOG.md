@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6 (2026-10-26)
+
+The user-level Stop gate can release a session again when it gates a clean copy.
+
+- **Fixed:** when other uncommitted work shared the tree, the Stop gate (H6) ran `require-green.sh` in a throwaway worktree, and the hook's 3-attempt release (rule C2) counted red Stops in that worktree's git dir, which is deleted with the copy. Every red Stop read "attempt 1/3", so a session whose work was mid-change could never stop, and each attempt re-ran the full gate. The user-level hook now keeps that count per session and repo: after 3 consecutive red Stops it reports the failure without blocking, and a green Stop resets the count.
+
 ## 0.2.5 (2026-10-26)
 
 The git guard (H5) now protects branches, tags and worktrees from every command that can lose work, and tells the agent what to do instead.
