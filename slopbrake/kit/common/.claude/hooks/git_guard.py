@@ -933,9 +933,13 @@ class Git:
     def forced_refspecs(self, verb, opts, pos):
         """The reason a forced fetch/pull refspec (+src:dst, or --force) overwrites a local branch or tag and orphans
         commits only it has, or None. The fetched value isn't known yet, so it doesn't count as keeping them."""
-        if has(opts, "--all", "--multiple", "-m") and verb == "fetch":
-            return None  # every operand is a remote: only the configured refspecs, which own their own +
-        force, specs, i = has(opts, "-f", "--force"), [], 1
+        force = has(opts, "-f", "--force")
+        # --refmap and -c remote.<name>.fetch map the fetched refs like a command-line refspec, with --all too
+        specs = [value for name, value in opts if name == "--refmap"]
+        specs += [value for key, _, value in (entry.partition("=") for entry in self.config)
+                  if re.fullmatch(r"remote\..+\.fetch", key.lower())]
+        # with --all or --multiple every operand is a remote; refspecs in its config files aren't modelled
+        i = len(pos) if has(opts, "--all", "--multiple", "-m") and verb == "fetch" else 1
         while i < len(pos):
             if pos[i] == "tag" and i + 1 < len(pos):
                 specs.append(f"refs/tags/{pos[i + 1]}:refs/tags/{pos[i + 1]}")

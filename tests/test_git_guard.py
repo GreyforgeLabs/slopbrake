@@ -462,6 +462,19 @@ class LostWork(unittest.TestCase):
                      "git fetch . +main:refs/heads/unique", "git fetch . main:fresh +main:unique",
                      "git pull . +main:unique", "git fetch . +main:refs/tags/only-tag")
 
+    def test_refspecs_from_config_and_refmap_count_too(self):
+        # -c remote.<name>.fetch and --refmap map fetched refs like a command-line refspec does.
+        self.blocked("git -c remote.origin.fetch=+refs/heads/main:refs/heads/unique fetch origin",
+                     "git -c remote.origin.fetch=refs/heads/main:refs/heads/unique fetch --force origin",
+                     "git fetch --refmap=+main:unique . main", "git fetch --refmap +refs/heads/main:refs/heads/unique . main",
+                     "git -c remote.origin.fetch=+refs/heads/main:refs/heads/unique pull origin")
+        self.blocked("git -c remote.origin.fetch=+refs/heads/*:refs/heads/* fetch --all",
+                     "git fetch --refmap='+refs/heads/*:refs/heads/*' . main", why="checked")
+        self.allowed("git -c remote.origin.fetch=+refs/heads/*:refs/remotes/origin/* fetch origin",
+                     "git -c remote.origin.fetch=refs/heads/main:refs/heads/unique fetch origin",
+                     "git fetch --refmap= . main", "git fetch --refmap=+main:fresh . main",
+                     "git -c remote.origin.fetch=+refs/heads/main:refs/heads/merged fetch --all")
+
     def test_rm_of_the_repo_root_by_path_is_blocked(self):
         why = "whole tree"
         self.blocked(f"git rm -rf {self.repo}", f"git rm -rf {self.repo}/", "git rm -rf ..", why=why,
