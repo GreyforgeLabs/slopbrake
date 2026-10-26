@@ -210,7 +210,7 @@ From a repo, on a branch, because the kit files are one-way doors:
 ```sh
 git switch -c remove-slopbrake
 [ "$(git config --get core.hooksPath)" = .githooks ] && git config --unset core.hooksPath
-git rm -r scripts/slopbrake .githooks .claude/hooks .claude/slopbrake.json
+git rm -r --ignore-unmatch scripts/slopbrake .githooks .claude/hooks .claude/slopbrake.json
 ```
 
 Then delete the other kit-owned files you no longer want (the table under [What a repo gets](#what-a-repo-gets) marks them), and remove Slopbrake's hook entries from `.claude/settings.json`. Repo-owned files such as `scripts/check`, `.claude/door-rules.yml` and `CODING_STANDARDS.md` are yours to keep.
