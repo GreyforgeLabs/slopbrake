@@ -820,6 +820,14 @@ class Git:
         return int(self.git("rev-list", "--ignore-missing", "--count", f"--max-count={LOST_LIMIT}", ref, "--not",
                             *groups, *keep) or 0)
 
+    def start_point(self, start):
+        """start as one revision: branch, checkout -B and switch -C read A...B as the merge base of A and B (an empty
+        side is HEAD), so it is resolved here; a range or an option can't be checked."""
+        sides = start.split("...") if "..." in start else [start]
+        if len(sides) > 2 or any(side.startswith(("-", "^")) or ".." in side for side in sides):
+            raise Uncheckable(f"start point {start!r}")
+        return self.git("merge-base", sides[0] or "HEAD", sides[1] or "HEAD") if len(sides) == 2 else start
+
     def reset_branch(self, verb, name, start):
         """The reason a forced create (branch -f, checkout -B, switch -C) loses work, or None.
         A new branch, or one whose every commit another ref or the start point still reaches, is allowed."""
@@ -828,9 +836,7 @@ class Git:
         try:
             if not name or name in ("-", "@", "HEAD") or "@{" in name:
                 raise Uncheckable(f"no plain branch name ({name!r})" if name else "no branch name")
-            if start.startswith(("-", "^")):
-                raise Uncheckable(f"start point {start!r}")
-            lost = self.orphaned(f"refs/heads/{name}", [start])
+            lost = self.orphaned(f"refs/heads/{name}", [self.start_point(start)])
         except Uncheckable as exc:
             return (f"{verb} resets the branch if it already exists, and the guard could not check whether that "
                     f"orphans commits ({exc}); run it from inside the repository with a plain branch name, or "
@@ -1053,7 +1059,7 @@ class Git:
             return None  # git refuses the command itself
         ref, new = pos[0], pos[1]
         try:
-            if new.startswith(("-", "^")):
+            if new.startswith(("-", "^")) or ".." in new:
                 raise Uncheckable(f"new value {new!r}")
             if ref == "HEAD" and not has(opts, "--no-deref"):
                 ref = self.git("rev-parse", "--symbolic-full-name", "HEAD") or "HEAD"  # moves the checked-out branch

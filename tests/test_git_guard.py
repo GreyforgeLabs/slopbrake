@@ -424,8 +424,17 @@ class LostWork(unittest.TestCase):
         loose.mkdir(exist_ok=True)
         self.blocked("git branch -f x", "git checkout -B x main", "git switch -C x", cwd=loose, why="could not check")
         self.blocked('cd "$X" && git checkout -B x', "git branch -f @{-1} main", "git branch -f", "git checkout -B ''",
-                     "git branch -f x -- -main", "git config alias.nb 'checkout -B'", why="could not check")
+                     "git branch -f x -- -main", "git config alias.nb 'checkout -B'", "git branch -f unique main..unique",
+                     "git update-ref refs/heads/unique main..unique", "git branch -f unique main...-x",
+                     why="could not check")
         self.assertIsNone(self.check("git branch -f unique main", loose, scope="managed"))
+
+    def test_a_merge_base_start_point_is_resolved(self):
+        # branch, checkout -B and switch -C read A...B as the merge base of A and B, not as a range.
+        self.blocked("git branch -f unique main...unique", "git checkout -B unique main...unique",
+                     "git switch -C unique ...unique")
+        self.allowed("git branch -f merged main...merged", "git checkout -B fresh main...unique",
+                     f"git branch -f unique unique...{self.child}")
 
     def test_listing_and_configuring_options_do_not_reset(self):
         self.allowed("git branch -f --list", "git branch -fl 'u*'", "git branch -f -u origin/pushed pushed",
