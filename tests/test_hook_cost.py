@@ -43,8 +43,15 @@ class Startup(R2):
     def test_the_guard_module_needs_no_argparse_to_judge(self):
         code = (f"import importlib.machinery, types; g = types.ModuleType('g')\n"
                 f"importlib.machinery.SourceFileLoader('g', {str(GUARD)!r}).exec_module(g)\n"
-                "assert g.check_command('git push -f', '/', 'always')")
+                "assert g.check_command('git push -f', '/', 'always')\n"
+                f"assert g.check_command('git status && git checkout -b x && git tag v1', {str(HOME)!r}, 'always') is None")
         self.assertEqual(loaded_after(code), [])
+
+    def test_only_a_branch_reset_runs_git_from_the_guard(self):
+        load = (f"import importlib.machinery, types; g = types.ModuleType('g')\n"
+                f"importlib.machinery.SourceFileLoader('g', {str(GUARD)!r}).exec_module(g)\n")
+        self.assertEqual(loaded_after(load + f"g.check_command('git checkout -B no-such-branch-x', {str(HOME)!r}, "
+                                             "'always')"), ["signal", "subprocess"])
 
 
 class RepoState(R2):

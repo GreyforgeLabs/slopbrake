@@ -10,6 +10,12 @@ Text inside the arguments of other commands (commit messages, grep patterns, her
 written to files) is never matched. A command that does not parse falls back to a
 conservative check of the raw string.
 
+Commands that move an existing ref (branch -f, checkout -B, switch -C, update-ref, a forced fetch
+refspec into a local branch or tag) are judged by what they would lose: the guard runs one
+read-only `git rev-list` and blocks only when a commit on the ref would be reachable from no other
+branch, remote-tracking ref or tag, nor from the new value. When git can't answer it blocks.
+Every other command is judged on its argv alone, without running anything.
+
 Hook protocol: JSON on stdin (`tool_input.command`, or grok's camelCase `toolInput.command`,
 and `cwd`); exit 2 with the reason on stderr blocks, exit 0 allows. `--scope always` judges
 every command (the project hook); `--scope managed` acts only when the git invocation's
@@ -32,6 +38,9 @@ import shlex
 import sys
 
 MAX_DEPTH = 12
+LOST_LIMIT = 101  # count orphaned commits up to 100; more is "100+"
+LOCATING = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX")
 CONTROL = ("&&", "||", ";;", "|&", ";", "&", "|", "(", ")", "\n")
 REDIRECTS = ("<<<", "<<-", "&>>", "<<", ">>", "&>", ">&", "<&", ">|", "<>", "<", ">")
 OPERATORS = sorted(CONTROL + REDIRECTS, key=len, reverse=True)
@@ -43,7 +52,9 @@ VARIABLE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])?")
 FALLBACK = re.compile(
     r"\bgit\b.*?(--force|--mirror|--delete|--prune|--no-verify|--hard|--merge|--discard-changes|hookspath"
     r"|\bpush\b.*\s[-+:]|\bclean\b|\bbranch\b.*\s-\w*[DMCdf]|\bcheckout\b|\brestore\b|\bstash\s+(drop|clear)"
-    r"|\bupdate-ref\b|\breflog\s+(expire|delete)|\bprune\b|\bcommit\b.*\s-\w*n)",
+    r"|\bupdate-ref\b|\breflog\s+(expire|delete)|\bprune\b|\bcommit\b.*\s-\w*n|\bswitch\b.*\s-\w*C"
+    r"|\btag\b.*\s(-\w*d|--delete)|\bworktree\b.*\bremove\b|\bfilter-(branch|repo)\b|(?<=git)\s+rm\b.*\s-\w*f"
+    r"|\bfetch\b.*\s\+)",
     re.DOTALL | re.IGNORECASE)
 
 
@@ -390,6 +401,47 @@ def whole_tree(spec):
     return all(p in (".", "..") for p in spec.split("/") if p) or spec.strip("/") in ("*", "**")
 
 
+def toplevel(path):
+    """The work tree root of the repo that path is in (the nearest directory with a .git), or None."""
+    path = os.path.realpath(path)
+    while not os.path.exists(os.path.join(path, ".git")):
+        if os.path.dirname(path) == path:
+            return None
+        path = os.path.dirname(path)
+    return path
+
+
+def repo_root(base, spec):
+    """True when the path spec, read from base, is the toplevel of base's repo or a directory above it."""
+    path, top = resolve(base, spec), base and toplevel(base)
+    if path is None or top is None:
+        return False
+    path = os.path.realpath(path)
+    return top == path or top.startswith(path.rstrip("/") + "/")
+
+
+def spell_out(arg, longs, unambiguous):
+    """arg with an unambiguous abbreviation of one of longs (it starts with one of unambiguous) written in full."""
+    name, eq, value = arg.partition("=")
+    full = next((o for o in longs if o.startswith(name) and name.startswith(unambiguous)), None) if name[:2] == "--" else None
+    return full + eq + value if full else arg
+
+
+def local_ref(dst):
+    """The local ref a fetch refspec's destination names (git's get_local_ref)."""
+    if dst.startswith("refs/"):
+        return dst
+    return "refs/" + dst if dst.startswith(("heads/", "tags/", "remotes/")) else "refs/heads/" + dst
+
+
+def plural(count):
+    return f"{count} commit" + ("" if count == 1 else "s") if count < LOST_LIMIT else f"{LOST_LIMIT - 1}+ commits"
+
+
+class Uncheckable(Exception):
+    """The guard can't tell what a command would lose: not a repo, git failed, or the arguments make no sense."""
+
+
 class Judge:
     def __init__(self, cwd, scope, depth=0, env=None, session=None):
         self.dir, self.scope, self.depth, self.env = cwd, scope, depth, env or {}
@@ -728,13 +780,78 @@ class Git:
             return "clean -f deletes untracked files"
         return None
 
+    def judged(self):
+        """Whether a reason from this invocation counts: always in "always" scope, else only in a managed repo.
+        Checked before running git, so the managed hook never spawns git for repos it ignores."""
+        target = self.effective_dir()
+        return self.judge.scope != "managed" or managed(self.judge.session if target is None else target)
+
+    def git(self, *args):
+        """Run a read-only git command against this invocation's repo; its stdout, or Uncheckable."""
+        import subprocess  # deferred: only the commands that move or overwrite a ref pay for it
+
+        if self.cwd is None:
+            raise Uncheckable("the directory it runs in isn't known")
+        command = ["git", "-C", self.cwd]
+        command += ["--git-dir", self.git_dir] if self.git_dir else []
+        command += ["--work-tree", self.work_tree] if self.work_tree else []
+        env = {k: v for k, v in os.environ.items() if k not in LOCATING}
+        env["LC_ALL"] = "C"
+        try:
+            done = subprocess.run([*command, *args], capture_output=True, text=True, env=env, timeout=10,
+                                  stdin=subprocess.DEVNULL, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise Uncheckable(f"git did not run: {exc}") from exc
+        if done.returncode:
+            lines = done.stderr.strip().splitlines()
+            raise Uncheckable(lines[0].removeprefix("fatal: ") if lines else f"git exited {done.returncode}")
+        return done.stdout.strip()
+
+    def orphaned(self, ref, keep=()):
+        """How many commits reachable from ref no other branch, remote-tracking ref or tag reaches, nor any of
+        keep (the ref's new value). 0 when ref doesn't exist. Counts at most LOST_LIMIT."""
+        kind, _, name = ref.removeprefix("refs/").partition("/")
+        groups = []
+        for group in ("heads", "remotes", "tags"):
+            if kind == group and name:
+                groups.append(f"--exclude={name}")  # the ref itself is no other copy of its commits
+            groups.append("--branches" if group == "heads" else f"--{group}")
+        return int(self.git("rev-list", "--ignore-missing", "--count", f"--max-count={LOST_LIMIT}", ref, "--not",
+                            *groups, *keep) or 0)
+
+    def reset_branch(self, verb, name, start):
+        """The reason a forced create (branch -f, checkout -B, switch -C) loses work, or None.
+        A new branch, or one whose every commit another ref or the start point still reaches, is allowed."""
+        if not self.judged():
+            return None
+        try:
+            if not name or name in ("-", "@", "HEAD") or "@{" in name:
+                raise Uncheckable(f"no plain branch name ({name!r})" if name else "no branch name")
+            if start.startswith(("-", "^")):
+                raise Uncheckable(f"start point {start!r}")
+            lost = self.orphaned(f"refs/heads/{name}", [start])
+        except Uncheckable as exc:
+            return (f"{verb} resets the branch if it already exists, and the guard could not check whether that "
+                    f"orphans commits ({exc}); run it from inside the repository with a plain branch name, or "
+                    "create a branch under a new name instead")
+        if lost:
+            return (f"{verb} would orphan {plural(lost)} on branch {name!r} that no other branch, remote-tracking "
+                    f"ref or tag reaches, nor {start}; create a branch under a new name instead, or push or tag "
+                    f"{name!r} first so its commits stay reachable")
+        return None
+
     def rule_branch(self, rest):
-        opts, _ = parse(rest, short_arg="u", short_opt="t", long_arg=(
+        opts, pos = parse(rest, short_arg="u", short_opt="t", long_arg=(
             "--set-upstream-to", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
             "--format", "--sort"))
         if has(opts, "-D", "-M", "-C") or (has(opts, "-f", "--force") and has(
                 opts, "-d", "--delete", "-m", "--move", "-c", "--copy")):
             return "force-deleting or overwriting a branch loses its commits"
+        if has(opts, "-f", "--force") and not has(  # these list or configure branches; none moves one
+                opts, "-l", "--list", "-a", "--all", "-r", "--remotes", "--contains", "--no-contains", "--merged",
+                "--no-merged", "--points-at", "-u", "--set-upstream-to", "--set-upstream", "--unset-upstream",
+                "--show-current", "--edit-description"):
+            return self.reset_branch("branch -f", pos[0] if pos else "", pos[1] if len(pos) > 1 else "HEAD")
         return None
 
     def rule_checkout(self, rest):
@@ -745,12 +862,110 @@ class Git:
             return "pathspecs read from a file can't be checked and may cover the whole tree"
         if any(whole_tree(p) for p in pos):
             return "checking out the whole tree discards uncommitted changes"
+        reset = [value for name, value in opts if name == "-B"]
+        if reset:
+            return self.reset_branch("checkout -B", reset[-1], pos[0] if pos else "HEAD")
         return None
 
     def rule_switch(self, rest):
-        opts, _ = parse(rest, short_arg="cC", long_arg=("--create", "--force-create", "--orphan"))
-        return "switch --force discards uncommitted changes" if has(
-            opts, "-f", "--force", "--discard-changes") else None
+        # git accepts unambiguous abbreviations such as --force-c; spell them out so their value parses
+        rest = [spell_out(a, ("--force-create", "--create", "--orphan"), ("--force-", "--cr", "--or")) for a in rest]
+        opts, pos = parse(rest, short_arg="cC", long_arg=("--create", "--force-create", "--orphan"))
+        if has(opts, "-f", "--force", "--discard-changes"):
+            return "switch --force discards uncommitted changes"
+        reset = [value for name, value in opts if name in ("-C", "--force-create")]
+        if reset:
+            return self.reset_branch("switch -C", reset[-1], pos[0] if pos else "HEAD")
+        return None
+
+    def rule_tag(self, rest):
+        opts, _ = parse(rest, short_arg="mFu", long_arg=(
+            "--message", "--file", "--local-user", "--sort", "--contains", "--no-contains", "--points-at",
+            "--merged", "--no-merged", "--format", "--cleanup", "--trailer"))
+        if has(opts, "-d", "--delete"):
+            return ("deleting a tag removes a release marker that other clones, tools and people rely on; leave it "
+                    "in place and create a tag under a new name instead")
+        return None
+
+    def rule_worktree(self, rest):
+        sub = next((a for a in rest if not a.startswith("-")), "")
+        if sub == "remove" and has(parse(rest[rest.index(sub) + 1:])[0], "-f", "--force"):
+            return ("worktree remove --force deletes a worktree's uncommitted and untracked changes (or a locked "
+                    "worktree); commit or stash the work in it, then remove it without --force")
+        return None
+
+    def rule_filter_branch(self, rest):
+        return ("filter-branch rewrites every commit of the branches it touches; ask the operator to run it on a "
+                "fresh clone")
+
+    def rule_filter_repo(self, rest):
+        return ("filter-repo rewrites the whole history and drops the origin remote; ask the operator to run it on "
+                "a fresh clone")
+
+    def rule_rm(self, rest):
+        opts, pos = parse(rest, long_arg=("--pathspec-from-file",))
+        if not has(opts, "-f", "--force") or has(opts, "--cached", "-n", "--dry-run"):
+            return None
+        if has(opts, "--pathspec-from-file"):
+            return "pathspecs read from a file can't be checked and may cover the whole tree"
+        if any(whole_tree(p) or repo_root(self.cwd, p) for p in pos):
+            return ("rm -f over the whole tree deletes every tracked file together with its uncommitted changes; "
+                    "remove the specific paths instead, or use rm --cached to untrack files without deleting them")
+        return None
+
+    def rule_checkout_index(self, rest):
+        opts, _ = parse(rest, long_arg=("--prefix", "--stage"))
+        prefix = [value for name, value in opts if name == "--prefix"]
+        elsewhere = (prefix and posixpath.normpath(prefix[-1] or ".") != ".") or has(opts, "--temp")
+        if has(opts, "-f", "--force") and has(opts, "-a", "--all", "--stdin") and not elsewhere:
+            return ("checkout-index -a -f overwrites every file in the working tree with the index, discarding "
+                    "uncommitted changes; restore the specific files instead (git checkout-index -f -- <file>)")
+        return None
+
+    def forced_refspecs(self, verb, opts, pos):
+        """The reason a forced fetch/pull refspec (+src:dst, or --force) overwrites a local branch or tag and orphans
+        commits only it has, or None. The fetched value isn't known yet, so it doesn't count as keeping them."""
+        if has(opts, "--all", "--multiple", "-m") and verb == "fetch":
+            return None  # every operand is a remote: only the configured refspecs, which own their own +
+        force, specs, i = has(opts, "-f", "--force"), [], 1
+        while i < len(pos):
+            if pos[i] == "tag" and i + 1 < len(pos):
+                specs.append(f"refs/tags/{pos[i + 1]}:refs/tags/{pos[i + 1]}")
+                i += 1
+            else:
+                specs.append(pos[i])
+            i += 1
+        if force and has(opts, "--stdin"):
+            specs.append("+<stdin>:<stdin>")
+        for spec in specs:
+            plus = spec.startswith("+")
+            src, colon, dst = spec.removeprefix("+").partition(":")
+            if not (plus or force) or not colon or not dst or spec.startswith("^"):
+                continue  # a fast-forward only update, or no local destination
+            ref = local_ref(dst)
+            if not ref.startswith(("refs/heads/", "refs/tags/")) or not self.judged():
+                continue  # remote-tracking refs are the remote's copy, overwritten on every fetch
+            try:
+                if src == "<stdin>":
+                    raise Uncheckable("its refspecs come from stdin")
+                if "*" in ref:
+                    raise Uncheckable(f"{spec} can overwrite many local refs at once")
+                lost = self.orphaned(ref)
+            except Uncheckable as exc:
+                return (f"a forced {verb} into a local branch or tag can't be checked for lost commits ({exc}); "
+                        f"fetch into a new branch name, or drop the + and --force so only a fast-forward happens")
+            if lost:
+                return (f"{verb} {spec} would overwrite {ref} and orphan {plural(lost)} that no other ref reaches; fetch into "
+                        f"a new branch name ({src}:<new-name>), or drop the + and --force so only a fast-forward "
+                        "happens")
+        return None
+
+    def rule_fetch(self, rest):
+        opts, pos = parse(rest, short_arg="jo", long_arg=(
+            "--jobs", "--server-option", "--depth", "--deepen", "--shallow-since", "--shallow-exclude",
+            "--upload-pack", "--refmap", "--negotiation-tip", "--recurse-submodules-default", "--submodule-prefix",
+            "--filter"))
+        return self.forced_refspecs("fetch", opts, pos)
 
     def rule_restore(self, rest):
         opts, pos = parse(rest, short_arg="s", long_arg=("--source", "--pathspec-from-file"))
@@ -778,7 +993,10 @@ class Git:
         return self.no_verify(parse(rest, short_arg="mFsX", long_arg=("--message", "--file", "--strategy"))[0])
 
     def rule_pull(self, rest):
-        return self.no_verify(parse(rest, short_arg="sXo", long_arg=("--strategy", "--strategy-option"))[0])
+        opts, pos = parse(rest, short_arg="sXoj", long_arg=(
+            "--strategy", "--strategy-option", "--jobs", "--server-option", "--depth", "--deepen", "--shallow-since",
+            "--shallow-exclude", "--upload-pack", "--negotiation-tip"))
+        return self.no_verify(opts) or self.forced_refspecs("pull", opts, pos)
 
     def rule_am(self, rest):
         return self.no_verify(parse(rest)[0])
@@ -823,7 +1041,28 @@ class Git:
         return None
 
     def rule_update_ref(self, rest):
-        return "update-ref -d deletes a ref" if has(parse(rest)[0], "-d") else None
+        opts, pos = parse(rest, short_arg="m")
+        if has(opts, "-d") or (len(pos) > 1 and re.fullmatch(r"0{40}|0{64}", pos[1])):
+            return "update-ref -d deletes a ref"
+        if has(opts, "--stdin"):
+            return ("update-ref --stdin reads its updates from stdin, which the guard can't check; run one "
+                    "git update-ref <ref> <new> per ref instead")
+        if len(pos) < 2 or not self.judged():
+            return None  # git refuses the command itself
+        ref, new = pos[0], pos[1]
+        try:
+            if new.startswith(("-", "^")):
+                raise Uncheckable(f"new value {new!r}")
+            if ref == "HEAD" and not has(opts, "--no-deref"):
+                ref = self.git("rev-parse", "--symbolic-full-name", "HEAD") or "HEAD"  # moves the checked-out branch
+            lost = self.orphaned(ref, [new])
+        except Uncheckable as exc:
+            return (f"update-ref overwrites {ref}, and the guard could not check whether that orphans commits ({exc}); "
+                    "create a new ref instead")
+        if lost:
+            return (f"update-ref would orphan {plural(lost)} on {ref} that no other branch, remote-tracking ref or "
+                    f"tag reaches, nor {new}; create a new ref instead, or push or tag the old commits first")
+        return None
 
     def rule_reflog(self, rest):
         sub = next((a for a in rest if not a.startswith("-")), "")

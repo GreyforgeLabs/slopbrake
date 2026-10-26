@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -141,6 +142,19 @@ BLOCK = {
         "bash -c \"$(cat <<'EOF'\ncd /tmp\ngit reset --hard\nEOF\n)\"", "$(echo git) push -f", "sudo $(echo git push -f)",
         "command `echo git reset --hard`", "git $(echo push -f)", "git $(echo push) -f", 'eval "$(printf \'git clean -fd\')"',
     ],
+    "lost work: always blocked": [
+        "git tag -d v1", "git tag --delete v1 v2", "git -C . tag -d v1", "git worktree remove --force x",
+        "git worktree remove -f x", "git worktree remove -f -f x", "git worktree remove x --force",
+        "git filter-branch --tree-filter 'rm -f a' HEAD", "git filter-branch", "git filter-repo --path a",
+        "git rm -rf .", "git rm -r -f .", "git rm -fr :/", "git rm -rf '*'", "git rm -r --force -- .", "git rm -f '*'",
+        "git rm -rf ./", "git rm -rf src/..", "git rm -rf --pathspec-from-file=list.txt", "git checkout-index -a -f",
+        "git checkout-index --all --force", "git checkout-index -af", "git checkout-index -f --stdin",
+        "git checkout-index -a -f --prefix=./", "git update-ref --stdin", "git update-ref -z --stdin",
+        "git update-ref refs/heads/x 0000000000000000000000000000000000000000",
+        "git -c alias.untag='tag -d' untag v1", "git config alias.wr 'worktree remove --force'",
+        "bash -c 'git tag -d v1'", "git fetch origin '+refs/heads/*:refs/heads/*'", "git fetch -f origin 'refs/tags/*:refs/tags/*'",
+        "git fetch --stdin --force origin", 'git tag -d v1 "', "git filter-branch 'x",
+    ],
 }
 
 ALLOW = {
@@ -166,9 +180,9 @@ ALLOW = {
         "git merge --no-ff x", "git rebase main", "git diff -- .", "git add .", "git commit --amend --no-edit",
         "ls; git status", "git push origin feature/x 2>&1 | tail", "cd sub && git restore --staged .", "command -v git",
         "which git", "git -C /tmp status", "git --no-pager log -p", "git push origin HEAD:refs/heads/feature/x",
-        "git branch -f x HEAD", "git submodule foreach 'git status'", "git rebase -x 'make test' main",
+        "git submodule foreach 'git status'", "git rebase -x 'make test' main",
         "git -c alias.st=status st", "env FOO=1 git status", "bash -c 'git status && git log'", "git update-ref refs/x HEAD",
-        "git reflog show", "git checkout -- src", "git tag -d v1", "git push origin v1.0.0", "",
+        "git reflog show", "git checkout -- src", "git push origin v1.0.0", "",
     ],
     "near misses of the round-2 forms": [
         "bash -c -- 'git status'", "bash -c -x 'git log'", "sh -c +e 'git push origin x'", "bash -o pipefail script.sh",
@@ -185,6 +199,16 @@ ALLOW = {
         "$(echo git status)", "`which python3` -V", 'git commit -m "$(echo fix -n handling)"',
         "git commit -m \"$(cat <<'EOF'\nfix: stop --force pushes, -n and --no-verify\n\ngit reset --hard is blocked\nEOF\n)\"",
         "git push origin $(git branch --show-current)", 'cd "$(git rev-parse --show-toplevel)" && git status',
+    ],
+    "near misses of the lost-work rules": [
+        "git tag v1", "git tag -a v1 -m 'drop -d'", "git tag -l", "git tag --list 'v*'", "git tag -m '-d' v2",
+        "git worktree remove x", "git worktree add ../x", "git worktree prune", "git worktree list",
+        "git rm -r --cached .", "git rm -rf --cached .", "git rm -rf build", "git rm -n -rf .", "git rm -r .", "git rm a.py",
+        "git checkout-index -f -- a.py", "git checkout-index -a", "git checkout-index -a -f --prefix=out/",
+        "git checkout-index -a -f --temp", "git fetch origin", "git fetch -f origin", "git fetch --all --force",
+        "git fetch origin main:feature/x", "git fetch origin +main:refs/remotes/origin/main", "git fetch origin +main",
+        "git fetch origin '+refs/heads/*:refs/remotes/origin/*'", "git pull origin main",
+        "git commit -m 'git tag -d v1 and git rm -rf .'", "echo git filter-branch",
     ],
 }
 
@@ -309,6 +333,145 @@ class Managed(unittest.TestCase):
     def test_unbalanced_quotes_in_a_nested_string_do_not_raise(self):
         self.assertIsNotNone(self.check("git -c alias.x='!git push -f \"' x", self.managed))
         self.assertIsNone(self.check("git -c alias.x='status \"' x", self.managed))
+
+
+class LostWork(unittest.TestCase):
+    """The reachability rules (branch -f, checkout -B, switch -C, update-ref, forced fetch refspecs) against real
+    repos: allowed when no commit would be orphaned, blocked when one would, blocked when that can't be told."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guard = load_guard()
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.tmp.name)
+        cls.repo = repo = cls.root / "repo"
+        git = cls.git
+        git("init", "-q", "-b", "main", str(repo), cwd=cls.root)
+        (repo / "src").mkdir()
+        (repo / "src/a.py").write_text("a = 1\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        for branch in ("unique", "pushed", "tagged", "merged"):
+            git("checkout", "-q", "-b", branch, "main")
+            git("commit", "-q", "--allow-empty", "-m", f"only on {branch}")
+        git("update-ref", "refs/remotes/origin/pushed", "pushed")  # as if pushed: the remote-tracking ref has it
+        git("tag", "v1", "tagged")
+        git("checkout", "-q", "main")
+        git("merge", "-q", "--no-ff", "-m", "merge", "merged")
+        git("branch", "behind", "main~1")  # an ancestor of main: nothing of its own
+        git("tag", "-a", "-m", "release", "only-tag", git("commit-tree", "-p", "main", "-m", "tag-only", "main^{tree}"))
+        cls.child = git("commit-tree", "-p", "unique", "-m", "child", "unique^{tree}")  # a descendant no ref reaches
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @classmethod
+    def git(cls, *args, cwd=None):
+        done = subprocess.run(["git", "-c", "user.name=kit-test", "-c", "user.email=kit@test", *args],
+                              cwd=cwd or cls.repo, capture_output=True, text=True, check=True)
+        return done.stdout.strip()
+
+    def check(self, command, cwd=None, scope="always"):
+        return self.guard.check_command(command, str(cwd or self.repo), scope)
+
+    def allowed(self, *commands, cwd=None):
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(self.check(command, cwd))
+
+    def blocked(self, *commands, cwd=None, why="orphan"):
+        for command in commands:
+            with self.subTest(command=command):
+                reason = self.check(command, cwd)
+                self.assertIsNotNone(reason)
+                self.assertIn(why, reason)
+
+    def test_a_new_branch_is_allowed_in_every_spelling(self):
+        self.allowed("git branch -f fresh", "git branch --force fresh main", "git branch -qf fresh unique",
+                     "git checkout -B fresh", "git checkout -qB fresh unique", "git checkout -Bfresh",
+                     "git switch -C fresh", "git switch --force-create fresh unique", "git switch --force-c fresh", "git switch --force-cr=fresh",
+                     "git switch -qC fresh main", f"git -C {self.repo} checkout -B fresh", "git -c a.b=c switch -C fresh",
+                     "git -c alias.nb='checkout -B' nb fresh unique", "git -c alias.bf='branch -f' bf fresh",
+                     "git branch -f -t fresh origin/pushed", "git branch -f feature/new main")
+        self.allowed(f"git -C {self.root} -C repo branch -f fresh main", f"cd {self.repo}/src && git checkout -B fresh",
+                     cwd=self.root)
+
+    def test_a_branch_whose_commits_another_ref_reaches_is_allowed(self):
+        self.allowed("git branch -f merged main", "git checkout -B merged main", "git switch -C behind main",
+                     "git branch -f pushed main", "git checkout -B pushed main", "git switch -C tagged main",
+                     "git branch -f tagged", "git branch -f main main", "git switch -C main",
+                     "git branch -f pushed unique", "git checkout -B tagged unique")
+
+    def test_resetting_to_a_descendant_is_allowed(self):
+        self.allowed(f"git branch -f unique {self.child}", f"git checkout -B unique {self.child}",
+                     f"git switch -C unique {self.child}", "git branch -f behind main", "git branch --force unique unique")
+
+    def test_orphaning_commits_only_the_branch_has_is_blocked(self):
+        self.blocked("git branch -f unique", "git branch -f unique main", "git branch --force unique main",
+                     "git branch -fq unique main", "git checkout -B unique", "git checkout -B unique main",
+                     "git checkout -q -B unique main", "git switch -C unique main", "git switch --force-create unique", "git switch --force-c=unique main",
+                     "git switch --force-create=unique main",
+                     f"git -C {self.repo} switch -C unique main", "git -c core.pager=cat checkout -B unique main",
+                     "git -c alias.nb='checkout -B' nb unique main", "bash -c 'git branch -f unique main'",
+                     "git branch -f unique pushed")
+        reason = self.check("git checkout -B unique main")
+        self.assertIn("1 commit on branch 'unique'", reason)
+        self.assertIn("new name", reason)
+
+    def test_what_cannot_be_checked_is_blocked(self):
+        loose = self.root / "loose"
+        loose.mkdir(exist_ok=True)
+        self.blocked("git branch -f x", "git checkout -B x main", "git switch -C x", cwd=loose, why="could not check")
+        self.blocked('cd "$X" && git checkout -B x', "git branch -f @{-1} main", "git branch -f", "git checkout -B ''",
+                     "git branch -f x -- -main", "git config alias.nb 'checkout -B'", why="could not check")
+        self.assertIsNone(self.check("git branch -f unique main", loose, scope="managed"))
+
+    def test_listing_and_configuring_options_do_not_reset(self):
+        self.allowed("git branch -f --list", "git branch -fl 'u*'", "git branch -f -u origin/pushed pushed",
+                     "git branch -f --unset-upstream unique", "git branch -f -a", "git checkout -b x main")
+
+    def test_update_ref_follows_the_same_test(self):
+        self.allowed("git update-ref refs/heads/fresh main", "git update-ref refs/heads/merged main",
+                     f"git update-ref refs/heads/unique {self.child}", "git update-ref refs/heads/main main~1",
+                     "git update-ref refs/x HEAD", "git update-ref -m note refs/heads/behind main",
+                     "git update-ref --no-deref HEAD unique")
+        self.blocked("git update-ref refs/heads/unique main", "git update-ref -m x refs/heads/unique main unique",
+                     "git update-ref refs/tags/only-tag main", "git update-ref refs/heads/unique HEAD")
+        self.git("checkout", "-q", "unique")
+        try:
+            self.blocked("git update-ref HEAD main")
+            self.allowed(f"git update-ref HEAD {self.child}")
+        finally:
+            self.git("checkout", "-q", "main")
+
+    def test_forced_fetch_into_a_local_branch_follows_the_same_test(self):
+        self.allowed("git fetch . +main:fresh", "git fetch . main:unique", "git fetch -f . unique:merged",
+                     "git fetch . +unique:pushed", "git fetch . +main:refs/remotes/origin/main", "git fetch . +main",
+                     "git fetch . +main:heads/fresh", "git pull . +main:fresh")
+        self.blocked("git fetch . +main:unique", "git fetch -f . main:unique", "git fetch --force . main:heads/unique",
+                     "git fetch . +main:refs/heads/unique", "git fetch . main:fresh +main:unique",
+                     "git pull . +main:unique", "git fetch . +main:refs/tags/only-tag")
+
+    def test_rm_of_the_repo_root_by_path_is_blocked(self):
+        why = "whole tree"
+        self.blocked(f"git rm -rf {self.repo}", f"git rm -rf {self.repo}/", "git rm -rf ..", why=why,
+                     cwd=self.repo / "src")
+        self.blocked(f"git -C {self.repo} rm -r -f {self.repo}", why=why, cwd=self.root)
+        self.allowed(f"git rm -rf {self.repo}/src", "git rm -rf a.py", cwd=self.repo / "src")
+
+    def test_managed_scope_runs_no_git_outside_managed_repos(self):
+        with unittest.mock.patch.object(self.guard.Git, "git", side_effect=AssertionError("git ran")):
+            self.assertIsNone(self.check("git branch -f unique main", scope="managed"))
+            self.assertIsNone(self.check("git fetch . +main:unique", scope="managed"))
+            self.assertIsNone(self.check("git update-ref refs/heads/unique main", scope="managed"))
+
+    def test_the_hook_blocks_through_the_wrapper(self):
+        blocked = hook("git checkout -B unique main", cwd=str(self.repo))
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("would orphan 1 commit on branch 'unique'", blocked.stderr)
+        self.assertEqual(hook("git checkout -B fresh main", cwd=str(self.repo)).returncode, 0)
+        self.assertEqual(self.git("for-each-ref", "refs/heads/fresh"), "")  # the guard only reads
 
 
 if __name__ == "__main__":

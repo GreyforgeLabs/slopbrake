@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+The git guard (H5) now protects branches, tags and worktrees from every command that can lose work, and tells the agent what to do instead.
+
+- **New:** `branch -f`, `checkout -B`, `switch -C` (every spelling, including `--force-create`, combined short flags, `git -C`, `-c` prefixes and `-c alias.*` aliases), `update-ref <ref> <new>` and a forced fetch or pull refspec (`+src:dst`, `--force`) into a local branch or tag are judged by reachability. They run as before when the branch is new, merged, pushed, tagged or reset to a descendant, and are blocked only when they would orphan commits no other branch, remote-tracking ref, tag or the new start point reaches. The block names how many commits and suggests a new branch name, or pushing or tagging first. The check is one read-only `git rev-list` that only these commands pay for (about 9 ms); every other command is judged without running git, at unchanged cost.
+- **New:** always blocked: `tag -d`, `worktree remove --force`, `filter-branch`, `filter-repo`, `rm -f` over the whole tree (`.`, `:/`, `*` or the repo root's path; `rm --cached` stays allowed), `checkout-index -a -f` and `update-ref --stdin`.
+- When the guard can't tell what a branch reset would lose (outside a repository, an unknown directory, an unusual branch name), it blocks with the reason, like its other checks.
+
 ## 0.2.4 (2026-10-24)
 
 Encoding-correct Python checks, line-accurate allow comments, `--version`, and pruned session records.
