@@ -420,14 +420,26 @@ class LostWork(unittest.TestCase):
         self.assertIn("new name", reason)
 
     def test_what_cannot_be_checked_is_blocked(self):
-        loose = self.root / "loose"
-        loose.mkdir(exist_ok=True)
-        self.blocked("git branch -f x", "git checkout -B x main", "git switch -C x", cwd=loose, why="could not check")
         self.blocked('cd "$X" && git checkout -B x', "git branch -f @{-1} main", "git branch -f", "git checkout -B ''",
                      "git branch -f x -- -main", "git config alias.nb 'checkout -B'", "git branch -f unique main..unique",
                      "git update-ref refs/heads/unique main..unique", "git branch -f unique main...-x",
                      why="could not check")
+        loose = self.root / "loose"
+        loose.mkdir(exist_ok=True)
         self.assertIsNone(self.check("git branch -f unique main", loose, scope="managed"))
+
+    def test_a_repository_the_command_creates_has_nothing_to_lose(self):
+        # Outside any repository, or in a directory an earlier command creates, no branch exists yet, so nothing
+        # can be orphaned: git init or clone followed by a reset is everyday setup.
+        loose = self.root / "loose"
+        loose.mkdir(exist_ok=True)
+        self.allowed("git checkout -B main", "git init -q && git checkout -B main", "git branch -f x main",
+                     "git init -q fresh && cd fresh && git switch -C main",
+                     "git clone -q ../repo copy && cd copy && git checkout -B dev origin/main",
+                     "git -C not-yet switch -C main", cwd=loose)
+        # A directory that doesn't exist yet inside a repository is judged by that repository.
+        self.blocked("mkdir -p later && cd later && git checkout -B unique main", "git -C src/new branch -f unique main",
+                     why="would orphan")
 
     def test_a_merge_base_start_point_is_resolved(self):
         # branch, checkout -B and switch -C read A...B as the merge base of A and B, not as a range.

@@ -13,7 +13,8 @@ conservative check of the raw string.
 Commands that move an existing ref (branch -f, checkout -B, switch -C, update-ref, a forced fetch
 refspec into a local branch or tag) are judged by what they would lose: the guard runs one
 read-only `git rev-list` and blocks only when a commit on the ref would be reachable from no other
-branch, remote-tracking ref or tag, nor from the new value. When git can't answer it blocks.
+branch, remote-tracking ref or tag, nor from the new value. When git can't answer it blocks; where no
+repository exists yet (git init or clone earlier in the command) there is no branch to lose.
 Every other command is judged on its argv alone, without running anything.
 
 Hook protocol: JSON on stdin (`tool_input.command`, or grok's camelCase `toolInput.command`,
@@ -440,7 +441,11 @@ def plural(count):
 
 
 class Uncheckable(Exception):
-    """The guard can't tell what a command would lose: not a repo, git failed, or the arguments make no sense."""
+    """The guard can't tell what a command would lose: git failed, or the arguments make no sense."""
+
+
+class NoRepository(Uncheckable):
+    """git found no repository: none exists yet (a git init or clone earlier in the command makes it)."""
 
 
 class Judge:
@@ -793,7 +798,10 @@ class Git:
 
         if self.cwd is None:
             raise Uncheckable("the directory it runs in isn't known")
-        command = ["git", "-C", self.cwd]
+        cwd = self.cwd
+        while not (self.git_dir or self.work_tree or os.path.isdir(cwd)) and os.path.dirname(cwd) != cwd:
+            cwd = os.path.dirname(cwd)  # made by an earlier command (mkdir, clone): judge the repo it will be in
+        command = ["git", "-C", cwd]
         command += ["--git-dir", self.git_dir] if self.git_dir else []
         command += ["--work-tree", self.work_tree] if self.work_tree else []
         env = {k: v for k, v in os.environ.items() if k not in LOCATING}
@@ -805,7 +813,8 @@ class Git:
             raise Uncheckable(f"git did not run: {exc}") from exc
         if done.returncode:
             lines = done.stderr.strip().splitlines()
-            raise Uncheckable(lines[0].removeprefix("fatal: ") if lines else f"git exited {done.returncode}")
+            message = lines[0].removeprefix("fatal: ") if lines else f"git exited {done.returncode}"
+            raise (NoRepository if message.startswith("not a git repository") else Uncheckable)(message)
         return done.stdout.strip()
 
     def orphaned(self, ref, keep=()):
@@ -817,8 +826,11 @@ class Git:
             if kind == group and name:
                 groups.append(f"--exclude={name}")  # the ref itself is no other copy of its commits
             groups.append("--branches" if group == "heads" else f"--{group}")
-        return int(self.git("rev-list", "--ignore-missing", "--count", f"--max-count={LOST_LIMIT}", ref, "--not",
-                            *groups, *keep) or 0)
+        try:
+            return int(self.git("rev-list", "--ignore-missing", "--count", f"--max-count={LOST_LIMIT}", ref, "--not",
+                                *groups, *keep) or 0)
+        except NoRepository:
+            return 0  # no repository yet, so no branch: git init or clone runs first in the same command
 
     def start_point(self, start):
         """start as one revision: branch, checkout -B and switch -C read A...B as the merge base of A and B (an empty
