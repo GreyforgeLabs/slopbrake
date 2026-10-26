@@ -3,6 +3,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/GreyforgeLabs/slopbrake/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/GreyforgeLabs/slopbrake?style=flat-square&color=38c8e8"></a>
   <a href="https://github.com/GreyforgeLabs/slopbrake/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/GreyforgeLabs/slopbrake/ci.yml?branch=main&style=flat-square&label=ci"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-38c8e8?style=flat-square"></a>
   <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-38c8e8?style=flat-square">
@@ -16,6 +17,7 @@
   <a href="#what-it-catches">What it catches</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="docs/RULES.md">The rules</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="#credits">Credits</a>
 </p>
@@ -43,9 +45,21 @@ flowchart LR
 
 ## Quick start
 
-```sh
-uv tool install git+https://github.com/GreyforgeLabs/slopbrake    # or: pipx install git+https://…
+Install the CLI (Python 3.11+, standard library only):
 
+```sh
+uv tool install git+https://github.com/GreyforgeLabs/slopbrake@v0.2.6
+```
+
+or, with pipx:
+
+```sh
+pipx install git+https://github.com/GreyforgeLabs/slopbrake@v0.2.6
+```
+
+Then add it to a repo:
+
+```sh
 cd path/to/repo
 slopbrake init . --dry-run          # see exactly what it would add
 slopbrake init .                    # add it; never overwrites files you own
@@ -167,6 +181,40 @@ A finding that shows up twice and is still only prose counts as a failed retro.
 
 </details>
 
+## Troubleshooting
+
+`slopbrake status .` is the first stop: it lists every gap with the command that closes it.
+
+| Symptom | Fix |
+|---------|-----|
+| The git guard or Stop gate never fires | The session started outside the repo. Run `slopbrake user-hooks install` (add `--harness codex` or `--harness opencode` for those). |
+| `user-hooks install` refuses: the `slopbrake` on `PATH` cannot run the hook | Put the install directory on `PATH` (`~/.local/bin` for `uv tool` and `pipx`), or upgrade an older `slopbrake` that shadows it. |
+| `status` says `kit is stale` | The CLI was upgraded after `init`. Run `slopbrake init . --update` and commit the refreshed kit files on a branch. |
+| `status` says git hooks are disabled (`core.hooksPath=/dev/null`) | Turn them back on: `git config core.hooksPath .githooks`. |
+| No git hooks in a linked worktree | `init` leaves `core.hooksPath` alone there, because the setting is shared with the main checkout. If you want the gate in every worktree, run `git config core.hooksPath .githooks`. |
+| The Stop gate skips a repo | It only runs scripts in trusted repos. `slopbrake user-hooks trust <repo>` adds one. |
+| `verify` fails a proof | The output names the rule and the planted violation it missed; [docs/RULES.md](docs/RULES.md) explains each check. |
+
+## Removing Slopbrake
+
+From your machine:
+
+```sh
+slopbrake user-hooks uninstall           # repeat with --harness codex / --harness opencode if you installed those
+uv tool uninstall slopbrake              # or: pipx uninstall slopbrake
+rm -f ~/.config/slopbrake/trusted.json   # optional: the trusted-repo list
+```
+
+From a repo, on a branch, because the kit files are one-way doors:
+
+```sh
+git switch -c remove-slopbrake
+[ "$(git config --get core.hooksPath)" = .githooks ] && git config --unset core.hooksPath
+git rm -r scripts/slopbrake .githooks .claude/hooks .claude/slopbrake.json
+```
+
+Then delete the other kit-owned files you no longer want (the table under [What a repo gets](#what-a-repo-gets) marks them), and remove Slopbrake's hook entries from `.claude/settings.json`. Repo-owned files such as `scripts/check`, `.claude/door-rules.yml` and `CODING_STANDARDS.md` are yours to keep.
+
 ## Where Slopbrake departs from the talks
 
 - **Mutation testing** is ours: it's the objective test of "can this test fail?" It starts at a 60% floor on changed lines, and `/retro` raises it.
@@ -208,3 +256,9 @@ Any mistakes in turning these ideas into checks are ours, not his.
 ## License
 
 MIT © 2026 [Greyforge Labs](https://github.com/GreyforgeLabs). The vendored skills keep their own MIT license © 2026 Matt Pocock.
+
+---
+
+<p align="center">
+  <b>Slopbrake keeping your agents honest?</b> <a href="https://github.com/GreyforgeLabs/slopbrake">Star it on GitHub</a> · <a href="https://x.com/GreyforgeLabs">Follow @GreyforgeLabs</a> · <a href="https://greyforge.tech/open-source">More tools at greyforge.tech</a>
+</p>
