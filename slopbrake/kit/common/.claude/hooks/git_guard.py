@@ -411,9 +411,10 @@ def toplevel(path):
     return path
 
 
-def repo_root(base, spec):
-    """True when the path spec, read from base, is the toplevel of base's repo or a directory above it."""
-    path, top = resolve(base, spec), base and toplevel(base)
+def repo_root(base, spec, tree=None):
+    """True when the path spec, read from base, is the root of the work tree (tree when --work-tree names one,
+    else the toplevel of base's repo) or a directory above it."""
+    path, top = resolve(base, spec), os.path.realpath(tree) if tree else base and toplevel(base)
     if path is None or top is None:
         return False
     path = os.path.realpath(path)
@@ -908,7 +909,8 @@ class Git:
             return None
         if has(opts, "--pathspec-from-file"):
             return "pathspecs read from a file can't be checked and may cover the whole tree"
-        if any(whole_tree(p) or repo_root(self.cwd, p) for p in pos):
+        tree = resolve(self.cwd, self.work_tree) if self.work_tree else None
+        if any(whole_tree(p) or repo_root(self.cwd, p, tree) for p in pos):
             return ("rm -f over the whole tree deletes every tracked file together with its uncommitted changes; "
                     "remove the specific paths instead, or use rm --cached to untrack files without deleting them")
         return None

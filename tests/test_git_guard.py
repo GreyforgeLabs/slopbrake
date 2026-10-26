@@ -458,6 +458,14 @@ class LostWork(unittest.TestCase):
         self.blocked(f"git rm -rf {self.repo}", f"git rm -rf {self.repo}/", "git rm -rf ..", why=why,
                      cwd=self.repo / "src")
         self.blocked(f"git -C {self.repo} rm -r -f {self.repo}", why=why, cwd=self.root)
+        # --work-tree names the tree, wherever the command runs; it needn't contain a .git (a dotfiles repo)
+        home = self.root / "home"
+        home.mkdir(exist_ok=True)
+        self.blocked(f"git --git-dir={self.repo}/.git --work-tree={self.repo} rm -rf {self.repo}",
+                     f"GIT_DIR={self.repo}/.git GIT_WORK_TREE={home} git rm -rf {home}",
+                     f"git --git-dir={self.repo}/.git --work-tree={home} rm -rf {home}", why=why, cwd=self.root)
+        self.allowed(f"git --git-dir={self.repo}/.git --work-tree={self.repo} rm -rf {self.repo}/src",
+                     f"git --git-dir={self.repo}/.git --work-tree={home} rm -rf {home}/.vimrc", cwd=self.root)
         self.allowed(f"git rm -rf {self.repo}/src", "git rm -rf a.py", cwd=self.repo / "src")
 
     def test_managed_scope_runs_no_git_outside_managed_repos(self):
