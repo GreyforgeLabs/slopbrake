@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.5 (2026-10-26)
 
 The git guard (H5) now protects branches, tags and worktrees from every command that can lose work, and tells the agent what to do instead.
 
