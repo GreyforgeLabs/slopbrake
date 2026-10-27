@@ -383,9 +383,11 @@ class Verify(Scratch):
         l1 = self.proof(result, "clean tree passes")
         self.assertFalse(l1["ok"])
         self.assertIn("NO_RECORD=1", l1["output"])  # verify never records last-green
-        self.assertTrue(any("lint types boundaries tests smoke test-quality mutation pr" in line for line in l1["output"]))
+        self.assertTrue(any("lint types boundaries tests smoke test-quality lowered-bar mutation pr" in line for line in l1["output"]))
         self.assertFalse(self.proof(result, "boundaries pass again")["ok"])
         self.assertFalse(self.proof(result, "real assertions clear")["ok"])
+        self.assertFalse(self.proof(result, "seeded skipped test fails lowered-bar")["ok"])
+        self.assertFalse(self.proof(result, "lowered-bar passes once the skip is removed")["ok"])
         self.assertTrue(self.proof(result, "hooks are wired")["ok"])
         self.assert_nothing_leaked()
 
@@ -393,7 +395,7 @@ class Verify(Scratch):
         self.python_repo()
         self.gf("init", str(self.root))
         check = self.root / "scripts/check"
-        check.write_text(check.read_text().replace("STAGES=(lint types boundaries tests smoke test-quality mutation pr)",
+        check.write_text(check.read_text().replace("STAGES=(lint types boundaries tests smoke test-quality lowered-bar mutation pr)",
                                                    "STAGES=(tests)"))
         self.commit("trim the gate")
         l1 = self.proof(self.verify(), "clean tree passes")
@@ -507,7 +509,8 @@ class Verify(Scratch):
 class VerifyProofHelpers(unittest.TestCase):
     def test_required_stages_come_from_the_kit_template(self):
         self.assertEqual(cli.kit_stages("python"),
-                         ["lint", "types", "boundaries", "tests", "smoke", "test-quality", "mutation", "pr"])
+                         ["lint", "types", "boundaries", "tests", "smoke", "test-quality", "lowered-bar", "mutation",
+                          "pr"])
 
     def test_summary_counts_pass_and_skip_but_not_fail(self):
         out = "── tests ──\nok\n── summary ──\npass  lint (1s)\nskip  mutation (nothing changed)\nFAIL  tests (0s)\n"

@@ -26,7 +26,7 @@ TEST_CMD="'${PY//\'/\'\\\'\'}' @TEST_ARGS@"  # single-quoted: POSIX sh reads it 
 case "$PY" in */bin/python) export PATH="${PY%/python}:$PATH" ;; esac
 export PYTHONPATH="$PWD/src:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
-STAGES=(lint types boundaries tests smoke test-quality mutation pr)
+STAGES=(lint types boundaries tests smoke test-quality lowered-bar mutation pr)
 SLOW_STAGES=(mutation)
 
 stage_lint()         { @LINT_CMD@; }
@@ -35,6 +35,7 @@ stage_boundaries()   { python3 "$G/boundaries_py.py" .; }
 stage_tests()        { eval "$TEST_CMD"; }
 stage_smoke()        { if [ -f scripts/smoke.sh ]; then bash scripts/smoke.sh; else echo "smoke: skipped: no scripts/smoke.sh (run the real entry point end to end there)"; return 78; fi; }
 stage_test_quality() { python3 "$G/tautology_py.py" .; }
+stage_lowered_bar()  { python3 "$G/lowered_bar.py"; }
 stage_mutation()     { python3 "$G/mutation_py.py" --test-cmd "$TEST_CMD"; }
 stage_pr()           { python3 "$G/pr_body_check.py"; }
 

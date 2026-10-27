@@ -31,7 +31,7 @@ Coding agents write code faster than anyone can review it. They also write **tes
 
 ```mermaid
 flowchart LR
-    A([agent implements]) --> L1["<b>Layer 1 · scripts/check</b><br/>lint · types · boundaries<br/>tests · tautology · mutation floor"]
+    A([agent implements]) --> L1["<b>Layer 1 · scripts/check</b><br/>lint · types · boundaries<br/>tests · tautology · lowered bar · mutation floor"]
     L1 --> L2["<b>Layer 2 · reviewer</b><br/>fresh context<br/>commits its own fixes"]
     L2 --> D{door?}
     D -- two-way --> M([merge-eligible])
@@ -66,7 +66,7 @@ Python and TypeScript repos are supported, installed at the repository root (mon
 
 ### The checks are proven, not configured
 
-`verify` works in a throwaway git worktree of the committed HEAD. It runs 16 proofs over the 10 rules a machine can check (L1, D1, T1, T4, G1, G2, G4, H1, H5, H6). Where a rule can be broken on purpose, it plants a real violation and requires the check to **fail and name the rule**, then requires it to pass again once the violation is removed. A check that crashes can't pass a proof, a gate that leaves out one of the kit's stages fails the L1 proof, and unwired hooks fail the H5/H6 proof. The other rules guide the reviewer and the workflow; [docs/RULES.md](docs/RULES.md) marks each one Check, Review or Process.
+`verify` works in a throwaway git worktree of the committed HEAD. It runs 19 proofs over the 11 rules a machine can check (L1, D1, T1, T4, T6, G1, G2, G4, H1, H5, H6). Where a rule can be broken on purpose, it plants a real violation and requires the check to **fail and name the rule**, then requires it to pass again once the violation is removed. A check that crashes can't pass a proof, a gate that leaves out one of the kit's stages fails the L1 proof, and unwired hooks fail the H5/H6 proof. The other rules guide the reviewer and the workflow; [docs/RULES.md](docs/RULES.md) marks each one Check, Review or Process.
 
 <p align="center"><img src="brand/verify.svg" alt="slopbrake verify output: sixteen proofs, all holding" width="720"></p>
 
@@ -100,6 +100,7 @@ The fix is an independent expectation, a literal or a worked example: `assert di
 |:----:|---------|--------|------------|
 | **T1** | Tautological tests (constants asserted against themselves, expected values rebuilt from the test's own inputs, `expect(true).toBe(true)`) and tests with no assertion at all | AST check | `no-tautological-test` and `expect-in-test` ESLint rules |
 | **T4** | Tests that can't fail: mutation score below the floor, **on changed lines only**. Nothing to mutate is a skip, never a 100% | stdlib mutator in a copy of the tree: comparisons and boundaries, arithmetic, `and`/`or`, `not`, constants and strings, deleted calls, `return None`, negated conditions | StrykerJS with `--mutate` line ranges |
+| **T6** | Quietly lowering the bar **on the lines a change adds**: new skipped or focused tests (`@pytest.mark.skip`, `self.skipTest()`, `it.skip`, `xit`, `.only`), new suppressions (`# noqa`, `# type: ignore`, `# pragma: no cover`, `eslint-disable`, `@ts-ignore`, `istanbul ignore`) and deleted tests. Moved lines and renamed tests pass; a `slopbrake: allow-skip:`/`allow-suppress:`/`allow-delete-test:` comment with a reason keeps one | stdlib lexer and AST over the diff since the base | same script |
 | **D1** | Imports that reach past a package's entry points, at every package level, and import cycles | stdlib port of Pocock's rules | dependency-cruiser, Pocock's config |
 | **G1 · G2** | PR bodies without a Door and Blast Radius; a door declared lower than the rules compute. The base revision's rules count too, so a PR can't loosen its own floor, and a one-way change can't be committed on the default branch | door classifier + PR-body check | same |
 | **H5** | Force pushes in every spelling (`-f`, `+ref`, `--force-with-lease`, `--mirror`, deletes), `--no-verify` and `core.hooksPath` overrides, `reset --hard`, `clean -f`, `branch -D`, whole-tree `checkout`/`restore`/`rm -rf`, `stash drop`, reflog, ref and tag deletion, `worktree remove --force`, `filter-branch`. `branch -f`, `checkout -B`, `switch -C`, `update-ref` and forced fetch refspecs are blocked only when they would orphan commits no other ref reaches. Parsed like a shell, so `bash -c`, `eval`, `env` and `rtk` wrappers don't hide them | Claude Code hook | same |

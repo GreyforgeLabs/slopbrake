@@ -757,6 +757,12 @@ PY_SEEDS = {
                         "    def test_members_save_ten_from_one_hundred(self):\n"
                         "        self.assertEqual(discount(150, True), 140)\n        self.assertEqual(discount(100, True), 90)\n"
                         "        self.assertEqual(discount(99, True), 99)\n        self.assertEqual(discount(150, False), 150)\n")),
+    "bar_skip": ("tests/test_slopbrake_seed_bar.py",
+                 ("import unittest\n\n\nclass Seed(unittest.TestCase):\n    @unittest.skip('seeded skip')\n"
+                 "    def test_doubles(self):\n        self.assertEqual(2 * 2, 4)\n")),
+    "bar_clean": ("tests/test_slopbrake_seed_bar.py",
+                  ("import unittest\n\n\nclass Seed(unittest.TestCase):\n"
+                  "    def test_doubles(self):\n        self.assertEqual(2 * 2, 4)\n")),
     "red": ("tests/test_slopbrake_seed_red.py",
             ("import unittest\n\n\nclass Seed(unittest.TestCase):\n    def test_red(self):\n"
             "        self.fail('seeded red test')\n")),
@@ -781,6 +787,12 @@ TS_SEEDS = {  # {src} and {tests}: the repo's first source root and test dir (bo
                         'test("members save ten from one hundred", () => {\n  expect(discount(150, true)).toBe(140);\n'
                         "  expect(discount(100, true)).toBe(90);\n  expect(discount(99, true)).toBe(99);\n"
                         "  expect(discount(150, false)).toBe(150);\n});\n")),
+    "bar_skip": ("{tests}/slopbrake-seed-bar.test.ts",
+                 ('import { expect, test } from "vitest";\n\n'
+                 'test.skip("seeded skip", () => {\n  expect(2 * 2).toBe(4);\n});\n')),
+    "bar_clean": ("{tests}/slopbrake-seed-bar.test.ts",
+                  ('import { expect, test } from "vitest";\n\n'
+                  'test("doubles", () => {\n  expect(2 * 2).toBe(4);\n});\n')),
     "red": ("{tests}/slopbrake-seed-red.test.ts",
             ('import { expect, test } from "vitest";\nimport { discount } from "../{src}/slopbrake-seed.js";\n\n'
             'test("seeded red", () => {\n  expect(discount(1, false)).toBe(2);\n});\n')),
@@ -957,6 +969,15 @@ class Verifier:
         seeded = self.write(*seeds["tautology"])
         self.prove("seeded tautological test fails test-quality", False, self.check("test-quality"), "T1",
                    "no-tautological-test" if self.stack == "typescript" else "tautological assertion")
+        seeded.unlink()
+
+        # T6: a skip added on a changed line fails the gate; the same test without it passes.
+        self.write(*seeds["bar_skip"])
+        self.prove("seeded skipped test fails lowered-bar", False, self.check("lowered-bar"), "T6",
+                   "T6 skipped test added")
+        seeded = self.write(*seeds["bar_clean"])
+        self.prove("lowered-bar passes once the skip is removed", True, self.check("lowered-bar"), "T6",
+                   "lowered-bar: ok")
         seeded.unlink()
 
         # T4: weak tests on changed code fall below the floor; strong tests clear it.

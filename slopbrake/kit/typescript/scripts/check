@@ -12,7 +12,7 @@ source "$G/run-stages.sh"
 PM="@PM@"
 
 # UNCOVERED=(dir ...)  TypeScript sources left out of T1/T4 on purpose (vendored code): status stops flagging them.
-STAGES=(lint types boundaries tests smoke test-quality mutation pr)
+STAGES=(lint types boundaries tests smoke test-quality lowered-bar mutation pr)
 SLOW_STAGES=(mutation)
 
 # Tools run from node_modules/.bin, never `$PM exec`: npm eats the tool's flags and installs
@@ -89,6 +89,7 @@ stage_smoke() {
   esac
 }
 stage_test_quality() { tool eslint eslint --max-warnings 0 --no-error-on-unmatched-pattern @TEST_GLOBS@; }
+stage_lowered_bar()  { python3 "$G/lowered_bar.py"; }
 stage_mutation() {
   local base ranges
   base=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from common import describe_base; print(describe_base())' "$G") || return 1

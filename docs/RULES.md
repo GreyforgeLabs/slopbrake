@@ -1,6 +1,6 @@
 # The rules
 
-Each rule has an ID, a **mechanism**, and, where it can be checked, the proof that `slopbrake verify` runs. `verify` proves 10 rules (L1, D1, T1, T4, G1, G2, G4, H1, H5, H6) with 16 proofs; the rest are review and process guidance that the reviewer agent and the skills carry.
+Each rule has an ID, a **mechanism**, and, where it can be checked, the proof that `slopbrake verify` runs. `verify` proves 11 rules (L1, D1, T1, T4, T6, G1, G2, G4, H1, H5, H6) with 19 proofs; the rest are review and process guidance that the reviewer agent and the skills carry.
 
 - **Check**: deterministic; it fails `scripts/check`.
 - **Review**: a judgement call; the reviewer agent enforces it.
@@ -12,7 +12,7 @@ The ideas come from Matt Pocock (see [Credits](../README.md#credits)). Rules mar
 
 ## L: the gate
 
-**L1. One gate command.** *Check.* `scripts/check` runs lint, types, boundaries, tests, smoke, test quality, the mutation floor and the PR-body check. The pre-commit hook runs `scripts/check --fast` (no mutation); pre-push runs the full gate once per pushed ref, measured against the commit the remote already has; CI runs the full gate. A repo with no hook and no CI running its checks has no guardrail, and that is a finding in itself.
+**L1. One gate command.** *Check.* `scripts/check` runs lint, types, boundaries, tests, smoke, test quality, the lowered-bar check, the mutation floor and the PR-body check. The pre-commit hook runs `scripts/check --fast` (no mutation); pre-push runs the full gate once per pushed ref, measured against the commit the remote already has; CI runs the full gate. A repo with no hook and no CI running its checks has no guardrail, and that is a finding in itself.
 - **Skip is not pass.** A stage with nothing to check (no type checker configured, no smoke entry point, nothing changed, no PR context) prints `<stage>: skipped: <reason>`, exits 78 and shows as `skip` in the summary. It never fails the gate and never claims a `pass`.
 - **Last green.** A full run (no `--fast`, no stage list) where every stage passed or skipped, with no uncommitted changes to tracked files, records HEAD as `refs/slopbrake/last-green/<branch>` (a `/` in the branch name is written `%2F`). When HEAD is on the base branch, base-relative checks (mutation, the door) measure from that ref instead of seeing nothing; after an amend or rebase, from the merge-base with it; with no ratchet yet, from the empty tree (every line is new; mutants are sampled). Never recorded on a detached HEAD; `SLOPBRAKE_NO_RECORD=1` opts out, and `init` starts the ratchet at HEAD.
 - **Base order:** `--base` > `GITHUB_BASE_REF` > `SLOPBRAKE_BASE` > the branch's upstream > `origin/HEAD` > `main` > `master` > `origin/main` > `origin/master`. Checks print the base they used.
@@ -34,6 +34,15 @@ The ideas come from Matt Pocock (see [Credits](../README.md#credits)). Rules mar
 *Proof:* an assertion-free test fails the floor; real assertions clear it.
 
 **T5. Evidence of behaviour.** *Review.* "Tests pass" is not enough evidence for a user-visible change: show a before and an after.
+
+**T6. No silent lowering of the bar.** *Check.* The `lowered-bar` stage (`lowered_bar.py`, both stacks) reads the change since the base (L1), committed, uncommitted and untracked, and fails when the lines it adds:
+- skip or focus a test: Python `@pytest.mark.skip`/`skipif`/`xfail` (also as `pytestmark`), `unittest.skip`/`skipIf`/`skipUnless`/`expectedFailure`, `self.skipTest()`, `pytest.skip()`/`xfail()`, `raise SkipTest`; JS/TS `.skip`, `.skipIf`, `.todo` and `.fixme` on `it`/`test`/`describe`, `xit`/`xtest`/`xdescribe`, and focused `.only`/`fit`/`fdescribe`, which silently skip everything else (JS/TS ones are read in the test tree, where `fit(` is a test rather than a call);
+- add a suppression comment: Python `# noqa`, `# type: ignore`, `# pyright: ignore`, `# pragma: no cover`, `# pylint: disable`; JS/TS `eslint-disable` (`-line`, `-next-line` and block), `@ts-ignore`, `@ts-nocheck`, `@ts-expect-error`, `istanbul`/`c8`/`v8 ignore`.
+
+It also fails when the change **deletes a test**: a Python `test*` function or a JS/TS `it()`/`test()` case that the base has and the test tree no longer has. Tests are matched by name over every test file the change touches (files it leaves alone hold the same tests on both sides), so a test moved to another file isn't deleted, and neither is one renamed with its body unchanged.
+
+Only code and comments count: the same words in strings, docstrings and regex literals are text. A marker the change also removes elsewhere (an edited, re-indented or moved line) isn't new, widening `# noqa: E501` to a blanket `# noqa` is, and lines that were already there never fail. Python files are decoded like the other checks (BOM, coding cookie); a file that doesn't parse is still read. Each finding names T6, the file and line, what was added and the remedy. To keep one, say why, on the line or the line above: `# slopbrake: allow-skip: <why>` or `# slopbrake: allow-suppress: <why>` (`//` in JS/TS; after `--` on an `eslint-disable` line). For a deletion, add `slopbrake: allow-delete-test: <name>: <why>` on any added line in the test tree (a test file, or a file under `tests/`, `test/`, `__tests__/` or `spec/`), or in the PR body. The kit's own files (`scripts/slopbrake/`, `.claude/`, `eslint-rules/`) are not read; `--exclude <prefix>` skips more. *(Ours.)*
+*Proof:* a seeded skipped test fails `lowered-bar` naming T6; the same test without the skip passes.
 
 ## D: deep modules
 
@@ -121,6 +130,7 @@ Slopbrake brakes hurried or careless agents; it is not a sandbox against a delib
 - Shell data flow the git guard doesn't model (variables, scripts written to a file and then run).
 - T1 evasions that need data flow to see; mutants killed by a crash on a non-literal operand.
 - TypeScript changes that touch only tests are not mutation-checked yet (Python's are).
+- T6 matches markers by their text: un-skipping one test while skipping another, or moving a suppression onto other code in the same change, counts as even. A test renamed *and* edited reads as deleted (record it with `allow-delete-test`). JS/TS cases named by a variable or a `test.each` table aren't tracked, and the JS/TS reader is a lexer, not a parser, so odd regex or JSX text can blur one line.
 - Killing `mutation_py` with SIGKILL can orphan the test run it started.
 
 ## What we don't adopt

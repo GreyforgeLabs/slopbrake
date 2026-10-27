@@ -493,6 +493,15 @@ class VerifyRun(Scratch):
         self.assertEqual(sh(["git", "status", "--porcelain"], self.root).stdout, "")
         self.assertEqual(list(self.tmpdir.iterdir()), [])
 
+    def test_the_real_gate_holds_the_t6_proofs_and_leaves_no_seed_behind(self):
+        self.installed()
+        result = json.loads(self.gf("verify", str(self.root), "--json").stdout)
+        fails = self.proof(result, "seeded skipped test fails lowered-bar")
+        self.assertEqual(fails["rule"], "T6")
+        self.assertTrue(fails["ok"], fails)
+        self.assertTrue(self.proof(result, "lowered-bar passes once the skip is removed")["ok"])
+        self.assertEqual(sh(["git", "status", "--porcelain"], self.root).stdout, "")
+
     def test_sigterm_removes_the_worktree_and_scratch_dir(self):
         self.gate("#!/bin/sh\nsleep 30\n")
         env = {k: v for k, v in os.environ.items() if k not in SCRUBBED}

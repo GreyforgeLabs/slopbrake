@@ -142,6 +142,7 @@ class FileChange:
     old_path: str | None = None
     deleted: bool = False
     added: dict[int, str] = field(default_factory=dict)  # new line number -> text
+    removed: dict[int, str] = field(default_factory=dict)  # old line number -> text
 
 
 _PATH = r'("(?:[^"\\]|\\.)*"|[ab]/.*?)'
@@ -168,10 +169,10 @@ def unquote_path(text: str) -> str:
 
 
 def parse_unified_diff(text: str) -> dict[str, FileChange]:
-    """Parse `git diff --unified=0` output into per-file added lines."""
+    """Parse `git diff --unified=0` output into per-file added and removed lines."""
     changes: dict[str, FileChange] = {}
     current: FileChange | None = None
-    new_line = 0
+    new_line = old_line = 0
     in_hunk = False  # `+++ b/path` is a header only before the first hunk; inside one it is content
     # Only "\n" ends a diff line: str.splitlines() also splits on \f, \v, \x1c.. inside content.
     for line in text.split("\n"):
@@ -198,12 +199,15 @@ def parse_unified_diff(text: str) -> dict[str, FileChange]:
         elif line.startswith("deleted file mode") and not in_hunk:
             current.deleted = True
         elif line.startswith("@@"):
-            match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-            new_line = int(match.group(1)) if match else 0
+            match = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            old_line, new_line = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
             in_hunk = True
         elif line.startswith("+") and in_hunk:
             current.added[new_line] = line[1:]
             new_line += 1
+        elif line.startswith("-") and in_hunk:
+            current.removed[old_line] = line[1:]
+            old_line += 1
     return changes
 
 
@@ -217,9 +221,13 @@ def read_python(path: Path) -> str:
     """A Python file decoded the way the interpreter reads it: a UTF-8 BOM or a PEP 263 coding cookie, else
     UTF-8; newlines translated as read_text does. Raises SyntaxError for an unknown or conflicting cookie, and
     UnicodeDecodeError over the whole file (so .start locates the bad byte) for bytes that do not decode."""
+    return decode_python(path.read_bytes())
+
+
+def decode_python(data: bytes) -> str:
+    """read_python for bytes already in hand (a blob from `git show`)."""
     import io
     import tokenize
-    data = path.read_bytes()
     try:
         encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)  # "utf-8-sig" strips a BOM
     except SyntaxError:  # it raises this, without a line, for a non-UTF-8 byte in its first two lines too

@@ -20,8 +20,8 @@ def proved_rules() -> set[str]:
 
 
 def claimed_rules(doc: str) -> set[str]:
-    """The rule IDs a doc lists after 'proves 10 rules (' or 'the 10 rules a machine can check ('."""
-    match = re.search(r"\b10 rules[^(]*\(([^)]*)\)", (ROOT / doc).read_text(encoding="utf-8"))
+    """The rule IDs a doc lists after 'proves 11 rules (' or 'the 11 rules a machine can check ('."""
+    match = re.search(r"\b11 rules[^(]*\(([^)]*)\)", (ROOT / doc).read_text(encoding="utf-8"))
     return set(re.findall(r"\b[A-Z]\d\b", match.group(1))) if match else set()
 
 
@@ -32,8 +32,8 @@ class VerifyClaims(unittest.TestCase):
     def test_rules_doc_lists_the_rules_verify_proves(self):
         self.assertEqual(claimed_rules("docs/RULES.md"), proved_rules())
 
-    def test_ten_rules_are_proved(self):
-        self.assertEqual(len(proved_rules()), 10)
+    def test_eleven_rules_are_proved(self):
+        self.assertEqual(len(proved_rules()), 11)
 
 
 if __name__ == "__main__":
