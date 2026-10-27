@@ -388,6 +388,8 @@ class Verify(Scratch):
         self.assertFalse(self.proof(result, "real assertions clear")["ok"])
         self.assertFalse(self.proof(result, "seeded skipped test fails lowered-bar")["ok"])
         self.assertFalse(self.proof(result, "lowered-bar passes once the skip is removed")["ok"])
+        unwired = self.proof(result, "seeded skipped test fails lowered-bar")["output"]
+        self.assertTrue(any("does not run the lowered-bar stage" in line for line in unwired), unwired)
         self.assertTrue(self.proof(result, "hooks are wired")["ok"])
         self.assert_nothing_leaked()
 

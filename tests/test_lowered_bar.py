@@ -3,6 +3,8 @@
 Each test builds a repo on main, branches, changes it, and runs the check against main (the base the other
 base-relative checks use). Only lines the change adds can fail; what was already there never does.
 """
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,10 +17,13 @@ sys.path.insert(0, str(GUARDS))
 from common import parse_unified_diff
 
 GIT_ID = ["-c", "user.name=kit-test", "-c", "user.email=kit@test"]
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+OVERRIDES = ("SLOPBRAKE_BASE", "GITHUB_BASE_REF", "GITHUB_EVENT_PATH", "PR_BODY_FILE")
 
 
-def sh(cmd, cwd):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+def sh(cmd, cwd, **env):
+    full = {k: v for k, v in os.environ.items() if k not in OVERRIDES} | env
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False, env=full)
 
 
 class Repo(unittest.TestCase):
@@ -48,12 +53,13 @@ class Repo(unittest.TestCase):
         self.commit("base")
         sh(["git", "switch", "-q", "-c", "feat"], self.root)
 
-    def run_check(self, *args):
-        return sh([sys.executable, str(GUARDS / "lowered_bar.py"), "--base", "main", *args], self.root)
+    def run_check(self, *args, base="main", **env):
+        return sh([sys.executable, str(GUARDS / "lowered_bar.py"), *(["--base", base] if base else []), *args],
+                  self.root, **env)
 
-    def findings(self, *args):
+    def findings(self, *args, **kw):
         """(path, line, text) for every T6 finding."""
-        result = self.run_check(*args)
+        result = self.run_check(*args, **kw)
         out = []
         for line in result.stdout.splitlines():
             parts = line.split(":", 2)
@@ -61,8 +67,8 @@ class Repo(unittest.TestCase):
                 out.append((parts[0], int(parts[1]), parts[2].strip()))
         return out
 
-    def lines(self, *args):
-        return [(path, line) for path, line, _ in self.findings(*args)]
+    def lines(self, *args, **kw):
+        return [(path, line) for path, line, _ in self.findings(*args, **kw)]
 
 
 PY_TEST = """\
@@ -469,6 +475,198 @@ class Scope(Repo):
         self.write("src/app.py", "X = 2\n")
         result = self.run_check()
         self.assertIn("lowered-bar: ok (base main", result.stdout)
+
+
+class EmptyTreeBase(Repo):
+    """With no shared history to measure from, committed lines already passed this stage at pre-commit."""
+
+    def legacy(self):
+        sh(["git", "branch", "-q", "-m", "main", "develop"], self.root)
+        self.write("src/app.py", "import os  # noqa: F401\n")
+        self.write("tests/test_app.py", "import pytest\n\n\n@pytest.mark.skip\ndef test_a():\n    assert 1 + 1 == 2\n")
+        self.write("src/other.py", "X = 1\n")
+        self.commit("legacy code")
+        sh(["git", "switch", "-q", "-c", "feature"], self.root)
+        self.write("src/other.py", "X = 2\n")
+
+    def test_pre_existing_markers_never_fail_against_the_empty_tree(self):
+        self.legacy()
+        result = self.run_check(base=None, SLOPBRAKE_BASE=EMPTY_TREE)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("only uncommitted changes", result.stdout)
+
+    def test_without_any_base_ref_pre_existing_markers_never_fail(self):
+        self.legacy()
+        result = self.run_check(base=None)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_uncommitted_markers_still_fail_against_the_empty_tree(self):
+        self.legacy()
+        self.write("src/other.py", "X = 2  # noqa\n")
+        self.assertEqual(self.lines(base=None, SLOPBRAKE_BASE=EMPTY_TREE), [("src/other.py", 1)])
+
+    def test_nothing_uncommitted_against_the_empty_tree_is_a_skip(self):
+        self.legacy()
+        self.commit()
+        result = self.run_check(base=None, SLOPBRAKE_BASE=EMPTY_TREE)
+        self.assertEqual(result.returncode, 78, result.stdout)
+
+
+class MergedFromTheDefaultBranch(Repo):
+    """A feature that merges main must not own the lines main brought in."""
+
+    def setUp(self):
+        super().setUp()
+        remote = Path(self.tmp.name) / "remote.git"
+        self.root = Path(self.tmp.name) / "work"
+        self.root.mkdir()
+        sh(["git", "init", "-q", "--bare", "-b", "main", str(remote)], self.tmp.name)
+        sh(["git", "init", "-q", "-b", "main"], self.root)
+        sh(["git", "remote", "add", "origin", str(remote)], self.root)
+        self.write("src/app.py", "X = 1\n")
+        self.write("tests/test_app.py", "def test_a():\n    assert 1 + 1 == 2\n\n\ndef test_b():\n    assert 2 + 2 == 4\n")
+        self.commit("base")
+        sh(["git", "push", "-q", "origin", "main"], self.root)
+        sh(["git", "switch", "-q", "-c", "feature"], self.root)
+        self.write("src/feature.py", "Y = 1\n")
+        self.commit("feature work")
+        sh(["git", "push", "-q", "-u", "origin", "feature"], self.root)
+        sh(["git", "switch", "-q", "main"], self.root)
+        self.write("src/app.py", "import os  # noqa: F401\nX = 1\n")
+        self.write("tests/test_app.py", "def test_a():\n    assert 1 + 1 == 2\n")
+        self.commit("teammate's change")
+        sh(["git", "switch", "-q", "feature"], self.root)
+        result = sh(["git", *GIT_ID, "merge", "-q", "--no-edit", "main"], self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_suppression_and_a_deletion_merged_from_main_are_not_this_changes(self):
+        result = self.run_check(base=None)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_the_branchs_own_additions_after_the_merge_still_fail(self):
+        self.write("src/feature.py", "Y = 1  # noqa\n")
+        self.assertEqual(self.lines(base=None), [("src/feature.py", 1)])
+
+
+class VendoredAndGenerated(Repo):
+    def test_vendored_fixture_and_generated_files_are_not_read(self):
+        self.base({"src/app.py": "X = 1\n", ".gitattributes": "src/schema/** linguist-generated\nlib/** linguist-vendored=true\n"})
+        self.write("third_party/lib/x.py", "X = 1  # noqa\n")
+        self.write("vendor/lib.js", "/* eslint-disable */\n")
+        self.write("src/gen/api.ts", "// @generated by the API compiler\n/* eslint-disable */\n// @ts-nocheck\nexport const x = 1;\n")
+        self.write("src/gen/models.py", "# Code generated by protoc. DO NOT EDIT.\nX = 1  # noqa\n")
+        self.write("test/fixtures/only.js", 'describe.only("x", () => {});\n')
+        self.write("tests/__fixtures__/skip.test.ts", 'it.skip("x", () => {});\n')
+        self.write("testdata/a.py", "X = 1  # noqa\n")
+        self.write("src/schema/types.py", "X = 1  # type: ignore\n")
+        self.write("lib/min.js", "// eslint-disable-next-line\n")
+        self.write("src/app.py", "X = 1  # noqa\n")
+        self.assertEqual(self.lines(), [("src/app.py", 1)])
+
+    def test_a_generated_word_further_down_a_file_does_not_exempt_it(self):
+        self.base({"src/app.py": "X = 1\n"})
+        self.write("src/app.py", "X = 1\n\n\n\n\n\n# the client is auto-generated elsewhere\nY = 2  # noqa\n")
+        self.assertEqual(self.lines(), [("src/app.py", 8)])
+
+
+class JsxText(Repo):
+    def test_a_jsx_closing_tag_does_not_open_a_regex(self):
+        self.base({"src/view.tsx": "export const x = 1;\n"})
+        self.write("src/view.tsx", "export const x = 1;\n"
+                                   "export const a = <p>a</p>; // eslint-disable-line no-unused-vars\n"
+                                   "export const b = <div><span>x</span>{/* @ts-expect-error */}</div>;\n")
+        self.assertEqual(self.lines(), [("src/view.tsx", 2), ("src/view.tsx", 3)])
+
+    def test_a_backtick_in_jsx_text_does_not_hide_the_rest_of_the_file(self):
+        self.base({"tests/view.test.tsx": "export const x = 1;\n"})
+        self.write("tests/view.test.tsx", "export const x = 1;\n"
+                                          "const c = <p>don`t</p>;\n"
+                                          "// @ts-ignore\n"
+                                          'it.only("renders", () => {});\n')
+        self.assertEqual(self.lines(), [("tests/view.test.tsx", 3), ("tests/view.test.tsx", 4)])
+
+    def test_a_multiline_template_in_plain_typescript_stays_text(self):
+        self.base({"src/sql.ts": "export const x = 1;\n"})
+        self.write("src/sql.ts", "export const x = 1;\nexport const q = `select 1\n// @ts-ignore is text here\n`;\n")
+        self.assertEqual(self.lines(), [])
+
+
+class GitCost(Repo):
+    def test_old_versions_are_read_in_one_git_call_not_one_per_file(self):
+        files = {f"src/m{i}.py": f"X{i} = {i}\n" for i in range(40)}
+        self.base(files)
+        for rel in files:
+            self.write(rel, "Y = 2\n")
+        real = shutil.which("git")
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir()
+        log = Path(self.tmp.name) / "git.log"
+        (bindir / "git").write_text(f'#!/bin/sh\necho "$1" >> "{log}"\nexec "{real}" "$@"\n')
+        (bindir / "git").chmod(0o755)
+        result = self.run_check(PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = log.read_text().split()
+        self.assertLess(len(calls), 25, calls)
+
+
+class MoreSpellings(Repo):
+    def test_cypress_specs_are_tests(self):
+        self.base({"cypress/e2e/cart.cy.ts": 'it("adds", () => {\n  cy.get("a");\n});\n'})
+        self.write("cypress/e2e/cart.cy.ts", 'it.only("checks out", () => {\n  cy.get("b");\n});\n')
+        found = self.findings()
+        self.assertEqual([(p, n) for p, n, _ in found], [("cypress/e2e/cart.cy.ts", 1), ("cypress/e2e/cart.cy.ts", 1)])
+        self.assertTrue(any("test deleted: adds" in text for _, _, text in found), found)
+
+    def test_imported_and_aliased_python_skips_and_disabled_classes_fail(self):
+        self.base({"tests/test_cart.py": PY_TEST})
+        self.write("tests/test_more.py", """\
+            import unittest as ut
+            from pytest import skip, xfail as expect_failure
+
+
+            def test_a():
+                skip("later")
+
+
+            def test_b():
+                expect_failure("known")
+
+
+            class T(ut.TestCase):
+                @ut.skip("x")
+                def test_c(self):
+                    self.assertEqual(1 + 1, 2)
+
+
+            class Disabled:
+                __test__ = False
+            """)
+        self.assertEqual([line for _, line in self.lines()], [6, 10, 14, 20])
+
+    def test_importorskip_and_unrelated_skip_functions_pass(self):
+        self.base({"tests/test_cart.py": PY_TEST, "src/reader.py": "X = 1\n"})
+        self.write("tests/test_numpy.py", 'import pytest\n\nnp = pytest.importorskip("numpy")\n\n\n'
+                                          "def test_a():\n    assert np.zeros(1)[0] == 0\n")
+        self.write("src/reader.py", "def skip(n):\n    return n\n\n\nskip(3)\n")
+        self.assertEqual(self.lines(), [])
+
+
+class AllowPlacement(Repo):
+    def test_an_allow_on_any_line_of_a_wrapped_decorator_passes(self):
+        self.base({"tests/test_cart.py": PY_TEST})
+        self.write("tests/test_cart.py", PY_TEST.replace(
+            "    def test_total", "    @unittest.skipIf(\n"
+                                  "            True,\n"
+                                  "            'sandbox',\n"
+                                  "        )  # slopbrake: allow-skip: the payment sandbox is down\n"
+                                  "        def test_total"))
+        self.assertEqual(self.lines(), [])
+
+    def test_an_allow_delete_in_any_file_under_a_test_directory_passes(self):
+        self.base({"tests/test_cart.py": PY_TEST})
+        self.write("tests/test_cart.py", PY_TEST.split("    def test_empty")[0])
+        self.write("tests/NOTES.md", "slopbrake: allow-delete-test: test_empty: covered by test_total\n")
+        self.assertEqual(self.lines(), [])
 
 
 class DiffParsing(unittest.TestCase):

@@ -24,6 +24,12 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
 
 
 def repo_root() -> Path:
+    return _toplevel(os.getcwd())
+
+
+@functools.cache
+def _toplevel(cwd: str) -> Path:
+    """Asked of git once per working directory: checks call repo_root() for every file they read."""
     return Path(git("rev-parse", "--show-toplevel").strip())
 
 

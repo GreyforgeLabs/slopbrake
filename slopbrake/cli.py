@@ -849,7 +849,15 @@ GIT_GUARD_CASES = [(c, 2) for c in GIT_GUARD_BLOCK] + [(c, 0) for c in GIT_GUARD
 
 def kit_stages(stack: str) -> list[str]:
     """The STAGES the kit's scripts/check template runs: a full run must report every one."""
-    match = re.search(r"^STAGES=\(([^)]*)\)", (KIT / stack / "scripts/check").read_text(encoding="utf-8"), re.MULTILINE)
+    return stages_in(KIT / stack / "scripts/check")
+
+
+def stages_in(check: Path) -> list[str]:
+    """The STAGES a scripts/check runs ([] when it has none or is missing)."""
+    try:
+        match = re.search(r"^STAGES=\(([^)]*)\)", check.read_text(encoding="utf-8"), re.MULTILINE)
+    except (OSError, UnicodeDecodeError):
+        return []
     return match.group(1).split() if match else []
 
 
@@ -972,13 +980,20 @@ class Verifier:
         seeded.unlink()
 
         # T6: a skip added on a changed line fails the gate; the same test without it passes.
-        self.write(*seeds["bar_skip"])
-        self.prove("seeded skipped test fails lowered-bar", False, self.check("lowered-bar"), "T6",
-                   "T6 skipped test added")
-        seeded = self.write(*seeds["bar_clean"])
-        self.prove("lowered-bar passes once the skip is removed", True, self.check("lowered-bar"), "T6",
-                   "lowered-bar: ok")
-        seeded.unlink()
+        if "lowered-bar" not in stages_in(self.wt / "scripts/check"):  # an install from before 0.2.8
+            gap = [("scripts/check does not run the lowered-bar stage: add lowered-bar to its STAGES and the line "
+                    "stage_lowered_bar()  { python3 \"$G/lowered_bar.py\"; } (as in the kit's template)")]
+            unwired = subprocess.CompletedProcess([], 1, "", "")
+            self.prove("seeded skipped test fails lowered-bar", False, unwired, "T6", problems=gap)
+            self.prove("lowered-bar passes once the skip is removed", True, unwired, "T6", problems=gap)
+        else:
+            self.write(*seeds["bar_skip"])
+            self.prove("seeded skipped test fails lowered-bar", False, self.check("lowered-bar"), "T6",
+                       "T6 skipped test added")
+            seeded = self.write(*seeds["bar_clean"])
+            self.prove("lowered-bar passes once the skip is removed", True, self.check("lowered-bar"), "T6",
+                       "lowered-bar: ok")
+            seeded.unlink()
 
         # T4: weak tests on changed code fall below the floor; strong tests clear it.
         self.write(*seeds["mutation_src"])
