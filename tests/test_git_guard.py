@@ -90,6 +90,11 @@ BLOCK = {
         "time git push -f", "time -p git push -f", "sudo git push -f", "sudo -u bob git push -f", "FOO=1 git push -f",
         "/usr/bin/git reset --hard", "./git push -f", "nice -n 5 git push -f", "timeout 10 git push -f",
         "xargs git branch -D < list", "env -S 'git push -f'", "env -S'git push -f'", "env -S 'git push -f \"' ", "! git push -f", "doas git push -f",
+        "rtk git push -f", "rtk git reset --hard", "rtk -v git -C . push --force", "rtk --skip-env git clean -fd",
+        "rtk bypass git push -f", "rtk proxy git reset --hard", "rtk run git push -f", "rtk run -- git push -f",
+        "rtk run -c 'git reset --hard'", "rtk run --shell bash -c 'git push -f'", "rtk err git push -f",
+        "rtk test --shell bash 'git clean -fd'", "rtk summary git branch -D x", "/usr/local/bin/rtk git push -f",
+        "env FOO=1 rtk git push -f", "bash -c 'rtk git push -f'",
     ],
     "global options before the subcommand": [
         "git -C . -c a=b --no-pager push -f", "git --git-dir=.git --work-tree=. reset --hard",
@@ -193,6 +198,8 @@ ALLOW = {
         "git config --get alias.nuke", "stdbuf -oL git log", "setsid git status", "source <(echo export X=1)",
         "source ./env.sh", ". ./env.sh", "bash <(echo 'git status')", "git restore --staged --pathspec-from-file=list.txt",
         "diff <(git show HEAD:a) a",
+        "rtk git status", "rtk git log -n 5", "rtk git push -u origin HEAD", "rtk run -c 'git status'", "rtk err cargo build",
+        "rtk read src/a.py", "rtk grep 'git push -f' docs", "rtk gain", "rtk test pytest -q", "rtk",
     ],
     "near misses of command substitutions": [
         'eval "$(ssh-agent -s)"', "$(git rev-parse --show-toplevel)/scripts/check", 'eval "$(echo export X=1)"',

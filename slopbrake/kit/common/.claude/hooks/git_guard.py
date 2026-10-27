@@ -562,6 +562,10 @@ class Judge:
                 cwd = resolve(cwd, chdir) if chdir else cwd
                 if split is not None:
                     argv = split + argv
+            elif name == "rtk":
+                argv, script = rtk_options(argv[1:])
+                if script is not None:
+                    return self.string(script, cwd=cwd)
             else:
                 break
         if not argv:
@@ -639,6 +643,37 @@ def skip_options(argv, takes_value=()):
             return argv[1:]
         argv = argv[2:] if argv[0] in takes_value else argv[1:]
     return argv
+
+
+def rtk_options(argv):
+    """(argv, script) for an rtk (output-filtering proxy) invocation: `rtk git ...` runs git; `rtk run|bypass|proxy|
+    err|test|summary <command>` runs the command it is given, and `rtk run -c <script>` or `--shell <sh> <script>`
+    runs a shell script. Other subcommands run rtk's own filters, never git."""
+    while argv and argv[0] in ("-v", "-vv", "-vvv", "--verbose", "--skip-env"):
+        argv = argv[1:]
+    if not argv:
+        return [], None
+    sub, argv = argv[0], argv[1:]
+    if sub == "git":
+        return ["git", *argv], None
+    if sub not in ("run", "bypass", "proxy", "err", "test", "summary"):
+        return [], None
+    shell = False
+    while argv and argv[0].startswith("-") and argv[0] != "-":
+        a = argv.pop(0)
+        if a == "--":
+            break
+        if a in ("-c", "--command") and argv:
+            return [], argv[0]
+        if a.startswith("--command="):
+            return [], a.partition("=")[2]
+        if a == "--shell" and argv:
+            argv, shell = argv[1:], True
+        elif a.startswith("--shell="):
+            shell = True
+    if shell:
+        return [], " ".join(argv)
+    return argv, None
 
 
 def sudo_options(argv):

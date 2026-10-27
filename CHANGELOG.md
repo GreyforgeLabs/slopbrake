@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.7 (2026-10-27)
+
+The git guard (H5) sees through the `rtk` output-filtering proxy.
+
+- **Fixed:** `rtk git push --force`, `rtk git reset --hard` and the same commands run through `rtk run`, `rtk bypass` (or its old name `rtk proxy`), `rtk err`, `rtk test` and `rtk summary` ran unchecked, because the guard only unwrapped shells, `env`, `sudo`, `nice` and similar prefixes. rtk's own hook rewrites `git` commands into `rtk git`, so an agent that has seen those rewrites can type them directly. The guard now unwraps rtk's global options, `rtk git`, the command-running subcommands, and `rtk run -c <script>` / `--shell <sh> <script>`, and judges the git command inside. rtk's other subcommands (`rtk read`, `rtk grep`, `rtk gain`, ...) still pass.
+
 ## 0.2.6 (2026-10-26)
 
 The user-level Stop gate can release a session again when it gates a clean copy.
