@@ -68,7 +68,7 @@ Python and TypeScript repos are supported, installed at the repository root (mon
 
 `verify` works in a throwaway git worktree of the committed HEAD. It runs 19 proofs over the 11 rules a machine can check (L1, D1, T1, T4, T6, G1, G2, G4, H1, H5, H6). Where a rule can be broken on purpose, it plants a real violation and requires the check to **fail and name the rule**, then requires it to pass again once the violation is removed. A check that crashes can't pass a proof, a gate that leaves out one of the kit's stages fails the L1 proof, and unwired hooks fail the H5/H6 proof. The other rules guide the reviewer and the workflow; [docs/RULES.md](docs/RULES.md) marks each one Check, Review or Process.
 
-<p align="center"><img src="brand/verify.svg" alt="slopbrake verify output: sixteen proofs, all holding" width="720"></p>
+<p align="center"><img src="brand/verify.svg" alt="slopbrake verify output: nineteen proofs, all holding" width="720"></p>
 
 ### What it is not
 
