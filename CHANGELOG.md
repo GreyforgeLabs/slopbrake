@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.9 (2026-10-27)
+
+T6 no longer re-judges what a repo committed before it ran the `lowered-bar` stage.
+
+- **Fixed:** adding the stage to an existing repo whose branch tracks an old upstream (or any base older than the install) failed the gate on every skip and suppression committed since that base, though none of those lines had ever met this stage. The Stop hook then kept the session from stopping. T6 now measures from no earlier than the commit that wired `stage_lowered_bar` into `scripts/check`, and from HEAD while that wiring is uncommitted. Lines added after the wiring still fail as before. Run `slopbrake init . --update` to pick up the new `lowered_bar.py`.
+
 ## 0.2.8 (2026-10-27)
 
 A new check catches an agent lowering the bar on the lines it changes, instead of fixing what the bar caught.

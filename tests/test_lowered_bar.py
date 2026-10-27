@@ -690,3 +690,50 @@ class DiffParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+WIRED_CHECK = """\
+    STAGES=(lint tests test-quality lowered-bar)
+    stage_lowered_bar()  { python3 "$G/lowered_bar.py"; }
+"""
+
+
+class SinceWired(Repo):
+    """Lines committed before the repo's scripts/check ran this stage never met it: an install on a branch whose
+    base is far behind (an old upstream) must not re-judge them."""
+
+    def test_lines_committed_before_the_stage_was_wired_do_not_count(self):
+        self.base({"scripts/check": "STAGES=(lint tests)\n", "src/a.py": "x = 1\n"})
+        self.write("src/a.py", "import os  # noqa: F401\n")
+        self.write("tests/test_old.py", "import pytest\n\n\n@pytest.mark.skip\ndef test_old():\n    pass\n")
+        self.commit("work from before the kit had T6")
+        self.write("scripts/check", WIRED_CHECK)
+        self.commit("wire the lowered-bar stage")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 78, result.stdout)  # nothing of its own since the wiring commit
+        self.assertIn("where scripts/check started running this stage", result.stdout)
+
+    def test_lines_added_after_wiring_still_fail(self):
+        self.base({"scripts/check": "STAGES=(lint tests)\n", "src/a.py": "x = 1\n"})
+        self.write("src/a.py", "import os  # noqa: F401\n")
+        self.commit("old work")
+        self.write("scripts/check", WIRED_CHECK)
+        self.commit("wire the lowered-bar stage")
+        self.write("src/b.py", "import re  # noqa: F401\n")
+        self.commit("new work")
+        self.write("src/c.py", "import json  # type: ignore\n")
+        self.assertEqual(self.lines(), [("src/b.py", 1), ("src/c.py", 1)])
+
+    def test_stage_wired_but_not_committed_judges_only_uncommitted_lines(self):
+        self.base({"scripts/check": "STAGES=(lint tests)\n", "src/a.py": "x = 1\n"})
+        self.write("src/a.py", "import os  # noqa: F401\n")
+        self.commit("old work")
+        self.write("scripts/check", WIRED_CHECK)
+        self.write("src/b.py", "import re  # noqa: F401\n")
+        self.assertEqual(self.lines(), [("src/b.py", 1)])
+
+    def test_a_base_after_the_wiring_commit_is_kept(self):
+        self.write("scripts/check", WIRED_CHECK)
+        self.base({"src/a.py": "x = 1\n"})
+        self.write("src/a.py", "import os  # noqa: F401\n")
+        self.assertEqual(self.lines(), [("src/a.py", 1)])

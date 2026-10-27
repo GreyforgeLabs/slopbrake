@@ -556,6 +556,25 @@ def default_branch_forks(fork: str, head: str) -> list[str]:
     return forks
 
 
+def since_wired(base: str, fork: str, head: str, described: str) -> tuple[str, str, str]:
+    """Lines committed before scripts/check ran this stage never met it (an install or kit update on a branch whose
+    base is far behind, such as an old upstream), so measure from the commit that wired the stage when it is newer
+    than the fork, and from HEAD when the wiring is not committed yet."""
+    wired = git("log", "--format=%H", "-S", "stage_lowered_bar", "HEAD", "--", ":/scripts/check", check=False).split()
+    if not wired:
+        check = Path(repo_root()) / "scripts/check"
+        if not check.is_file() or "stage_lowered_bar" not in check.read_text(errors="replace"):
+            return base, fork, described  # run by hand, or by a gate that names the stage some other way
+        return head, head, (f"HEAD: scripts/check runs this stage but the change that wired it is not committed, so "
+                            f"only uncommitted lines count ({described} is older)")
+    first = wired[-1]  # git log lists newest first; the oldest commit that added the stage wired it
+    if first == fork or subprocess.run(["git", "merge-base", "--is-ancestor", first, fork], capture_output=True,
+                                       check=False).returncode == 0:
+        return base, fork, described
+    return first, first, (f"{first[:7]}: where scripts/check started running this stage ({described} is older, and "
+                          "lines committed before it never met this stage)")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base")
@@ -575,6 +594,8 @@ def main(argv: list[str] | None = None) -> int:
         base = fork = head
         described = (f"HEAD: the base, {described}, shares no history with it, and committed lines passed this "
                      "stage at pre-commit, so only uncommitted changes count")
+    if head:
+        base, fork, described = since_wired(base, fork, head, described)
     changes = list(collect_changes(base, working_tree=True).values())
     scan = Scan(root, args.exclude)
     if not any(scan.candidate(c.path) or scan.candidate(c.old_path) for c in changes):
