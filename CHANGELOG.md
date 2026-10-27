@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.8 (2026-10-27)
+
+A new check catches an agent lowering the bar on the lines it changes, instead of fixing what the bar caught.
+
+- **New:** rule T6 and the `lowered-bar` stage in the kit's `scripts/check` (Python and TypeScript). It fails when the change since the base adds a skipped or focused test (`@pytest.mark.skip`/`skipif`/`xfail`, `unittest.skip*`, `self.skipTest()`, `pytest.skip()`, `it.skip`, `xit`, `it.todo`, `.only` and more), a suppression comment (`# noqa`, `# type: ignore`, `# pyright: ignore`, `# pragma: no cover`, `eslint-disable`, `@ts-ignore`, `@ts-nocheck`, `@ts-expect-error`, `istanbul`/`c8 ignore` and more), or deletes a test that is left nowhere in the test tree. Words in strings and docstrings don't count; edited, moved and renamed lines and tests pass; skips and suppressions already there never fail. Each finding names T6, the file and line, what was added and the remedy. Keep one by saying why: `slopbrake: allow-skip: <why>`, `allow-suppress: <why>`, or `allow-delete-test: <name>: <why>` in the test tree or the PR body.
+- **New:** `slopbrake verify` proves T6 (19 proofs over 11 rules): a seeded skipped test must fail `lowered-bar` naming the rule, and pass once the skip is gone.
+- Existing installs: `slopbrake init . --update` adds `scripts/slopbrake/lowered_bar.py` and refreshes `common.py`. `scripts/check` is yours, so add `lowered-bar` to `STAGES` (after `test-quality`) and the line `stage_lowered_bar()  { python3 "$G/lowered_bar.py"; }` by hand; `slopbrake status` lists the stage as missing until you do.
+
 ## 0.2.7 (2026-10-27)
 
 The git guard (H5) sees through the `rtk` output-filtering proxy.
