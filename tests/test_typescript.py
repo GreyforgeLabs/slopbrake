@@ -15,6 +15,9 @@ KIT = HOME / "slopbrake/kit"
 TS = KIT / "typescript"
 GUARDS = KIT / "common/scripts/slopbrake"
 GIT_ID = ["-c", "user.name=kit-test", "-c", "user.email=kit@test"]
+# A pull_request CI run sets GITHUB_BASE_REF, which outranks the SLOPBRAKE_BASE the tests pass.
+OVERRIDES = ("GITHUB_BASE_REF", "SLOPBRAKE_BASE")
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in OVERRIDES}
 
 SUBS = {
     "DEPCRUISE_PATHS": "src tests",
@@ -82,7 +85,7 @@ class Project(unittest.TestCase):
             self.write("node_modules/typescript/package.json", '{"name": "typescript"}\n')
 
     def check(self, *stages, **env):
-        full = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "ARGV_DIR": str(self.argv), **env}
+        full = {**CLEAN_ENV, "PATH": f"{self.bin}:{os.environ['PATH']}", "ARGV_DIR": str(self.argv), **env}
         result = subprocess.run([str(self.root / "scripts/check"), *stages], cwd=self.root, env=full,
                                 capture_output=True, text=True, timeout=60, check=False)
         result.out = result.stdout + result.stderr
